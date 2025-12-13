@@ -962,7 +962,7 @@ impl<'a> JsonParser<'a> {
                         // Check if only whitespace between quotes
                         let all_whitespace = (1..i).all(|k| {
                             self.get_char_at(k as isize)
-                                .map_or(true, |c| c.is_whitespace())
+                                .is_none_or(|c| c.is_whitespace())
                         });
                         if all_whitespace {
                             break;
