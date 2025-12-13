@@ -1,6 +1,6 @@
 //! MiniLLMLib CLI - JSON repair tool
 //!
-//! Usage: minillmlib [OPTIONS] [FILE]
+//! Usage: `minillmlib-cli [FILE]`
 //!
 //! If no file is provided, reads from stdin.
 

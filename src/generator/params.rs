@@ -58,7 +58,8 @@ pub struct CompletionParameters {
     pub tool_choice: Option<serde_json::Value>,
 
     /// OpenRouter provider settings (order, sort, ignore, data_collection, etc.)
-    /// See: https://openrouter.ai/docs/provider-routing
+    ///
+    /// See: <https://openrouter.ai/docs/provider-routing>
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderSettings>,
 
@@ -69,7 +70,8 @@ pub struct CompletionParameters {
 }
 
 /// OpenRouter provider routing settings
-/// See: https://openrouter.ai/docs/provider-routing
+///
+/// See: <https://openrouter.ai/docs/provider-routing>
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderSettings {
     /// Ordered list of provider names to try

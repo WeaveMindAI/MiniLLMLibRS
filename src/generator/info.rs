@@ -8,7 +8,7 @@ pub struct GeneratorInfo {
     /// Display name for this generator
     pub name: String,
 
-    /// Base URL for the API (e.g., "https://openrouter.ai/api/v1")
+    /// Base URL for the API (e.g., `https://openrouter.ai/api/v1`)
     pub base_url: String,
 
     /// Model identifier (e.g., "anthropic/claude-3.5-sonnet")
