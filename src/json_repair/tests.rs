@@ -12,22 +12,50 @@ fn repair(input: &str) -> String {
 
 /// Helper to repair with ensure_ascii=false (preserve unicode)
 fn repair_unicode(input: &str) -> String {
-    repair_json(input, &RepairOptions { ensure_ascii: false, ..Default::default() }).unwrap_or_default()
+    repair_json(
+        input,
+        &RepairOptions {
+            ensure_ascii: false,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_default()
 }
 
 /// Helper to repair with skip_json_loads
 fn repair_skip(input: &str) -> String {
-    repair_json(input, &RepairOptions { skip_json_loads: true, ..Default::default() }).unwrap_or_default()
+    repair_json(
+        input,
+        &RepairOptions {
+            skip_json_loads: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_default()
 }
 
 /// Helper to repair with stream_stable
 fn repair_stream_stable(input: &str) -> String {
-    repair_json(input, &RepairOptions { stream_stable: true, ..Default::default() }).unwrap_or_default()
+    repair_json(
+        input,
+        &RepairOptions {
+            stream_stable: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_default()
 }
 
 /// Helper to repair with stream_stable = false (explicit)
 fn repair_stream_unstable(input: &str) -> String {
-    repair_json(input, &RepairOptions { stream_stable: false, ..Default::default() }).unwrap_or_default()
+    repair_json(
+        input,
+        &RepairOptions {
+            stream_stable: false,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_default()
 }
 
 /// Helper to load as JsonValue
@@ -37,7 +65,14 @@ fn load(input: &str) -> JsonValue {
 
 /// Helper to load with skip_json_loads
 fn load_skip(input: &str) -> JsonValue {
-    loads(input, &RepairOptions { skip_json_loads: true, ..Default::default() }).unwrap_or(JsonValue::Null)
+    loads(
+        input,
+        &RepairOptions {
+            skip_json_loads: true,
+            ..Default::default()
+        },
+    )
+    .unwrap_or(JsonValue::Null)
 }
 
 // ============================================================================
@@ -54,17 +89,38 @@ fn test_valid_json() {
         repair(r#"{"employees":["John", "Anna", "Peter"]} "#),
         r#"{"employees": ["John", "Anna", "Peter"]}"#
     );
-    assert_eq!(repair(r#"{"key": "value:value"}"#), r#"{"key": "value:value"}"#);
-    assert_eq!(repair(r#"{"text": "The quick brown fox,"}"#), r#"{"text": "The quick brown fox,"}"#);
-    assert_eq!(repair(r#"{"text": "The quick brown fox won't jump"}"#), r#"{"text": "The quick brown fox won't jump"}"#);
+    assert_eq!(
+        repair(r#"{"key": "value:value"}"#),
+        r#"{"key": "value:value"}"#
+    );
+    assert_eq!(
+        repair(r#"{"text": "The quick brown fox,"}"#),
+        r#"{"text": "The quick brown fox,"}"#
+    );
+    assert_eq!(
+        repair(r#"{"text": "The quick brown fox won't jump"}"#),
+        r#"{"text": "The quick brown fox won't jump"}"#
+    );
     assert_eq!(repair(r#"{"key": ""}"#), r#"{"key": ""}"#);
-    assert_eq!(repair(r#"{"key1": {"key2": [1, 2, 3]}}"#), r#"{"key1": {"key2": [1, 2, 3]}}"#);
+    assert_eq!(
+        repair(r#"{"key1": {"key2": [1, 2, 3]}}"#),
+        r#"{"key1": {"key2": [1, 2, 3]}}"#
+    );
     // Note: Very large integers may lose precision in Rust due to f64 limitations
     // Python handles arbitrary precision, but Rust i64 max is 9223372036854775807
-    assert_eq!(repair(r#"{"key": 9223372036854775807}"#), r#"{"key": 9223372036854775807}"#);
+    assert_eq!(
+        repair(r#"{"key": 9223372036854775807}"#),
+        r#"{"key": 9223372036854775807}"#
+    );
     // Python escapes non-ASCII to \uXXXX by default (ensure_ascii=True)
-    assert_eq!(repair("{\"key\": \"value\u{263a}\"}"), r#"{"key": "value\u263a"}"#);
-    assert_eq!(repair(r#"{"key": "value\nvalue"}"#), r#"{"key": "value\nvalue"}"#);
+    assert_eq!(
+        repair("{\"key\": \"value\u{263a}\"}"),
+        r#"{"key": "value\u263a"}"#
+    );
+    assert_eq!(
+        repair(r#"{"key": "value\nvalue"}"#),
+        r#"{"key": "value\nvalue"}"#
+    );
 }
 
 // ============================================================================
@@ -106,13 +162,19 @@ fn test_missing_and_mixed_quotes() {
         repair(r#"{"name": John, "age": 30, "city": "New York"}"#),
         r#"{"name": "John", "age": 30, "city": "New York"}"#
     );
-    assert_eq!(repair(r#"{"slanted_delimiter": "value"}"#), r#"{"slanted_delimiter": "value"}"#);
+    assert_eq!(
+        repair(r#"{"slanted_delimiter": "value"}"#),
+        r#"{"slanted_delimiter": "value"}"#
+    );
     assert_eq!(
         repair(r#"{"name": "John", "age": 30, "city": "New"#),
         r#"{"name": "John", "age": 30, "city": "New"}"#
     );
     assert_eq!(repair(r#"{"key": ""value"}"#), r#"{"key": "value"}"#);
-    assert_eq!(repair(r#"{"key": "value", 5: "value"}"#), r#"{"key": "value", "5": "value"}"#);
+    assert_eq!(
+        repair(r#"{"key": "value", 5: "value"}"#),
+        r#"{"key": "value", "5": "value"}"#
+    );
     assert_eq!(repair(r#"{"key": value , }"#), r#"{"key": "value"}"#);
 }
 
@@ -126,11 +188,20 @@ fn test_escaping() {
     assert_eq!(repair(r#"{"key\t_": "value"}"#), r#"{"key\t_": "value"}"#);
     assert_eq!(repair(r#"{"key": "valu\'e"}"#), r#"{"key": "valu'e"}"#);
     // Unicode literal in single quotes (Python line 73)
-    assert_eq!(repair("{\"key\": '\u{0076}\u{0061}\u{006c}\u{0075}\u{0065}'}"), r#"{"key": "value"}"#);
+    assert_eq!(
+        repair("{\"key\": '\u{0076}\u{0061}\u{006c}\u{0075}\u{0065}'}"),
+        r#"{"key": "value"}"#
+    );
     // Unicode escape sequences (Python line 74)
-    assert_eq!(repair_skip(r#"{"key": "\u0076\u0061\u006C\u0075\u0065"}"#), r#"{"key": "value"}"#);
+    assert_eq!(
+        repair_skip(r#"{"key": "\u0076\u0061\u006C\u0075\u0065"}"#),
+        r#"{"key": "value"}"#
+    );
     // Nested JSON string (Python line 76)
-    assert_eq!(repair(r#"{'key': "{\"key\": 1, \"key2\": 1}"}"#), r#"{"key": "{\"key\": 1, \"key2\": 1}"}"#);
+    assert_eq!(
+        repair(r#"{'key': "{\"key\": 1, \"key2\": 1}"}"#),
+        r#"{"key": "{\"key\": 1, \"key2\": 1}"}"#
+    );
 }
 
 // ============================================================================
@@ -143,8 +214,14 @@ fn test_markdown() {
         repair(r#"{ "content": "[LINK]("https://google.com")" }"#),
         r#"{"content": "[LINK](\"https://google.com\")"}"#
     );
-    assert_eq!(repair(r#"{ "content": "[LINK](" }"#), r#"{"content": "[LINK]("}"#);
-    assert_eq!(repair(r#"{ "content": "[LINK](", "key": true }"#), r#"{"content": "[LINK](", "key": true}"#);
+    assert_eq!(
+        repair(r#"{ "content": "[LINK](" }"#),
+        r#"{"content": "[LINK]("}"#
+    );
+    assert_eq!(
+        repair(r#"{ "content": "[LINK](", "key": true }"#),
+        r#"{"content": "[LINK](", "key": true}"#
+    );
 }
 
 // ============================================================================
@@ -153,10 +230,15 @@ fn test_markdown() {
 
 #[test]
 fn test_leading_trailing_characters() {
-    assert_eq!(repair(r#"````{ "key": "value" }```"#), r#"{"key": "value"}"#);
     assert_eq!(
-        repair(r#"{    "a": "",    "b": [ { "c": 1} ] 
-}```"#),
+        repair(r#"````{ "key": "value" }```"#),
+        r#"{"key": "value"}"#
+    );
+    assert_eq!(
+        repair(
+            r#"{    "a": "",    "b": [ { "c": 1} ] 
+}```"#
+        ),
         r#"{"a": "", "b": [{"c": 1}]}"#
     );
     assert_eq!(
@@ -218,18 +300,39 @@ fn test_parse_object_edge_cases() {
         repair(r#"{"value_1": true, SHOULD_NOT_EXIST "value_2": "data" AAAA }"#),
         r#"{"value_1": true, "value_2": "data"}"#
     );
-    assert_eq!(repair(r#"{"" : true, "key2": "value2"}"#), r#"{"": true, "key2": "value2"}"#);
-    assert_eq!(repair("{key:value,key2:value2}"), r#"{"key": "value", "key2": "value2"}"#);
-    assert_eq!(repair(r#"{"key":value, " key2":"value2" }"#), r#"{"key": "value", " key2": "value2"}"#);
-    assert_eq!(repair(r#"{"key":value "key2":"value2" }"#), r#"{"key": "value", "key2": "value2"}"#);
+    assert_eq!(
+        repair(r#"{"" : true, "key2": "value2"}"#),
+        r#"{"": true, "key2": "value2"}"#
+    );
+    assert_eq!(
+        repair("{key:value,key2:value2}"),
+        r#"{"key": "value", "key2": "value2"}"#
+    );
+    assert_eq!(
+        repair(r#"{"key":value, " key2":"value2" }"#),
+        r#"{"key": "value", " key2": "value2"}"#
+    );
+    assert_eq!(
+        repair(r#"{"key":value "key2":"value2" }"#),
+        r#"{"key": "value", "key2": "value2"}"#
+    );
     assert_eq!(
         repair("{'text': 'words{words in brackets}more words'}"),
         r#"{"text": "words{words in brackets}more words"}"#
     );
-    assert_eq!(repair("{text:words{words in brackets}}"), r#"{"text": "words{words in brackets}"}"#);
-    assert_eq!(repair(r#"{"key": "value, value2"```"#), r#"{"key": "value, value2"}"#);
+    assert_eq!(
+        repair("{text:words{words in brackets}}"),
+        r#"{"text": "words{words in brackets}"}"#
+    );
+    assert_eq!(
+        repair(r#"{"key": "value, value2"```"#),
+        r#"{"key": "value, value2"}"#
+    );
     assert_eq!(repair(r#"{"key": "value}```"#), r#"{"key": "value"}"#);
-    assert_eq!(repair(r#"{"key": , "key2": "value2"}"#), r#"{"key": "", "key2": "value2"}"#);
+    assert_eq!(
+        repair(r#"{"key": , "key2": "value2"}"#),
+        r#"{"key": "", "key2": "value2"}"#
+    );
 }
 
 // ============================================================================
@@ -242,7 +345,10 @@ fn test_parse_object_merge_at_the_end() {
         repair(r#"{"key": "value"}, "key2": "value2"}"#),
         r#"{"key": "value", "key2": "value2"}"#
     );
-    assert_eq!(repair(r#"{"key": "value"}, "key2": }"#), r#"{"key": "value", "key2": ""}"#);
+    assert_eq!(
+        repair(r#"{"key": "value"}, "key2": }"#),
+        r#"{"key": "value", "key2": ""}"#
+    );
     assert_eq!(repair(r#"{"key": "value"}, []"#), r#"{"key": "value"}"#);
     assert_eq!(repair(r#"{"key": "value"}, {}"#), r#"{"key": "value"}"#);
 }
@@ -336,16 +442,25 @@ fn test_parse_number_edge_cases() {
         repair(r#"{"here": "now", "key": 1/3, "foo": "bar"}"#),
         r#"{"here": "now", "key": "1/3", "foo": "bar"}"#
     );
-    assert_eq!(repair(r#"{"key": 12345/67890}"#), r#"{"key": "12345/67890"}"#);
+    assert_eq!(
+        repair(r#"{"key": 12345/67890}"#),
+        r#"{"key": "12345/67890"}"#
+    );
     assert_eq!(repair("[105,12"), "[105, 12]");
-    assert_eq!(repair(r#"{"key": 1/3, "foo": "bar"}"#), r#"{"key": "1/3", "foo": "bar"}"#);
+    assert_eq!(
+        repair(r#"{"key": 1/3, "foo": "bar"}"#),
+        r#"{"key": "1/3", "foo": "bar"}"#
+    );
     assert_eq!(repair(r#"{"key": 10-20}"#), r#"{"key": "10-20"}"#);
     assert_eq!(repair(r#"{"key": 1.1.1}"#), r#"{"key": "1.1.1"}"#);
     assert_eq!(repair("[- "), "[]");
     assert_eq!(repair(r#"{"key": 1. }"#), r#"{"key": 1.0}"#);
     assert_eq!(repair(r#"{"key": 1e10 }"#), r#"{"key": 10000000000.0}"#);
     assert_eq!(repair(r#"{"key": 1e }"#), r#"{"key": 1}"#);
-    assert_eq!(repair(r#"{"key": 1notanumber }"#), r#"{"key": "1notanumber"}"#);
+    assert_eq!(
+        repair(r#"{"key": 1notanumber }"#),
+        r#"{"key": "1notanumber"}"#
+    );
     assert_eq!(repair("[1, 2notanumber]"), r#"[1, "2notanumber"]"#);
 }
 
@@ -368,8 +483,14 @@ fn test_parse_comment() {
         repair(r#"{ "key": { "key2": "value2" /* comment */ }, "key3": "value3" }"#),
         r#"{"key": {"key2": "value2"}, "key3": "value3"}"#
     );
-    assert_eq!(repair(r#"[ "value", /* comment */ "value2" ]"#), r#"["value", "value2"]"#);
-    assert_eq!(repair(r#"{ "key": "value" /* comment"#), r#"{"key": "value"}"#);
+    assert_eq!(
+        repair(r#"[ "value", /* comment */ "value2" ]"#),
+        r#"["value", "value2"]"#
+    );
+    assert_eq!(
+        repair(r#"{ "key": "value" /* comment"#),
+        r#"{"key": "value"}"#
+    );
 }
 
 // ============================================================================
@@ -403,15 +524,36 @@ fn test_repair_json_skip_json_loads() {
 #[test]
 fn test_stream_stable() {
     // stream_stable = false (default)
-    assert_eq!(repair_stream_unstable(r#"{"key": "val\"#), r#"{"key": "val\\"}"#);
-    assert_eq!(repair_stream_unstable(r#"{"key": "val\n"#), r#"{"key": "val"}"#);
-    assert_eq!(repair_stream_unstable(r#"{"key": "val\n123,`key2:value2`"}"#), r#"{"key": "val\n123,`key2:value2`"}"#);
-    
+    assert_eq!(
+        repair_stream_unstable(r#"{"key": "val\"#),
+        r#"{"key": "val\\"}"#
+    );
+    assert_eq!(
+        repair_stream_unstable(r#"{"key": "val\n"#),
+        r#"{"key": "val"}"#
+    );
+    assert_eq!(
+        repair_stream_unstable(r#"{"key": "val\n123,`key2:value2`"}"#),
+        r#"{"key": "val\n123,`key2:value2`"}"#
+    );
+
     // stream_stable = true
-    assert_eq!(repair_stream_stable(r#"{"key": "val\"#), r#"{"key": "val"}"#);
-    assert_eq!(repair_stream_stable("{\"key\": \"val\\n"), "{\"key\": \"val\\n\"}");
-    assert_eq!(repair_stream_stable(r#"{"key": "val\n123,`key2:value2"#), r#"{"key": "val\n123,`key2:value2"}"#);
-    assert_eq!(repair_stream_stable(r#"{"key": "val\n123,`key2:value2`"}"#), r#"{"key": "val\n123,`key2:value2`"}"#);
+    assert_eq!(
+        repair_stream_stable(r#"{"key": "val\"#),
+        r#"{"key": "val"}"#
+    );
+    assert_eq!(
+        repair_stream_stable("{\"key\": \"val\\n"),
+        "{\"key\": \"val\\n\"}"
+    );
+    assert_eq!(
+        repair_stream_stable(r#"{"key": "val\n123,`key2:value2"#),
+        r#"{"key": "val\n123,`key2:value2"}"#
+    );
+    assert_eq!(
+        repair_stream_stable(r#"{"key": "val\n123,`key2:value2`"}"#),
+        r#"{"key": "val\n123,`key2:value2`"}"#
+    );
 }
 
 // ============================================================================
@@ -435,7 +577,10 @@ fn test_repair_json_with_objects() {
         JsonValue::Object(vec![
             ("name".to_string(), JsonValue::String("John".to_string())),
             ("age".to_string(), JsonValue::Integer(30)),
-            ("city".to_string(), JsonValue::String("New York".to_string())),
+            (
+                "city".to_string(),
+                JsonValue::String("New York".to_string())
+            ),
         ])
     );
     assert_eq!(
@@ -466,17 +611,21 @@ fn test_multiple_jsons() {
 
 #[test]
 fn test_strict_mode() {
-    let strict_opts = RepairOptions { strict: true, skip_json_loads: true, ..Default::default() };
-    
+    let strict_opts = RepairOptions {
+        strict: true,
+        skip_json_loads: true,
+        ..Default::default()
+    };
+
     // Multiple top-level values should error
     assert!(repair_json(r#"{"key":"value"}["value"]"#, &strict_opts).is_err());
-    
+
     // Empty keys should error
     assert!(repair_json(r#"{"" : "value"}"#, &strict_opts).is_err());
-    
+
     // Missing colon should error
     assert!(repair_json(r#"{"missing" "colon"}"#, &strict_opts).is_err());
-    
+
     // Empty values should error
     assert!(repair_json(r#"{"key": , "key2": "value2"}"#, &strict_opts).is_err());
 }
@@ -512,7 +661,10 @@ fn test_parse_object_more_edge_cases() {
     // Note: {"key": "value}```"} test is in test_parse_object (line 231)
     assert_eq!(repair(r#"{"key:"value"}"#), r#"{"key": "value"}"#);
     assert_eq!(repair(r#"{"key:value}"#), r#"{"key": "value"}"#);
-    assert_eq!(repair(r#"{"lorem": ipsum, sic, datum.",}"#), r#"{"lorem": "ipsum, sic, datum."}"#);
+    assert_eq!(
+        repair(r#"{"lorem": ipsum, sic, datum.",}"#),
+        r#"{"lorem": "ipsum, sic, datum."}"#
+    );
 }
 
 // ============================================================================
@@ -544,7 +696,10 @@ fn test_parse_number_more_edge_cases() {
 
 #[test]
 fn test_parse_comment_more() {
-    assert_eq!(repair("/* comment */ {\"key\": \"value\"}"), r#"{"key": "value"}"#);
+    assert_eq!(
+        repair("/* comment */ {\"key\": \"value\"}"),
+        r#"{"key": "value"}"#
+    );
 }
 
 // ============================================================================
@@ -591,7 +746,10 @@ fn test_missing_and_mixed_quotes_more() {
         repair(r#"{"comment": "lorem, "ipsum" sic "tamet". To improve"}"#),
         r#"{"comment": "lorem, \"ipsum\" sic \"tamet\". To improve"}"#
     );
-    assert_eq!(repair(r#"{"key": "v"alu"e"} key:"#), r#"{"key": "v\"alu\"e"}"#);
+    assert_eq!(
+        repair(r#"{"key": "v"alu"e"} key:"#),
+        r#"{"key": "v\"alu\"e"}"#
+    );
     assert_eq!(
         repair(r#"{"key": "v"alue", "key2": "value2"}"#),
         r#"{"key": "v\"alue", "key2": "value2"}"#
@@ -614,7 +772,9 @@ fn test_escaping_more() {
         r#"{"key": "string\"\n\t\\le"}"#
     );
     assert_eq!(
-        repair(r#"{"real_content": "Some string: Some other string \t Some string <a href=\"https://domain.com\">Some link</a>""#),
+        repair(
+            r#"{"real_content": "Some string: Some other string \t Some string <a href=\"https://domain.com\">Some link</a>""#
+        ),
         r#"{"real_content": "Some string: Some other string \t Some string <a href=\"https://domain.com\">Some link</a>"}"#
     );
     assert_eq!(
@@ -644,7 +804,10 @@ fn test_parse_object_edge_cases_more() {
     );
     assert_eq!(repair(r#"{ "a" : "{ b": {} }" }"#), r#"{"a": "{ b"}"#);
     assert_eq!(repair(r#"{"b": "xxxxx" true}"#), r#"{"b": "xxxxx"}"#);
-    assert_eq!(repair(r#"{"key": "Lorem "ipsum" s,"}"#), r#"{"key": "Lorem \"ipsum\" s,"}"#);
+    assert_eq!(
+        repair(r#"{"key": "Lorem "ipsum" s,"}"#),
+        r#"{"key": "Lorem \"ipsum\" s,"}"#
+    );
     assert_eq!(
         repair(r#"{"lorem": sic tamet. "ipsum": sic tamet, quick brown fox. "sic": ipsum}"#),
         r#"{"lorem": "sic tamet.", "ipsum": "sic tamet", "sic": "ipsum"}"#
@@ -653,7 +816,10 @@ fn test_parse_object_edge_cases_more() {
         repair(r#"{"lorem_ipsum": "sic tamet, quick brown fox. }"#),
         r#"{"lorem_ipsum": "sic tamet, quick brown fox."}"#
     );
-    assert_eq!(repair("{text:words{words in brackets}m}"), r#"{"text": "words{words in brackets}m"}"#);
+    assert_eq!(
+        repair("{text:words{words in brackets}m}"),
+        r#"{"text": "words{words in brackets}m"}"#
+    );
 }
 
 // ============================================================================
@@ -686,18 +852,26 @@ fn test_parse_object_merge_at_the_end_more() {
 
 #[test]
 fn test_parse_array_edge_cases_more() {
-    assert_eq!(repair(r#"["lorem "ipsum" sic"]"#), r#"["lorem \"ipsum\" sic"]"#);
+    assert_eq!(
+        repair(r#"["lorem "ipsum" sic"]"#),
+        r#"["lorem \"ipsum\" sic"]"#
+    );
     assert_eq!(
         repair(r#"{"key1": ["value1", "value2"}, "key2": ["value3", "value4"]}"#),
         r#"{"key1": ["value1", "value2"], "key2": ["value3", "value4"]}"#
     );
     assert_eq!(
-        repair(r#"{"key": ["lorem "ipsum" dolor "sit" amet, "consectetur" ", "lorem "ipsum" dolor", "lorem"]}"#),
+        repair(
+            r#"{"key": ["lorem "ipsum" dolor "sit" amet, "consectetur" ", "lorem "ipsum" dolor", "lorem"]}"#
+        ),
         r#"{"key": ["lorem \"ipsum\" dolor \"sit\" amet, \"consectetur\" ", "lorem \"ipsum\" dolor", "lorem"]}"#
     );
     assert_eq!(repair(r#"{"k"e"y": "value"}"#), r#"{"k\"e\"y": "value"}"#);
     assert_eq!(repair(r#"["key":"value"}]"#), r#"[{"key": "value"}]"#);
-    assert_eq!(repair(r#"[{"key": "value", "key"#), r#"[{"key": "value"}, ["key"]]"#);
+    assert_eq!(
+        repair(r#"[{"key": "value", "key"#),
+        r#"[{"key": "value"}, ["key"]]"#
+    );
     assert_eq!(repair("{'key1', 'key2'}"), r#"["key1", "key2"]"#);
 }
 
@@ -712,11 +886,15 @@ fn test_parse_array_missing_quotes() {
         r#"["value1", "value2", "value3"]"#
     );
     assert_eq!(
-        repair(r#"{"bad_one":["Lorem Ipsum", "consectetur" comment" ], "good_one":[ "elit", "sed", "tempor"]}"#),
+        repair(
+            r#"{"bad_one":["Lorem Ipsum", "consectetur" comment" ], "good_one":[ "elit", "sed", "tempor"]}"#
+        ),
         r#"{"bad_one": ["Lorem Ipsum", "consectetur", "comment"], "good_one": ["elit", "sed", "tempor"]}"#
     );
     assert_eq!(
-        repair(r#"{"bad_one": ["Lorem Ipsum","consectetur" comment],"good_one": ["elit","sed","tempor"]}"#),
+        repair(
+            r#"{"bad_one": ["Lorem Ipsum","consectetur" comment],"good_one": ["elit","sed","tempor"]}"#
+        ),
         r#"{"bad_one": ["Lorem Ipsum", "consectetur", "comment"], "good_one": ["elit", "sed", "tempor"]}"#
     );
 }
@@ -751,7 +929,10 @@ fn test_string_json_llm_block_more() {
         repair(r#"{"key": "```json {"key": [{"key1": 1},{"key2": 2}]}```"}"#),
         r#"{"key": {"key": [{"key1": 1}, {"key2": 2}]}}"#
     );
-    assert_eq!(repair(r#"{"response": "```json{}"}"#), r#"{"response": "```json{}"}"#);
+    assert_eq!(
+        repair(r#"{"response": "```json{}"}"#),
+        r#"{"response": "```json{}"}"#
+    );
 }
 
 // ============================================================================
@@ -773,11 +954,13 @@ fn test_multiple_jsons_with_markdown() {
 #[test]
 fn test_leading_trailing_characters_multiline() {
     assert_eq!(
-        repair(r#"
+        repair(
+            r#"
                        The next 64 elements are:
                        ```json
                        { "key": "value" }
-                       ```"#),
+                       ```"#
+        ),
         r#"{"key": "value"}"#
     );
 }
@@ -832,44 +1015,68 @@ fn test_parse_object_duplicate_with_quotes() {
 
 #[test]
 fn test_strict_duplicate_keys_inside_array() {
-    let strict_opts = RepairOptions { strict: true, skip_json_loads: true, ..Default::default() };
+    let strict_opts = RepairOptions {
+        strict: true,
+        skip_json_loads: true,
+        ..Default::default()
+    };
     assert!(repair_json(r#"[{"key": "first", "key": "second"}]"#, &strict_opts).is_err());
 }
 
 #[test]
 fn test_strict_rejects_empty_object_with_extra_characters() {
-    let strict_opts = RepairOptions { strict: true, ..Default::default() };
+    let strict_opts = RepairOptions {
+        strict: true,
+        ..Default::default()
+    };
     assert!(repair_json(r#"{"dangling"}"#, &strict_opts).is_err());
 }
 
 #[test]
 fn test_strict_detects_doubled_quotes() {
-    let strict_opts = RepairOptions { strict: true, ..Default::default() };
+    let strict_opts = RepairOptions {
+        strict: true,
+        ..Default::default()
+    };
     assert!(repair_json(r#"{"key": """"}"#, &strict_opts).is_err());
     assert!(repair_json(r#"{"key": "" "value"}"#, &strict_opts).is_err());
 }
 
 #[test]
 fn test_strict_rejects_multiple_top_level_values() {
-    let strict_opts = RepairOptions { strict: true, ..Default::default() };
+    let strict_opts = RepairOptions {
+        strict: true,
+        ..Default::default()
+    };
     assert!(repair_json(r#"{"key":"value"}["value"]"#, &strict_opts).is_err());
 }
 
 #[test]
 fn test_strict_rejects_empty_keys() {
-    let strict_opts = RepairOptions { strict: true, skip_json_loads: true, ..Default::default() };
+    let strict_opts = RepairOptions {
+        strict: true,
+        skip_json_loads: true,
+        ..Default::default()
+    };
     assert!(repair_json(r#"{"" : "value"}"#, &strict_opts).is_err());
 }
 
 #[test]
 fn test_strict_requires_colon_between_key_and_value() {
-    let strict_opts = RepairOptions { strict: true, ..Default::default() };
+    let strict_opts = RepairOptions {
+        strict: true,
+        ..Default::default()
+    };
     assert!(repair_json(r#"{"missing" "colon"}"#, &strict_opts).is_err());
 }
 
 #[test]
 fn test_strict_rejects_empty_values() {
-    let strict_opts = RepairOptions { strict: true, skip_json_loads: true, ..Default::default() };
+    let strict_opts = RepairOptions {
+        strict: true,
+        skip_json_loads: true,
+        ..Default::default()
+    };
     assert!(repair_json(r#"{"key": , "key2": "value2"}"#, &strict_opts).is_err());
 }
 
@@ -886,7 +1093,7 @@ fn test_ensure_ascii() {
         repair("{'test_中国人_ascii':'统一码'}"),
         r#"{"test_\u4e2d\u56fd\u4eba_ascii": "\u7edf\u4e00\u7801"}"#
     );
-    
+
     // Python's ensure_ascii=False preserves unicode characters
     assert_eq!(
         repair_unicode("{'test_中国人_ascii':'统一码'}"),
@@ -905,7 +1112,7 @@ fn test_repair_json_with_objects_complex() {
         repair("{\n\"html\": \"<h3 id=\"aaa\">Waarom meer dan 200 Technical Experts - \"Passie voor techniek\"?</h3>\"}"),
         "{\"html\": \"<h3 id=\\\"aaa\\\">Waarom meer dan 200 Technical Experts - \\\"Passie voor techniek\\\"?</h3>\"}"
     );
-    
+
     // Array with embedded quotes in strings (using # in tag)
     assert_eq!(
         repair("[{\"foo\": \"Foo bar baz\", \"tag\": \"#foo-bar-baz\"}, {\"foo\": \"foo bar \"foobar\" foo bar baz.\", \"tag\": \"#foo-bar-foobar\"}]"),
@@ -964,7 +1171,7 @@ fn test_parse_object_with_return_objects() {
             ("key3".to_string(), JsonValue::Bool(true)),
         ])
     );
-    
+
     // { "key": value, "key2": 1 "key3": null }
     assert_eq!(
         load(r#"{ "key": value, "key2": 1 "key3": null }"#),

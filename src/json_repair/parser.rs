@@ -2,7 +2,7 @@
 //!
 //! This module contains the main parser and all parsing functions.
 
-use super::context::{JsonContext as Context, ContextValue};
+use super::context::{ContextValue, JsonContext as Context};
 use super::value::JsonValue;
 use super::JsonRepairError;
 
@@ -35,7 +35,9 @@ impl Default for RepairOptions {
 pub const STRING_DELIMITERS: &[char] = &['"', '\'', '"', '"'];
 
 /// Characters that can appear in a number
-pub const NUMBER_CHARS: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '.', 'e', 'E', '/', ',', '_'];
+pub const NUMBER_CHARS: &[char] = &[
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', '.', 'e', 'E', '/', ',', '_',
+];
 
 /// The main JSON parser struct
 pub struct JsonParser<'a> {
@@ -58,15 +60,18 @@ impl<'a> JsonParser<'a> {
     /// Main parse entry point
     pub fn parse(&mut self) -> Result<JsonValue, JsonRepairError> {
         let json = self.parse_json()?;
-        
+
         if self.index < self.chars.len() {
             let mut results = vec![json];
-            
+
             while self.index < self.chars.len() {
                 self.context.reset();
                 if let Ok(j) = self.parse_json() {
                     if !j.is_empty() {
-                        if !results.is_empty() && (Self::is_same_object(&results[results.len() - 1], &j) || results[results.len() - 1].is_empty()) {
+                        if !results.is_empty()
+                            && (Self::is_same_object(&results[results.len() - 1], &j)
+                                || results[results.len() - 1].is_empty())
+                        {
                             results.pop();
                         }
                         results.push(j);
@@ -77,18 +82,18 @@ impl<'a> JsonParser<'a> {
                     self.index += 1;
                 }
             }
-            
+
             if results.len() == 1 {
                 return Ok(results.remove(0));
             } else if self.options.strict {
                 return Err(JsonRepairError::ParseError(
-                    "Multiple top-level JSON elements found".to_string()
+                    "Multiple top-level JSON elements found".to_string(),
                 ));
             }
-            
+
             return Ok(JsonValue::Array(results));
         }
-        
+
         Ok(json)
     }
 
@@ -111,7 +116,9 @@ impl<'a> JsonParser<'a> {
                 '#' | '/' => {
                     return self.parse_comment();
                 }
-                _ if !self.context.is_empty() && (STRING_DELIMITERS.contains(&c) || c.is_alphabetic()) => {
+                _ if !self.context.is_empty()
+                    && (STRING_DELIMITERS.contains(&c) || c.is_alphabetic()) =>
+                {
                     return self.parse_string();
                 }
                 _ if !self.context.is_empty() && (c.is_ascii_digit() || c == '-' || c == '.') => {
@@ -186,7 +193,9 @@ impl<'a> JsonParser<'a> {
                 if obj_a.is_empty() || obj_b.is_empty() {
                     return false;
                 }
-                obj_a.iter().all(|(k, _)| obj_b.iter().any(|(k2, _)| k == k2))
+                obj_a
+                    .iter()
+                    .all(|(k, _)| obj_b.iter().any(|(k2, _)| k == k2))
             }
             (JsonValue::Array(arr_a), JsonValue::Array(arr_b)) => {
                 if arr_a.is_empty() || arr_b.is_empty() {
@@ -201,7 +210,7 @@ impl<'a> JsonParser<'a> {
     pub fn parse_comment(&mut self) -> Result<JsonValue, JsonRepairError> {
         let char = self.get_char_at(0);
         let mut termination_chars = vec!['\n', '\r'];
-        
+
         if self.context.contains(ContextValue::Array) {
             termination_chars.push(']');
         }
@@ -281,7 +290,12 @@ impl<'a> JsonParser<'a> {
         }
 
         // Handle trailing invalid characters
-        if !number_str.is_empty() && matches!(number_str.chars().last(), Some('-') | Some('e') | Some('E') | Some('/') | Some(',')) {
+        if !number_str.is_empty()
+            && matches!(
+                number_str.chars().last(),
+                Some('-') | Some('e') | Some('E') | Some('/') | Some(',')
+            )
+        {
             number_str.pop();
             self.index -= 1;
         } else if self.get_char_at(0).is_some_and(|c| c.is_alphabetic()) {
@@ -294,7 +308,7 @@ impl<'a> JsonParser<'a> {
         if number_str.contains(',') {
             return Ok(JsonValue::String(number_str));
         }
-        
+
         if number_str.contains('.') || number_str.contains('e') || number_str.contains('E') {
             if let Ok(f) = number_str.parse::<f64>() {
                 return Ok(JsonValue::Float(f));
@@ -333,7 +347,10 @@ impl<'a> JsonParser<'a> {
             // Ignore unquoted ellipsis (previous char is .), keep quoted ones
             if value == JsonValue::String("...".to_string()) && self.get_char_at(-1) == Some('.') {
                 // Ignore unquoted ellipsis
-            } else if !value.is_empty() || self.get_char_at(0) == Some(']') || self.get_char_at(0) == Some(',') {
+            } else if !value.is_empty()
+                || self.get_char_at(0) == Some(']')
+                || self.get_char_at(0) == Some(',')
+            {
                 // Special case: if parse_object returned an array (due to duplicate key handling),
                 // flatten it into our array instead of nesting it
                 if let JsonValue::Array(inner) = &value {
@@ -397,14 +414,17 @@ impl<'a> JsonParser<'a> {
                 if self.get_char_at(0) == Some('[') && key.is_empty() {
                     // Merge with previous array if exists
                     let prev_key = obj.last().map(|(k, _)| k.clone());
-                    let prev_is_array = obj.last().map(|(_, v)| matches!(v, JsonValue::Array(_))).unwrap_or(false);
-                    
+                    let prev_is_array = obj
+                        .last()
+                        .map(|(_, v)| matches!(v, JsonValue::Array(_)))
+                        .unwrap_or(false);
+
                     if let Some(pk) = prev_key {
                         if prev_is_array {
                             // If the previous key's value is an array, parse the new array and merge
                             self.index += 1;
                             let new_array = self.parse_array()?;
-                            
+
                             if let JsonValue::Array(new_arr) = new_array {
                                 // Find the previous key's value and extend it
                                 for (k, v) in obj.iter_mut() {
@@ -425,7 +445,7 @@ impl<'a> JsonParser<'a> {
                                     }
                                 }
                             }
-                            
+
                             self.skip_whitespaces();
                             if self.get_char_at(0) == Some(',') {
                                 self.index += 1;
@@ -435,17 +455,20 @@ impl<'a> JsonParser<'a> {
                         }
                     }
                 }
-                
+
                 key = match self.parse_string()? {
                     JsonValue::String(s) => s,
                     _ => String::new(),
                 };
-                
+
                 if key.is_empty() {
                     self.skip_whitespaces();
                 }
-                
-                if !key.is_empty() || self.get_char_at(0) == Some(':') || self.get_char_at(0) == Some('}') {
+
+                if !key.is_empty()
+                    || self.get_char_at(0) == Some(':')
+                    || self.get_char_at(0) == Some('}')
+                {
                     if key.is_empty() && self.options.strict {
                         return Err(JsonRepairError::ParseError("Empty key found".to_string()));
                     }
@@ -456,13 +479,15 @@ impl<'a> JsonParser<'a> {
             // Check for duplicate keys
             if self.context.contains(ContextValue::Array) && obj.iter().any(|(k, _)| k == &key) {
                 if self.options.strict {
-                    return Err(JsonRepairError::ParseError("Duplicate key found".to_string()));
+                    return Err(JsonRepairError::ParseError(
+                        "Duplicate key found".to_string(),
+                    ));
                 }
                 // Roll back and parse remaining as new object
                 self.index = rollback_index;
                 self.context.reset();
                 let remaining = self.parse_object()?;
-                
+
                 // Return an array containing the current object and the remaining object/array
                 let mut result = vec![JsonValue::Object(obj)];
                 result.push(remaining);
@@ -477,7 +502,9 @@ impl<'a> JsonParser<'a> {
 
             // Handle missing colon
             if self.get_char_at(0) != Some(':') && self.options.strict {
-                return Err(JsonRepairError::ParseError("Missing ':' after key".to_string()));
+                return Err(JsonRepairError::ParseError(
+                    "Missing ':' after key".to_string(),
+                ));
             }
 
             self.index += 1;
@@ -489,7 +516,9 @@ impl<'a> JsonParser<'a> {
             // Parse value
             let value = if self.get_char_at(0) == Some(',') || self.get_char_at(0) == Some('}') {
                 if self.options.strict {
-                    return Err(JsonRepairError::ParseError("Parsed value is empty".to_string()));
+                    return Err(JsonRepairError::ParseError(
+                        "Parsed value is empty".to_string(),
+                    ));
                 }
                 JsonValue::String(String::new())
             } else {
@@ -512,7 +541,9 @@ impl<'a> JsonParser<'a> {
         // If object is empty but has content, try parsing as array
         if obj.is_empty() && self.index - start_index > 2 {
             if self.options.strict {
-                return Err(JsonRepairError::ParseError("Parsed object is empty".to_string()));
+                return Err(JsonRepairError::ParseError(
+                    "Parsed object is empty".to_string(),
+                ));
             }
             self.index = start_index;
             return self.parse_array();
@@ -529,11 +560,11 @@ impl<'a> JsonParser<'a> {
         }
         self.index += 1;
         self.skip_whitespaces();
-        
+
         if !STRING_DELIMITERS.contains(&self.get_char_at(0).unwrap_or(' ')) {
             return Ok(JsonValue::Object(obj));
         }
-        
+
         if !self.options.strict {
             if let Ok(JsonValue::Object(additional)) = self.parse_object() {
                 for (k, v) in additional {
@@ -595,8 +626,10 @@ impl<'a> JsonParser<'a> {
                 // Empty string case
                 if let Some(next) = self.get_char_at(1) {
                     if (self.context.current() == Some(ContextValue::ObjectKey) && next == ':')
-                        || (self.context.current() == Some(ContextValue::ObjectValue) && (next == ',' || next == '}'))
-                        || (self.context.current() == Some(ContextValue::Array) && (next == ',' || next == ']'))
+                        || (self.context.current() == Some(ContextValue::ObjectValue)
+                            && (next == ',' || next == '}'))
+                        || (self.context.current() == Some(ContextValue::Array)
+                            && (next == ',' || next == ']'))
                     {
                         self.index += 1;
                         return Ok(JsonValue::String(String::new()));
@@ -604,7 +637,9 @@ impl<'a> JsonParser<'a> {
                     // Tripled quotes
                     if next == lstring_delimiter {
                         if self.options.strict {
-                            return Err(JsonRepairError::ParseError("Found doubled quotes followed by another quote.".to_string()));
+                            return Err(JsonRepairError::ParseError(
+                                "Found doubled quotes followed by another quote.".to_string(),
+                            ));
                         }
                         return Ok(JsonValue::String(String::new()));
                     }
@@ -620,7 +655,10 @@ impl<'a> JsonParser<'a> {
                         // Check what follows
                         let j = self.scroll_whitespaces(1);
                         if let Some(after_ws) = self.get_char_at(j as isize) {
-                            if STRING_DELIMITERS.contains(&after_ws) || after_ws == '{' || after_ws == '[' {
+                            if STRING_DELIMITERS.contains(&after_ws)
+                                || after_ws == '{'
+                                || after_ws == '['
+                            {
                                 if self.options.strict {
                                     return Err(JsonRepairError::ParseError("Found doubled quotes followed by another quote while parsing a string.".to_string()));
                                 }
@@ -647,10 +685,14 @@ impl<'a> JsonParser<'a> {
 
             // Handle missing quotes termination
             if missing_quotes {
-                if self.context.current() == Some(ContextValue::ObjectKey) && (char == ':' || char.is_whitespace()) {
+                if self.context.current() == Some(ContextValue::ObjectKey)
+                    && (char == ':' || char.is_whitespace())
+                {
                     break;
                 }
-                if self.context.current() == Some(ContextValue::Array) && (char == ']' || char == ',') {
+                if self.context.current() == Some(ContextValue::Array)
+                    && (char == ']' || char == ',')
+                {
                     break;
                 }
             }
@@ -748,14 +790,19 @@ impl<'a> JsonParser<'a> {
             self.index += 1;
 
             // Handle stream_stable trailing backslash
-            if self.options.stream_stable && self.get_char_at(0).is_none() && string_acc.ends_with('\\') {
+            if self.options.stream_stable
+                && self.get_char_at(0).is_none()
+                && string_acc.ends_with('\\')
+            {
                 string_acc.pop();
             }
 
             // Handle escape sequences
             if let Some(next_char) = self.get_char_at(0) {
                 if string_acc.ends_with('\\') {
-                    if matches!(next_char, '"' | 't' | 'n' | 'r' | 'b' | '\\') || next_char == rstring_delimiter {
+                    if matches!(next_char, '"' | 't' | 'n' | 'r' | 'b' | '\\')
+                        || next_char == rstring_delimiter
+                    {
                         string_acc.pop();
                         match next_char {
                             't' => string_acc.push('\t'),
@@ -765,7 +812,7 @@ impl<'a> JsonParser<'a> {
                             _ => string_acc.push(next_char),
                         }
                         self.index += 1;
-                        
+
                         // Handle consecutive escapes
                         while let Some(c) = self.get_char_at(0) {
                             if string_acc.ends_with('\\') && (c == rstring_delimiter || c == '\\') {
@@ -781,8 +828,12 @@ impl<'a> JsonParser<'a> {
                         // Unicode/hex escape
                         let num_chars = if next_char == 'u' { 4 } else { 2 };
                         if self.index + 1 + num_chars <= self.chars.len() {
-                            let hex: String = self.chars[self.index + 1..self.index + 1 + num_chars].iter().collect();
-                            if hex.len() == num_chars && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                            let hex: String = self.chars
+                                [self.index + 1..self.index + 1 + num_chars]
+                                .iter()
+                                .collect();
+                            if hex.len() == num_chars && hex.chars().all(|c| c.is_ascii_hexdigit())
+                            {
                                 if let Ok(code) = u32::from_str_radix(&hex, 16) {
                                     if let Some(ch) = char::from_u32(code) {
                                         string_acc.pop();
@@ -793,7 +844,9 @@ impl<'a> JsonParser<'a> {
                                 }
                             }
                         }
-                    } else if STRING_DELIMITERS.contains(&next_char) && next_char != rstring_delimiter {
+                    } else if STRING_DELIMITERS.contains(&next_char)
+                        && next_char != rstring_delimiter
+                    {
                         // Escaped delimiter that shouldn't be escaped
                         string_acc.pop();
                         string_acc.push(next_char);
@@ -804,7 +857,10 @@ impl<'a> JsonParser<'a> {
             }
 
             // Handle colon in OBJECT_KEY context
-            if self.get_char_at(0) == Some(':') && !missing_quotes && self.context.current() == Some(ContextValue::ObjectKey) {
+            if self.get_char_at(0) == Some(':')
+                && !missing_quotes
+                && self.context.current() == Some(ContextValue::ObjectKey)
+            {
                 let i = self.skip_to_character(&[lstring_delimiter], 1);
                 if self.get_char_at(i as isize).is_some() {
                     let j = self.skip_to_character(&[rstring_delimiter], i + 1);
@@ -827,7 +883,7 @@ impl<'a> JsonParser<'a> {
                         self.index += 1;
                         continue;
                     }
-                    
+
                     // Missing quotes in OBJECT_VALUE
                     if missing_quotes && self.context.current() == Some(ContextValue::ObjectValue) {
                         let mut i = 1;
@@ -846,7 +902,7 @@ impl<'a> JsonParser<'a> {
                         }
                         continue;
                     }
-                    
+
                     // Unmatched delimiter
                     if unmatched_delimiter {
                         unmatched_delimiter = false;
@@ -854,11 +910,11 @@ impl<'a> JsonParser<'a> {
                         self.index += 1;
                         continue;
                     }
-                    
+
                     // Check for misplaced quote (Python lines 346-458)
                     let mut i = 1;
                     let mut check_comma_in_object_value = true;
-                    
+
                     while let Some(nc) = self.get_char_at(i as isize) {
                         if nc == rstring_delimiter || nc == lstring_delimiter {
                             break;
@@ -867,10 +923,14 @@ impl<'a> JsonParser<'a> {
                             check_comma_in_object_value = false;
                         }
                         // Check for structural characters
-                        if (self.context.contains(ContextValue::ObjectKey) && (nc == ':' || nc == '}'))
+                        if (self.context.contains(ContextValue::ObjectKey)
+                            && (nc == ':' || nc == '}'))
                             || (self.context.contains(ContextValue::ObjectValue) && nc == '}')
-                            || (self.context.contains(ContextValue::Array) && (nc == ']' || nc == ','))
-                            || (check_comma_in_object_value && self.context.current() == Some(ContextValue::ObjectValue) && nc == ',')
+                            || (self.context.contains(ContextValue::Array)
+                                && (nc == ']' || nc == ','))
+                            || (check_comma_in_object_value
+                                && self.context.current() == Some(ContextValue::ObjectValue)
+                                && nc == ',')
                         {
                             break;
                         }
@@ -878,9 +938,11 @@ impl<'a> JsonParser<'a> {
                     }
 
                     let next_c = self.get_char_at(i as isize);
-                    
+
                     // Handle comma in OBJECT_VALUE
-                    if next_c == Some(',') && self.context.current() == Some(ContextValue::ObjectValue) {
+                    if next_c == Some(',')
+                        && self.context.current() == Some(ContextValue::ObjectValue)
+                    {
                         let mut j = i + 1;
                         j = self.skip_to_character(&[rstring_delimiter], j);
                         if self.get_char_at(j as isize).is_some() {
@@ -892,17 +954,20 @@ impl<'a> JsonParser<'a> {
                             }
                         }
                     }
-                    
+
                     // Handle delimiter found
-                    if next_c == Some(rstring_delimiter) && self.get_char_at((i - 1) as isize) != Some('\\') {
+                    if next_c == Some(rstring_delimiter)
+                        && self.get_char_at((i - 1) as isize) != Some('\\')
+                    {
                         // Check if only whitespace between quotes
                         let all_whitespace = (1..i).all(|k| {
-                            self.get_char_at(k as isize).is_none_or(|c| c.is_whitespace())
+                            self.get_char_at(k as isize)
+                                .map_or(true, |c| c.is_whitespace())
                         });
                         if all_whitespace {
                             break;
                         }
-                        
+
                         if self.context.current() == Some(ContextValue::ObjectValue) {
                             let j = self.scroll_whitespaces(i + 1);
                             if self.get_char_at(j as isize) == Some(',') {
@@ -918,7 +983,7 @@ impl<'a> JsonParser<'a> {
                                     continue;
                                 }
                             }
-                            
+
                             // Check if this is a key
                             let mut k = self.skip_to_character(&[rstring_delimiter], j + 1);
                             k += 1;
@@ -928,12 +993,17 @@ impl<'a> JsonParser<'a> {
                                     found_colon = true;
                                     break;
                                 }
-                                if nc == ',' || nc == ']' || nc == '}' || (nc == rstring_delimiter && self.get_char_at((k - 1) as isize) != Some('\\')) {
+                                if nc == ','
+                                    || nc == ']'
+                                    || nc == '}'
+                                    || (nc == rstring_delimiter
+                                        && self.get_char_at((k - 1) as isize) != Some('\\'))
+                                {
                                     break;
                                 }
                                 k += 1;
                             }
-                            
+
                             if !found_colon {
                                 unmatched_delimiter = !unmatched_delimiter;
                                 string_acc.push(c);
@@ -952,7 +1022,7 @@ impl<'a> JsonParser<'a> {
                                 }
                                 j = self.skip_to_character(&[rstring_delimiter, ']'], j + 1);
                             }
-                            
+
                             if even_delimiters {
                                 unmatched_delimiter = !unmatched_delimiter;
                                 string_acc.push(c);
@@ -973,7 +1043,10 @@ impl<'a> JsonParser<'a> {
 
         // Handle extreme corner case
         if let Some(c) = self.get_char_at(0) {
-            if missing_quotes && self.context.current() == Some(ContextValue::ObjectKey) && c.is_whitespace() {
+            if missing_quotes
+                && self.context.current() == Some(ContextValue::ObjectKey)
+                && c.is_whitespace()
+            {
                 self.skip_whitespaces();
                 if !matches!(self.get_char_at(0), Some(':') | Some(',')) {
                     return Ok(JsonValue::String(String::new()));
@@ -1000,7 +1073,7 @@ impl<'a> JsonParser<'a> {
 
     fn parse_boolean_or_null(&mut self) -> Option<JsonValue> {
         let char = self.get_char_at(0)?.to_ascii_lowercase();
-        
+
         let (expected, value) = match char {
             't' => ("true", JsonValue::Bool(true)),
             'f' => ("false", JsonValue::Bool(false)),
@@ -1036,7 +1109,9 @@ impl<'a> JsonParser<'a> {
             if block == "```json" {
                 let i = self.skip_to_character(&['`'], 7);
                 if self.index + i + 3 <= self.chars.len() {
-                    let end: String = self.chars[self.index + i..self.index + i + 3].iter().collect();
+                    let end: String = self.chars[self.index + i..self.index + i + 3]
+                        .iter()
+                        .collect();
                     if end == "```" {
                         self.index += 7;
                         return Ok(Some(self.parse_json()?));

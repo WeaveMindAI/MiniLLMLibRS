@@ -1,1 +1,23 @@
+# Build artifacts
 /target
+Cargo.lock
+
+# Environment
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test data (keep structure but not actual files)
+data/*.jpg
+data/*.mp3
+data/*.wav
+data/*.png

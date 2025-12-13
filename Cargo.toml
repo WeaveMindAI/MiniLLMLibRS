@@ -1,26 +1,59 @@
 [package]
 name = "minillmlib"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.85"
-description = "Minimalist Rust library for LLM interactions"
+edition = "2021"
+rust-version = "1.75"
+description = "A minimalist, async-first Rust library for LLM interactions with streaming support"
 license = "MIT"
+repository = "https://github.com/qfeuilla/MiniLLMLibRS"
+homepage = "https://github.com/qfeuilla/MiniLLMLibRS"
+documentation = "https://docs.rs/minillmlib"
+readme = "README.md"
+keywords = ["llm", "openai", "openrouter", "ai", "streaming"]
+categories = ["api-bindings", "asynchronous", "web-programming"]
+authors = ["qfeuilla"]
+exclude = [
+    "data/*",
+    ".env",
+    ".github/*",
+]
 
 [lib]
 name = "minillmlib"
 path = "src/lib.rs"
 
 [[bin]]
-name = "minillmlib"
+name = "minillmlib-cli"
 path = "src/main.rs"
 
 [dependencies]
-# Serialization - we use serde_json for the final output
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
+futures = "0.3"
+
+# HTTP & Streaming
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-eventsource = "0.6"
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 # Error handling
 thiserror = "2"
 
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Media processing
+base64 = "0.22"
+
+# Utilities
+dotenvy = "0.15"
+secrecy = { version = "0.10", features = ["serde"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
 [dev-dependencies]
-# For running tests
+tokio-test = "0.4"

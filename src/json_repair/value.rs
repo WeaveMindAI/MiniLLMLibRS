@@ -30,7 +30,7 @@ impl JsonValue {
     pub fn to_json_string(&self) -> String {
         self.to_json_string_with_options(true)
     }
-    
+
     /// Convert this value to a JSON string with configurable ASCII escaping
     pub fn to_json_string_with_options(&self, ensure_ascii: bool) -> String {
         match self {
@@ -47,13 +47,22 @@ impl JsonValue {
             }
             JsonValue::String(s) => format!("\"{}\"", escape_json_string(s, ensure_ascii)),
             JsonValue::Array(arr) => {
-                let items: Vec<String> = arr.iter().map(|v| v.to_json_string_with_options(ensure_ascii)).collect();
+                let items: Vec<String> = arr
+                    .iter()
+                    .map(|v| v.to_json_string_with_options(ensure_ascii))
+                    .collect();
                 format!("[{}]", items.join(", "))
             }
             JsonValue::Object(obj) => {
                 let items: Vec<String> = obj
                     .iter()
-                    .map(|(k, v)| format!("\"{}\": {}", escape_json_string(k, ensure_ascii), v.to_json_string_with_options(ensure_ascii)))
+                    .map(|(k, v)| {
+                        format!(
+                            "\"{}\": {}",
+                            escape_json_string(k, ensure_ascii),
+                            v.to_json_string_with_options(ensure_ascii)
+                        )
+                    })
                     .collect();
                 format!("{{{}}}", items.join(", "))
             }
@@ -139,10 +148,15 @@ impl From<serde_json::Value> for JsonValue {
             }
             serde_json::Value::Object(obj) => {
                 // Clean up keys: strip trailing whitespace/newlines (common LLM issue)
-                JsonValue::Object(obj.into_iter().map(|(k, v)| {
-                    let clean_key = k.trim_end_matches(|c: char| c.is_whitespace()).to_string();
-                    (clean_key, JsonValue::from(v))
-                }).collect())
+                JsonValue::Object(
+                    obj.into_iter()
+                        .map(|(k, v)| {
+                            let clean_key =
+                                k.trim_end_matches(|c: char| c.is_whitespace()).to_string();
+                            (clean_key, JsonValue::from(v))
+                        })
+                        .collect(),
+                )
             }
         }
     }
