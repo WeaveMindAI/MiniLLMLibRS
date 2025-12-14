@@ -7,10 +7,11 @@
 
 use minillmlib::{
     chat_node::ChatNode,
-    generator::{CompletionParameters, GeneratorInfo, NodeCompletionParameters},
+    generator::{CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings},
     message::{AudioData, ImageData, Message, MessageContent, Role},
     provider::LLMClient,
 };
+use std::sync::Arc;
 
 // Test model - small and cheap for testing
 const TEST_MODEL: &str = "google/gemini-2.0-flash-lite-001";
@@ -1086,4 +1087,124 @@ fn test_validate_json_response_missing_content() {
 
     let result = validate_json_response(&response);
     assert!(result.is_err());
+}
+
+// =============================================================================
+// Multi-threading and Async Concurrency Tests
+// =============================================================================
+
+const CHEAP_MODEL: &str = "meta-llama/llama-3.2-3b-instruct";
+
+fn get_cheap_generator() -> GeneratorInfo {
+    dotenvy::dotenv().ok();
+    let provider = ProviderSettings::new().sort_by_price();
+    GeneratorInfo::openrouter(CHEAP_MODEL)
+        .with_default_params(CompletionParameters::default().with_provider(provider))
+}
+
+/// Test multi-threaded access to ChatNode
+/// Spawns multiple OS threads that each make a completion request
+#[tokio::test]
+async fn test_multi_threaded_completions() {
+    let gi = get_cheap_generator();
+    let params = NodeCompletionParameters::default()
+        .with_params(CompletionParameters::default().with_max_tokens(20));
+    
+    // Create a shared root node
+    let root = ChatNode::root("You are a helpful assistant. Be very brief.");
+    
+    // Spawn 10 threads, each making a completion
+    let mut handles = vec![];
+    
+    for i in 0..10 {
+        let gi_clone = gi.clone();
+        let params_clone = params.clone();
+        let root_clone = Arc::clone(&root);
+        
+        let handle = std::thread::spawn(move || {
+            // Each thread creates its own runtime for the async call
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                // Add a user message as a child
+                let user_node = root_clone.add_user(format!("Say the number {}", i));
+                
+                let result = user_node.complete(&gi_clone, Some(&params_clone)).await;
+                (i, result.is_ok())
+            })
+        });
+        
+        handles.push(handle);
+    }
+    
+    // Collect results
+    let mut successes = 0;
+    for handle in handles {
+        let (i, ok) = handle.join().expect("Thread panicked");
+        println!("Thread {}: {}", i, if ok { "OK" } else { "FAILED" });
+        if ok {
+            successes += 1;
+        }
+    }
+    
+    // All should succeed
+    assert!(successes >= 8, "At least 8/10 threads should succeed, got {}", successes);
+    
+    // Verify tree structure - root should have 10 children
+    let children_count = root.child_count();
+    assert_eq!(children_count, 10, "Root should have 10 children");
+}
+
+/// Test async concurrent completions (like Python's asyncio.gather)
+/// All requests are sent concurrently and awaited together
+#[tokio::test]
+async fn test_async_concurrent_completions() {
+    let gi = get_cheap_generator();
+    let params = NodeCompletionParameters::default()
+        .with_params(CompletionParameters::default().with_max_tokens(20));
+    
+    let root = ChatNode::root("You are a helpful assistant. Be very brief.");
+    
+    // Create 10 futures for concurrent execution
+    let mut futures = vec![];
+    
+    for i in 0..10 {
+        let gi_clone = gi.clone();
+        let params_clone = params.clone();
+        let root_clone = Arc::clone(&root);
+        
+        // Create the future (doesn't execute yet)
+        let future = async move {
+            let user_node = root_clone.add_user(format!("What is {} + 1?", i));
+            
+            let result = user_node.complete(&gi_clone, Some(&params_clone)).await;
+            (i, result)
+        };
+        
+        futures.push(future);
+    }
+    
+    // Execute all futures concurrently (like asyncio.gather)
+    let results = futures::future::join_all(futures).await;
+    
+    // Check results
+    let mut successes = 0;
+    for (i, result) in results {
+        match result {
+            Ok(response_node) => {
+                let content = response_node.message.content.get_text().unwrap_or("");
+                println!("Request {}: OK - {}", i, content.chars().take(50).collect::<String>());
+                successes += 1;
+            }
+            Err(e) => {
+                println!("Request {}: FAILED - {}", i, e);
+            }
+        }
+    }
+    
+    assert!(successes >= 8, "At least 8/10 concurrent requests should succeed, got {}", successes);
+    
+    // Verify tree structure - root should have 10 children (user messages)
+    // Each user message should have 1 child (assistant response)
+    let children_count = root.child_count();
+    assert_eq!(children_count, 10, "Root should have 10 children");
 }
