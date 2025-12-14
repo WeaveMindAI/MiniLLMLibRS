@@ -298,8 +298,10 @@ pub enum ResponseFormat {
     JsonObject,
 }
 
+use crate::provider::{CostCallback, CostTrackingType};
+
 /// Per-request completion parameters (used when calling complete on a node)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NodeCompletionParameters {
     /// Override the generator for this request
     pub generator: Option<super::GeneratorInfo>,
@@ -341,6 +343,13 @@ pub struct NodeCompletionParameters {
 
     /// Custom request timeout in seconds
     pub timeout_secs: Option<u64>,
+
+    // Cost tracking
+    /// Type of cost tracking to use (default: None)
+    pub cost_tracking: CostTrackingType,
+
+    /// Callback function called with cost info after each completion
+    pub cost_callback: Option<CostCallback>,
 }
 
 impl Default for NodeCompletionParameters {
@@ -359,7 +368,25 @@ impl Default for NodeCompletionParameters {
             crash_on_refusal: false,
             crash_on_empty_response: false,
             timeout_secs: None,
+            cost_tracking: CostTrackingType::None,
+            cost_callback: None,
         }
+    }
+}
+
+impl std::fmt::Debug for NodeCompletionParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeCompletionParameters")
+            .field("generator", &self.generator)
+            .field("params", &self.params)
+            .field("system_prompt", &self.system_prompt)
+            .field("stream", &self.stream)
+            .field("parse_json", &self.parse_json)
+            .field("force_prepend", &self.force_prepend)
+            .field("retry", &self.retry)
+            .field("cost_tracking", &self.cost_tracking)
+            .field("cost_callback", &self.cost_callback.is_some())
+            .finish()
     }
 }
 
@@ -444,6 +471,43 @@ impl NodeCompletionParameters {
 
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = Some(secs);
+        self
+    }
+
+    /// Enable cost tracking with OpenRouter's usage accounting
+    pub fn with_openrouter_cost_tracking(mut self) -> Self {
+        self.cost_tracking = CostTrackingType::OpenRouter;
+        self
+    }
+
+    /// Set the cost tracking type
+    pub fn with_cost_tracking(mut self, tracking_type: CostTrackingType) -> Self {
+        self.cost_tracking = tracking_type;
+        self
+    }
+
+    /// Set a callback function to be called with cost info after each completion
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::{Arc, Mutex};
+    ///
+    /// let total_cost = Arc::new(Mutex::new(0.0));
+    /// let cost_tracker = total_cost.clone();
+    ///
+    /// let params = NodeCompletionParameters::default()
+    ///     .with_openrouter_cost_tracking()
+    ///     .with_cost_callback(move |info| {
+    ///         let mut cost = cost_tracker.lock().unwrap();
+    ///         *cost += info.cost;
+    ///         println!("Request cost: {} credits, Total: {}", info.cost, *cost);
+    ///     });
+    /// ```
+    pub fn with_cost_callback<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(crate::provider::CostInfo) + Send + Sync + 'static,
+    {
+        self.cost_callback = Some(std::sync::Arc::new(callback));
         self
     }
 }

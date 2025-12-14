@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2025-12-14
+
+### Added
+
+- **Tree Navigation**: `get_root()` to navigate to root from any node
+- **Tree Manipulation**: `detach()` to remove a node from its parent, `merge()` to combine trees
+- **Tree Iteration**: `iter_depth_first()`, `iter_breadth_first()`, `iter_leaves()`, `node_count()`
+- **Format Kwargs**: Template substitution with `{placeholders}` in message content
+  - `set_format_kwarg()`, `get_format_kwarg()`, `formatted_thread()`
+  - Supports null placeholders in JSON (filled at runtime)
+- **Thread Serialization**: Save and load conversation threads to/from JSON
+  - `save_thread()`, `from_thread_file()`, `from_thread_json()`, `from_messages()`
+  - `ThreadData` and `ThreadMessage` structs for serialization
+- **Cost Tracking**: OpenRouter usage accounting with callbacks
+  - `CostInfo`, `CostTrackingType`, `CostCallback` types
+  - `with_openrouter_cost_tracking()`, `with_cost_callback()` on `NodeCompletionParameters`
+  - Works with both streaming and non-streaming completions
+- **Role Helper**: `Role::as_str()` method for string conversion
+
+### Changed
+
+- `Usage` struct now includes `cost`, `cached_tokens`, and `reasoning_tokens` fields
+- `pretty_messages()` and `format_conversation()` now apply format_kwargs
+- Streaming now waits for usage chunk after finish_reason (OpenRouter sends usage last)
+
+### Fixed
+
+- Streaming completions now correctly receive usage data from OpenRouter
+
 ## [0.1.1] - 2025-12-13
 
 ### Fixed

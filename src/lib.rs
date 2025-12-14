@@ -43,6 +43,7 @@ pub mod utils;
 // Re-export main types for convenience
 pub use chat_node::{
     format_conversation, pretty_messages, ChatNode, ConversationBuilder, PrettyPrintConfig,
+    ThreadData, ThreadMessage,
 };
 pub use error::{MiniLLMError, Result};
 pub use generator::{
@@ -50,7 +51,9 @@ pub use generator::{
 };
 pub use json_repair::{loads, repair_json, JsonValue, RepairOptions};
 pub use message::{AudioData, ImageData, Message, MessageContent, Role};
-pub use provider::{CompletionResponse, LLMClient, StreamingCompletion};
+pub use provider::{
+    CompletionResponse, CostCallback, CostInfo, CostTrackingType, LLMClient, StreamingCompletion,
+};
 pub use utils::{
     configure_logging, extract_json, extract_json_value, pretty_json, to_dict,
     validate_json_response, LogLevel,

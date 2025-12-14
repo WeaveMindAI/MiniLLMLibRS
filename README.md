@@ -12,6 +12,10 @@ A minimalist, async-first Rust library for LLM interactions with streaming suppo
 - **Async-first**: Built on Tokio for high-performance async operations
 - **Streaming Support**: First-class SSE streaming for real-time responses
 - **Conversation Trees**: `ChatNode` provides tree-based conversation structure with branching
+- **Tree Manipulation**: `detach()`, `merge()`, tree iterators (depth-first, breadth-first, leaves)
+- **Template Substitution**: Format kwargs with `{placeholders}` in messages
+- **Thread Serialization**: Save/load conversation threads to/from JSON files
+- **Cost Tracking**: OpenRouter usage accounting with callbacks
 - **Multimodal**: Support for images and audio in messages
 - **JSON Repair**: Robust handling of malformed JSON from LLM outputs
 - **OpenRouter Compatible**: Works with OpenRouter, OpenAI, and any OpenAI-compatible API
@@ -24,7 +28,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-minillmlib = "0.1"
+minillmlib = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -213,6 +217,99 @@ let config = PrettyPrintConfig::new("[SYS] ", "\n[USR] ", "\n[AST] ");
 let pretty = pretty_messages(&assistant, Some(&config));
 ```
 
+### Template Substitution (Format Kwargs)
+
+```rust
+use minillmlib::ChatNode;
+
+// Create a reusable prompt template
+let root = ChatNode::root("You are {bot_name}, a {style} assistant.");
+root.set_format_kwarg("bot_name", "Claude");
+root.set_format_kwarg("style", "helpful");
+
+let user = root.add_user("Hi {bot_name}!");
+
+// Get formatted messages with placeholders replaced
+let formatted = user.formatted_thread();
+// Messages now contain "You are Claude, a helpful assistant." etc.
+```
+
+### Save and Load Conversation Threads
+
+```rust
+use minillmlib::ChatNode;
+
+// Build a conversation
+let root = ChatNode::root("You are helpful.");
+root.set_format_kwarg("name", "Alice");
+let user = root.add_user("Hello {name}!");
+let assistant = user.add_assistant("Hi there!");
+
+// Save to JSON file
+assistant.save_thread("conversation.json")?;
+
+// Load from JSON file (returns root and leaf)
+let (loaded_root, loaded_leaf) = ChatNode::from_thread_file("conversation.json")?;
+
+// Or load from JSON string
+let json = r#"{"prompts": [{"role": "system", "content": "Hello"}], "required_kwargs": {}}"#;
+let (root, leaf) = ChatNode::from_thread_json(json)?;
+```
+
+### Tree Manipulation
+
+```rust
+use minillmlib::ChatNode;
+
+// Navigate to root from any node
+let root = some_deep_node.get_root();
+
+// Detach a subtree
+let subtree = node.detach();  // node is now a new root
+
+// Merge trees
+let merged = tree1_leaf.merge(&tree2_leaf);  // tree2's root becomes child of tree1_leaf
+
+// Iterate over tree
+for node in root.iter_depth_first() {
+    println!("{}", node.text().unwrap_or_default());
+}
+
+// Get all leaves
+let leaves = root.iter_leaves();
+
+// Count nodes
+let count = root.node_count();
+```
+
+### Cost Tracking (OpenRouter)
+
+```rust
+use minillmlib::{ChatNode, GeneratorInfo, NodeCompletionParameters, CostInfo};
+use std::sync::{Arc, Mutex};
+
+let generator = GeneratorInfo::openrouter("google/gemini-2.0-flash-lite-001");
+
+// Track costs across multiple requests
+let total_cost = Arc::new(Mutex::new(0.0));
+let cost_tracker = total_cost.clone();
+
+let params = NodeCompletionParameters::new()
+    .with_openrouter_cost_tracking()
+    .with_cost_callback(move |info: CostInfo| {
+        *cost_tracker.lock().unwrap() += info.cost;
+        println!("Request cost: {} credits", info.cost);
+        println!("Tokens: {} prompt, {} completion", 
+            info.prompt_tokens, info.completion_tokens);
+    });
+
+let root = ChatNode::root("You are helpful.");
+let user = root.add_user("Hello!");
+let response = user.complete(&generator, Some(&params)).await?;
+
+println!("Total spent: {} credits", *total_cost.lock().unwrap());
+```
+
 ## API Reference
 
 ### Core Types
@@ -222,9 +319,12 @@ let pretty = pretty_messages(&assistant, Some(&config));
 | `ChatNode` | A node in the conversation tree |
 | `GeneratorInfo` | LLM provider configuration |
 | `CompletionParameters` | Generation parameters (temperature, max_tokens, etc.) |
-| `NodeCompletionParameters` | Per-request settings (retry, JSON parsing, etc.) |
+| `NodeCompletionParameters` | Per-request settings (retry, JSON parsing, cost tracking, etc.) |
 | `Message` | A single message with role and content |
 | `MessageContent` | Text or multimodal content |
+| `ThreadData` | Serializable conversation thread with format kwargs |
+| `CostInfo` | Cost and token usage information from completions |
+| `CostTrackingType` | Cost tracking mode (`None`, `OpenRouter`) |
 
 ### GeneratorInfo Methods
 
@@ -271,6 +371,8 @@ GeneratorInfo::custom(name, url, model)  // Custom endpoint
 | `max_back_off` | `f64` | `15.0` | Max backoff (seconds) |
 | `crash_on_refusal` | `bool` | `false` | Error if no JSON |
 | `crash_on_empty_response` | `bool` | `false` | Error if empty |
+| `cost_tracking` | `CostTrackingType` | `None` | Enable cost tracking |
+| `cost_callback` | `Option<CostCallback>` | `None` | Callback for cost info |
 
 ### ProviderSettings (OpenRouter)
 

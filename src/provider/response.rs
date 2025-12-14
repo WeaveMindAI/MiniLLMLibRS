@@ -1,6 +1,7 @@
 //! Response types from LLM APIs
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Token usage information
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -16,7 +17,61 @@ pub struct Usage {
     /// Total tokens used
     #[serde(default)]
     pub total_tokens: u32,
+
+    /// Cost in credits (OpenRouter specific)
+    #[serde(default)]
+    pub cost: Option<f64>,
+
+    /// Cached tokens (tokens read from cache)
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+
+    /// Reasoning tokens (for models that support it)
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
 }
+
+/// Detailed cost information from a completion
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CostInfo {
+    /// Total cost in credits charged to your account
+    pub cost: f64,
+
+    /// Number of prompt tokens
+    pub prompt_tokens: u32,
+
+    /// Number of completion tokens
+    pub completion_tokens: u32,
+
+    /// Total tokens
+    pub total_tokens: u32,
+
+    /// Cached tokens (if any)
+    pub cached_tokens: Option<u32>,
+
+    /// Reasoning tokens (if any)
+    pub reasoning_tokens: Option<u32>,
+
+    /// The model used
+    pub model: String,
+
+    /// Response ID for tracking
+    pub response_id: String,
+}
+
+/// Type of cost tracking to use
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CostTrackingType {
+    /// No cost tracking
+    #[default]
+    None,
+    /// OpenRouter's usage accounting (adds `usage: { include: true }` to request)
+    OpenRouter,
+}
+
+/// Callback function type for cost ingestion
+/// Called with CostInfo after each successful completion
+pub type CostCallback = Arc<dyn Fn(CostInfo) + Send + Sync>;
 
 /// A complete response from an LLM API
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +200,13 @@ pub fn parse_completion_response(
         prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
         total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
+        cost: u["cost"].as_f64(),
+        cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .map(|v| v as u32),
+        reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"]
+            .as_u64()
+            .map(|v| v as u32),
     });
 
     // Extract tool calls
@@ -174,20 +236,7 @@ pub fn parse_stream_chunk(data: &str) -> Option<StreamChunk> {
     // Parse JSON
     let json: serde_json::Value = serde_json::from_str(data).ok()?;
 
-    let choice = json["choices"].get(0)?;
-
-    // Get delta content
-    let delta = choice["delta"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    let finish_reason = choice["finish_reason"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-
-    // Parse usage if present
+    // Parse usage if present (OpenRouter sends this in the last chunk, possibly without choices)
     let usage = json.get("usage").and_then(|u| {
         if u.is_null() {
             None
@@ -196,12 +245,38 @@ pub fn parse_stream_chunk(data: &str) -> Option<StreamChunk> {
                 prompt_tokens: u["prompt_tokens"].as_u64().unwrap_or(0) as u32,
                 completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
                 total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
+                cost: u["cost"].as_f64(),
+                cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
+                    .as_u64()
+                    .map(|v| v as u32),
+                reasoning_tokens: u["completion_tokens_details"]["reasoning_tokens"]
+                    .as_u64()
+                    .map(|v| v as u32),
             })
         }
     });
 
+    // Try to get choice (may not be present in usage-only chunks)
+    let choice = json["choices"].get(0);
+
+    // Get delta content
+    let delta = choice
+        .and_then(|c| c["delta"]["content"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let finish_reason = choice
+        .and_then(|c| c["finish_reason"].as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+
     // Extract tool call deltas
-    let tool_calls = choice["delta"]["tool_calls"].as_array().cloned();
+    let tool_calls = choice.and_then(|c| c["delta"]["tool_calls"].as_array().cloned());
+
+    // Return chunk if we have any content, finish reason, or usage
+    if delta.is_empty() && finish_reason.is_none() && usage.is_none() && tool_calls.is_none() {
+        return None;
+    }
 
     Some(StreamChunk {
         delta,

@@ -73,19 +73,25 @@ impl LLMClient {
         Ok(headers)
     }
 
-    /// Build the request body
-    fn build_body(
+    /// Build request body with optional usage tracking
+    fn build_body_with_usage(
         &self,
         generator: &GeneratorInfo,
         messages: &[Message],
         params: &CompletionParameters,
         stream: bool,
+        include_usage: bool,
     ) -> serde_json::Value {
         let mut body = serde_json::json!({
             "model": generator.model,
             "messages": messages_to_payload(messages),
             "stream": stream,
         });
+
+        // Add OpenRouter usage tracking if requested
+        if include_usage {
+            body["usage"] = serde_json::json!({ "include": true });
+        }
 
         // Add completion parameters
         if let Some(max_tokens) = params.max_tokens {
@@ -132,11 +138,23 @@ impl LLMClient {
         messages: &[Message],
         params: &CompletionParameters,
     ) -> Result<CompletionResponse> {
+        self.complete_with_usage_tracking(generator, messages, params, false)
+            .await
+    }
+
+    /// Make a non-streaming completion request with usage tracking option
+    pub async fn complete_with_usage_tracking(
+        &self,
+        generator: &GeneratorInfo,
+        messages: &[Message],
+        params: &CompletionParameters,
+        include_usage: bool,
+    ) -> Result<CompletionResponse> {
         let url = generator.completions_url();
         let headers = self.build_headers(generator)?;
-        let body = self.build_body(generator, messages, params, false);
+        let body = self.build_body_with_usage(generator, messages, params, false, include_usage);
 
-        tracing::debug!(url = %url, model = %generator.model, "Making completion request");
+        tracing::debug!(url = %url, model = %generator.model, include_usage = %include_usage, "Making completion request");
 
         let response = self
             .client
@@ -169,11 +187,23 @@ impl LLMClient {
         messages: &[Message],
         params: &CompletionParameters,
     ) -> Result<StreamingCompletion> {
+        self.complete_streaming_with_usage(generator, messages, params, false)
+            .await
+    }
+
+    /// Make a streaming completion request with usage tracking option
+    pub async fn complete_streaming_with_usage(
+        &self,
+        generator: &GeneratorInfo,
+        messages: &[Message],
+        params: &CompletionParameters,
+        include_usage: bool,
+    ) -> Result<StreamingCompletion> {
         let url = generator.completions_url();
         let headers = self.build_headers(generator)?;
-        let body = self.build_body(generator, messages, params, true);
+        let body = self.build_body_with_usage(generator, messages, params, true, include_usage);
 
-        tracing::debug!(url = %url, model = %generator.model, "Starting streaming completion");
+        tracing::debug!(url = %url, model = %generator.model, include_usage = %include_usage, "Starting streaming completion");
 
         // Build the request builder (EventSource needs RequestBuilder, not Request)
         let request_builder = self.client.post(&url).headers(headers).json(&body);
@@ -206,7 +236,8 @@ impl LLMClient {
                 .collect()
                 .await
         } else {
-            self.complete(generator, messages, params).await
+            self.complete_with_usage_tracking(generator, messages, params, false)
+                .await
         }
     }
 }

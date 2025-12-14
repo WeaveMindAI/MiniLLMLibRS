@@ -31,6 +31,16 @@ impl Role {
     pub fn is_system(&self) -> bool {
         matches!(self, Role::System)
     }
+
+    /// Get the role as a string slice
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        }
+    }
 }
 
 impl std::fmt::Display for Role {

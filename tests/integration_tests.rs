@@ -9,9 +9,9 @@ use minillmlib::{
     chat_node::ChatNode,
     generator::{CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings},
     message::{AudioData, ImageData, Message, MessageContent, Role},
-    provider::LLMClient,
+    provider::{CostInfo, LLMClient},
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 // Test model - small and cheap for testing
 const TEST_MODEL: &str = "google/gemini-2.0-flash-lite-001";
@@ -408,6 +408,621 @@ fn test_chat_node_get_leaf() {
 }
 
 #[test]
+fn test_chat_node_get_root() {
+    let root = ChatNode::root("System");
+    let u1 = root.add_user("U1");
+    let a1 = u1.add_assistant("A1");
+    let u2 = a1.add_user("U2");
+
+    // From any node, get_root should return the root
+    assert_eq!(root.get_root().id, root.id);
+    assert_eq!(u1.get_root().id, root.id);
+    assert_eq!(a1.get_root().id, root.id);
+    assert_eq!(u2.get_root().id, root.id);
+
+    // The returned root should be a root node
+    assert!(u2.get_root().is_root());
+}
+
+#[test]
+fn test_chat_node_detach() {
+    let root = ChatNode::root("System");
+    let u1 = root.add_user("U1");
+    let a1 = u1.add_assistant("A1");
+
+    assert_eq!(root.child_count(), 1);
+    assert!(!u1.is_root());
+
+    // Detach u1 from root
+    u1.detach();
+
+    // u1 should now be a root
+    assert!(u1.is_root());
+    // root should have no children
+    assert_eq!(root.child_count(), 0);
+    // a1 should still be a child of u1
+    assert_eq!(u1.child_count(), 1);
+    assert_eq!(a1.parent().unwrap().id, u1.id);
+}
+
+#[test]
+fn test_chat_node_merge() {
+    // Create first tree
+    let root1 = ChatNode::root("System 1");
+    let u1 = root1.add_user("User 1");
+
+    // Create second tree
+    let root2 = ChatNode::root("System 2");
+    let u2 = root2.add_user("User 2");
+    let a2 = u2.add_assistant("Assistant 2");
+
+    // Merge second tree into first
+    let merged_leaf = u1.merge(&a2);
+
+    // The merged leaf should be the leaf of the second tree
+    assert_eq!(merged_leaf.id, a2.id);
+
+    // root1 should now have the second tree as a subtree
+    // Structure: root1 -> u1 -> root2 -> u2 -> a2
+    assert_eq!(root1.node_count(), 5);
+
+    // root2's parent should now be u1
+    assert_eq!(root2.parent().unwrap().id, u1.id);
+}
+
+#[test]
+fn test_chat_node_iter_depth_first() {
+    //       root
+    //      /    \
+    //     u1     u2
+    //     |
+    //     a1
+    let root = ChatNode::root("System");
+    let u1 = root.add_user("U1");
+    let u2 = root.add_user("U2");
+    let a1 = u1.add_assistant("A1");
+
+    let nodes = root.iter_depth_first();
+
+    assert_eq!(nodes.len(), 4);
+    // Depth-first pre-order: root, u1, a1, u2
+    assert_eq!(nodes[0].id, root.id);
+    assert_eq!(nodes[1].id, u1.id);
+    assert_eq!(nodes[2].id, a1.id);
+    assert_eq!(nodes[3].id, u2.id);
+}
+
+#[test]
+fn test_chat_node_iter_breadth_first() {
+    //       root
+    //      /    \
+    //     u1     u2
+    //     |
+    //     a1
+    let root = ChatNode::root("System");
+    let u1 = root.add_user("U1");
+    let u2 = root.add_user("U2");
+    let _a1 = u1.add_assistant("A1");
+
+    let nodes = root.iter_breadth_first();
+
+    assert_eq!(nodes.len(), 4);
+    // Breadth-first: root, u1, u2, a1
+    assert_eq!(nodes[0].id, root.id);
+    assert_eq!(nodes[1].id, u1.id);
+    assert_eq!(nodes[2].id, u2.id);
+    // a1 is last because it's at depth 2
+}
+
+#[test]
+fn test_chat_node_iter_leaves() {
+    //       root
+    //      /    \
+    //     u1     u2
+    //     |
+    //     a1
+    let root = ChatNode::root("System");
+    let u1 = root.add_user("U1");
+    let u2 = root.add_user("U2");
+    let a1 = u1.add_assistant("A1");
+
+    let leaves = root.iter_leaves();
+
+    assert_eq!(leaves.len(), 2);
+    // Leaves are a1 and u2
+    let leaf_ids: Vec<_> = leaves.iter().map(|n| n.id.clone()).collect();
+    assert!(leaf_ids.contains(&a1.id));
+    assert!(leaf_ids.contains(&u2.id));
+}
+
+#[test]
+fn test_chat_node_node_count() {
+    let root = ChatNode::root("System");
+    assert_eq!(root.node_count(), 1);
+
+    let u1 = root.add_user("U1");
+    assert_eq!(root.node_count(), 2);
+
+    let _a1 = u1.add_assistant("A1");
+    assert_eq!(root.node_count(), 3);
+
+    let _u2 = root.add_user("U2");
+    assert_eq!(root.node_count(), 4);
+}
+
+#[test]
+fn test_chat_node_complex_tree_operations() {
+    // Build a complex tree:
+    //              root
+    //           /   |   \
+    //         u1   u2    u3
+    //        / \    |
+    //      a1  a2   a3
+    //      |
+    //     u4
+
+    let root = ChatNode::root("System");
+    let u1 = root.add_user("U1");
+    let u2 = root.add_user("U2");
+    let u3 = root.add_user("U3");
+    let a1 = u1.add_assistant("A1");
+    let a2 = u1.add_assistant("A2");
+    let a3 = u2.add_assistant("A3");
+    let u4 = a1.add_user("U4");
+
+    // Test node_count
+    assert_eq!(root.node_count(), 8);
+    assert_eq!(u1.node_count(), 4); // u1, a1, a2, u4
+    assert_eq!(u2.node_count(), 2); // u2, a3
+    assert_eq!(u3.node_count(), 1); // just u3
+
+    // Test iter_leaves
+    let leaves = root.iter_leaves();
+    assert_eq!(leaves.len(), 4); // u4, a2, a3, u3
+    let leaf_ids: Vec<_> = leaves.iter().map(|n| n.id.clone()).collect();
+    assert!(leaf_ids.contains(&u4.id));
+    assert!(leaf_ids.contains(&a2.id));
+    assert!(leaf_ids.contains(&a3.id));
+    assert!(leaf_ids.contains(&u3.id));
+
+    // Test depth
+    assert_eq!(root.depth(), 0);
+    assert_eq!(u1.depth(), 1);
+    assert_eq!(a1.depth(), 2);
+    assert_eq!(u4.depth(), 3);
+
+    // Test get_root from deepest node
+    assert_eq!(u4.get_root().id, root.id);
+
+    // Test thread from u4 (should be: root -> u1 -> a1 -> u4)
+    let thread = u4.thread();
+    assert_eq!(thread.len(), 4);
+    assert_eq!(thread[0].role, Role::System);
+    assert_eq!(thread[1].role, Role::User);
+    assert_eq!(thread[2].role, Role::Assistant);
+    assert_eq!(thread[3].role, Role::User);
+}
+
+#[test]
+fn test_chat_node_detach_and_reattach() {
+    // Build tree: root -> u1 -> a1 -> u2
+    let root = ChatNode::root("System");
+    let u1 = root.add_user("U1");
+    let a1 = u1.add_assistant("A1");
+    let u2 = a1.add_user("U2");
+
+    assert_eq!(root.node_count(), 4);
+
+    // Detach a1 (and its subtree: a1 -> u2)
+    a1.detach();
+
+    // root tree should now only have: root -> u1
+    assert_eq!(root.node_count(), 2);
+    assert_eq!(u1.child_count(), 0);
+
+    // a1 should be a new root with u2 as child
+    assert!(a1.is_root());
+    assert_eq!(a1.node_count(), 2);
+    assert_eq!(u2.get_root().id, a1.id);
+
+    // Reattach a1 to root directly
+    root.add_child(a1.clone());
+
+    // Now structure is: root -> [u1, a1 -> u2]
+    assert_eq!(root.node_count(), 4);
+    assert_eq!(root.child_count(), 2);
+    assert_eq!(a1.parent().unwrap().id, root.id);
+}
+
+#[test]
+fn test_chat_node_multiple_merges() {
+    // Create 3 separate trees
+    let tree1_root = ChatNode::root("System 1");
+    let tree1_u = tree1_root.add_user("Tree1 User");
+
+    let tree2_root = ChatNode::root("System 2");
+    let tree2_u = tree2_root.add_user("Tree2 User");
+    let tree2_a = tree2_u.add_assistant("Tree2 Assistant");
+
+    let tree3_root = ChatNode::root("System 3");
+    let tree3_u = tree3_root.add_user("Tree3 User");
+
+    // Merge tree2 into tree1
+    tree1_u.merge(&tree2_a);
+    // Structure: tree1_root -> tree1_u -> tree2_root -> tree2_u -> tree2_a
+    assert_eq!(tree1_root.node_count(), 5);
+
+    // Merge tree3 into tree2_a
+    tree2_a.merge(&tree3_u);
+    // Structure: tree1_root -> tree1_u -> tree2_root -> tree2_u -> tree2_a -> tree3_root -> tree3_u
+    assert_eq!(tree1_root.node_count(), 7);
+
+    // Verify the chain
+    assert_eq!(tree3_u.get_root().id, tree1_root.id);
+    assert_eq!(tree3_u.depth(), 6);
+}
+
+#[test]
+fn test_chat_node_iter_with_branching() {
+    // Build a wide tree:
+    //           root
+    //     /  /  |  \  \
+    //    c1 c2  c3  c4  c5
+    //    |      |
+    //   gc1    gc2
+
+    let root = ChatNode::root("Root");
+    let c1 = root.add_user("C1");
+    let c2 = root.add_user("C2");
+    let c3 = root.add_user("C3");
+    let c4 = root.add_user("C4");
+    let c5 = root.add_user("C5");
+    let gc1 = c1.add_assistant("GC1");
+    let gc2 = c3.add_assistant("GC2");
+
+    // Depth-first should visit: root, c1, gc1, c2, c3, gc2, c4, c5
+    let dfs = root.iter_depth_first();
+    assert_eq!(dfs.len(), 8);
+    assert_eq!(dfs[0].id, root.id);
+    assert_eq!(dfs[1].id, c1.id);
+    assert_eq!(dfs[2].id, gc1.id);
+    assert_eq!(dfs[3].id, c2.id);
+    assert_eq!(dfs[4].id, c3.id);
+    assert_eq!(dfs[5].id, gc2.id);
+    assert_eq!(dfs[6].id, c4.id);
+    assert_eq!(dfs[7].id, c5.id);
+
+    // Breadth-first should visit: root, c1, c2, c3, c4, c5, gc1, gc2
+    let bfs = root.iter_breadth_first();
+    assert_eq!(bfs.len(), 8);
+    assert_eq!(bfs[0].id, root.id);
+    // Level 1: c1, c2, c3, c4, c5 (in order)
+    assert_eq!(bfs[1].id, c1.id);
+    assert_eq!(bfs[2].id, c2.id);
+    assert_eq!(bfs[3].id, c3.id);
+    assert_eq!(bfs[4].id, c4.id);
+    assert_eq!(bfs[5].id, c5.id);
+    // Level 2: gc1, gc2
+    assert_eq!(bfs[6].id, gc1.id);
+    assert_eq!(bfs[7].id, gc2.id);
+
+    // Leaves: c2, c4, c5, gc1, gc2
+    let leaves = root.iter_leaves();
+    assert_eq!(leaves.len(), 5);
+}
+
+#[test]
+fn test_chat_node_format_kwargs_with_merge() {
+    // Tree 1 with format kwargs
+    let tree1 = ChatNode::root("Hello {name}, I am {bot}.");
+    tree1.set_format_kwarg("name", "Alice");
+    tree1.set_format_kwarg("bot", "Claude");
+    let tree1_u = tree1.add_user("Hi {bot}!");
+
+    // Tree 2 with different format kwargs
+    let tree2 = ChatNode::root("Switching to {mode} mode.");
+    tree2.set_format_kwarg("mode", "expert");
+    let tree2_u = tree2.add_user("Tell me about {topic}.");
+    tree2_u.set_format_kwarg("topic", "Rust");
+
+    // Merge tree2 into tree1
+    tree1_u.merge(&tree2_u);
+
+    // Get formatted thread from the deepest node
+    let formatted = tree2_u.formatted_thread();
+
+    // Should have 4 messages
+    assert_eq!(formatted.len(), 4);
+
+    // Check that format kwargs from both trees are applied
+    // tree1's kwargs should apply to tree1's messages
+    assert!(formatted[0].content.get_text().unwrap().contains("Alice"));
+    assert!(formatted[0].content.get_text().unwrap().contains("Claude"));
+    assert!(formatted[1].content.get_text().unwrap().contains("Claude"));
+
+    // tree2's kwargs should apply to tree2's messages
+    assert!(formatted[2].content.get_text().unwrap().contains("expert"));
+    assert!(formatted[3].content.get_text().unwrap().contains("Rust"));
+}
+
+#[test]
+fn test_chat_node_detach_preserves_format_kwargs() {
+    let root = ChatNode::root("Hello {name}");
+    root.set_format_kwarg("name", "World");
+    let u1 = root.add_user("Goodbye {name}");
+
+    // Verify format kwargs work before detach
+    let formatted_before = u1.formatted_thread();
+    assert!(formatted_before[0]
+        .content
+        .get_text()
+        .unwrap()
+        .contains("World"));
+    assert!(formatted_before[1]
+        .content
+        .get_text()
+        .unwrap()
+        .contains("World"));
+
+    // Detach u1
+    u1.detach();
+
+    // u1 should still have its own format kwargs (none set directly)
+    // But root's kwargs should no longer be accessible
+    let formatted_after = u1.formatted_thread();
+    assert_eq!(formatted_after.len(), 1); // Only u1's message
+                                          // The placeholder should NOT be replaced since root's kwargs are gone
+    assert!(formatted_after[0]
+        .content
+        .get_text()
+        .unwrap()
+        .contains("{name}"));
+}
+
+#[test]
+fn test_chat_node_to_thread_data() {
+    let root = ChatNode::root("You are helpful");
+    let u1 = root.add_user("Hello");
+    let a1 = u1.add_assistant("Hi there!");
+
+    let thread_data = a1.to_thread_data();
+
+    assert_eq!(thread_data.prompts.len(), 3);
+    assert_eq!(thread_data.prompts[0].role, "system");
+    assert_eq!(thread_data.prompts[0].content, "You are helpful");
+    assert_eq!(thread_data.prompts[1].role, "user");
+    assert_eq!(thread_data.prompts[1].content, "Hello");
+    assert_eq!(thread_data.prompts[2].role, "assistant");
+    assert_eq!(thread_data.prompts[2].content, "Hi there!");
+}
+
+#[test]
+fn test_chat_node_from_thread_json() {
+    let json = r#"{
+        "prompts": [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi!"}
+        ]
+    }"#;
+
+    // Returns (root, leaf) tuple - must keep root alive for weak refs to work
+    let (_root, leaf) = ChatNode::from_thread_json(json).unwrap();
+
+    // Should return the last node (assistant)
+    assert_eq!(leaf.role(), Role::Assistant);
+    assert_eq!(leaf.text(), Some("Hi!"));
+
+    // Check the full thread
+    let thread = leaf.thread();
+    assert_eq!(thread.len(), 3);
+    assert_eq!(thread[0].role, Role::System);
+    assert_eq!(thread[1].role, Role::User);
+    assert_eq!(thread[2].role, Role::Assistant);
+}
+
+#[test]
+fn test_chat_node_save_and_load_thread() {
+    use std::fs;
+
+    let root = ChatNode::root("System prompt");
+    let u1 = root.add_user("User message");
+    let a1 = u1.add_assistant("Assistant response");
+
+    // Save to temp file
+    let temp_path = "/tmp/test_thread.json";
+    a1.save_thread(temp_path).unwrap();
+
+    // Load it back - returns (root, leaf) tuple
+    let (_loaded_root, loaded_leaf) = ChatNode::from_thread_file(temp_path).unwrap();
+
+    // Verify
+    let thread = loaded_leaf.thread();
+    assert_eq!(thread.len(), 3);
+    assert_eq!(thread[0].content.get_text(), Some("System prompt"));
+    assert_eq!(thread[1].content.get_text(), Some("User message"));
+    assert_eq!(thread[2].content.get_text(), Some("Assistant response"));
+
+    // Cleanup
+    fs::remove_file(temp_path).ok();
+}
+
+#[test]
+fn test_chat_node_from_messages() {
+    let messages = vec![
+        Message::system("Be helpful"),
+        Message::user("Hi"),
+        Message::assistant("Hello!"),
+    ];
+
+    // Returns (root, leaf) tuple
+    let (_root, leaf) = ChatNode::from_messages(&messages).unwrap();
+
+    assert_eq!(leaf.role(), Role::Assistant);
+    let thread = leaf.thread();
+    assert_eq!(thread.len(), 3);
+}
+
+#[test]
+fn test_chat_node_format_kwargs_basic() {
+    let root = ChatNode::root("You are {assistant_name}, a helpful assistant.");
+    root.set_format_kwarg("assistant_name", "Claude");
+
+    let formatted = root.formatted_text().unwrap();
+    assert_eq!(formatted, "You are Claude, a helpful assistant.");
+}
+
+#[test]
+fn test_chat_node_format_kwargs_multiple() {
+    let root = ChatNode::root("Hello {name}, you are {age} years old.");
+
+    let mut kwargs = std::collections::HashMap::new();
+    kwargs.insert("name".to_string(), "Alice".to_string());
+    kwargs.insert("age".to_string(), "25".to_string());
+    root.set_format_kwargs(&kwargs);
+
+    let formatted = root.formatted_text().unwrap();
+    assert_eq!(formatted, "Hello Alice, you are 25 years old.");
+}
+
+#[test]
+fn test_chat_node_formatted_thread() {
+    let root = ChatNode::root("You are {bot_name}.");
+    root.set_format_kwarg("bot_name", "Assistant");
+
+    let user = root.add_user("Hi {bot_name}!");
+    let assistant = user.add_assistant("Hello {user_name}!");
+    assistant.set_format_kwarg("user_name", "Bob");
+
+    let formatted = assistant.formatted_thread();
+
+    assert_eq!(formatted[0].content.get_text(), Some("You are Assistant."));
+    assert_eq!(formatted[1].content.get_text(), Some("Hi Assistant!"));
+    assert_eq!(formatted[2].content.get_text(), Some("Hello Bob!"));
+}
+
+#[test]
+fn test_chat_node_format_kwargs_propagate() {
+    let root = ChatNode::root("System");
+    let user = root.add_user("Hello");
+    let assistant = user.add_assistant("Hi");
+
+    // Update from leaf with propagation
+    let mut kwargs = std::collections::HashMap::new();
+    kwargs.insert("key".to_string(), "value".to_string());
+    assistant.update_format_kwargs(&kwargs, true);
+
+    // All nodes should have the kwarg
+    assert_eq!(root.get_format_kwarg("key"), Some("value".to_string()));
+    assert_eq!(user.get_format_kwarg("key"), Some("value".to_string()));
+    assert_eq!(assistant.get_format_kwarg("key"), Some("value".to_string()));
+}
+
+#[test]
+fn test_chat_node_format_kwargs_save_load() {
+    use std::fs;
+
+    let root = ChatNode::root("Hello {name}!");
+    root.set_format_kwarg("name", "World");
+    let user = root.add_user("Goodbye {name}!");
+
+    // Save
+    let temp_path = "/tmp/test_format_kwargs.json";
+    user.save_thread(temp_path).unwrap();
+
+    // Load
+    let (loaded_root, loaded_leaf) = ChatNode::from_thread_file(temp_path).unwrap();
+
+    // Check format_kwargs were preserved
+    assert_eq!(
+        loaded_root.get_format_kwarg("name"),
+        Some("World".to_string())
+    );
+
+    // Check formatted content
+    let formatted = loaded_leaf.formatted_thread();
+    assert_eq!(formatted[0].content.get_text(), Some("Hello World!"));
+    assert_eq!(formatted[1].content.get_text(), Some("Goodbye World!"));
+
+    // Cleanup
+    fs::remove_file(temp_path).ok();
+}
+
+#[tokio::test]
+async fn test_load_data_test_json() {
+    let path = "./data/test.json";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("Skipping test_load_data_test_json: data/test.json not found");
+        return;
+    }
+
+    // Load the thread
+    let (root, leaf) = ChatNode::from_thread_file(path).unwrap();
+
+    // Set multiple format kwargs
+    root.set_format_kwarg("assistant_name", "Claude");
+    root.set_format_kwarg("user_name", "Alice");
+    root.set_format_kwarg("topic", "quantum computing");
+    root.set_format_kwarg("style", "friendly and concise");
+
+    // Print the formatted messages that will be sent to the LLM
+    println!("\n=== FORMATTED PROMPT ===");
+    println!("{}", minillmlib::format_conversation(&leaf));
+    println!("========================\n");
+
+    let formatted = leaf.formatted_thread();
+
+    // Verify all placeholders are replaced
+    for msg in &formatted {
+        let text = msg.content.get_text().unwrap();
+        assert!(
+            !text.contains("{assistant_name}"),
+            "Placeholder not replaced: {}",
+            text
+        );
+        assert!(
+            !text.contains("{user_name}"),
+            "Placeholder not replaced: {}",
+            text
+        );
+        assert!(
+            !text.contains("{topic}"),
+            "Placeholder not replaced: {}",
+            text
+        );
+        assert!(
+            !text.contains("{style}"),
+            "Placeholder not replaced: {}",
+            text
+        );
+    }
+
+    // Now let's actually call the LLM with this
+    let gi = get_cheap_generator();
+    let params = NodeCompletionParameters::default()
+        .with_params(CompletionParameters::default().with_max_tokens(150));
+
+    // Complete from the formatted thread
+    let result = leaf.complete(&gi, Some(&params)).await;
+    match result {
+        Ok(response) => {
+            println!("LLM Response: {}", response.text().unwrap_or("no text"));
+            // The response should mention Alice and quantum computing
+            let response_text = response.text().unwrap_or("");
+            assert!(
+                response_text.to_lowercase().contains("alice")
+                    || response_text.to_lowercase().contains("quantum"),
+                "Response should mention Alice or quantum: {}",
+                response_text
+            );
+        }
+        Err(e) => {
+            eprintln!("LLM Error: {}", e);
+        }
+    }
+}
+
+#[test]
 fn test_chat_node_metadata() {
     let node = ChatNode::user("Hello");
     node.set_metadata("custom_key", serde_json::json!({"value": 42}));
@@ -437,6 +1052,195 @@ fn test_conversation_builder() {
 // =============================================================================
 // Real API Integration Tests
 // =============================================================================
+
+#[tokio::test]
+async fn test_cost_tracking() {
+    dotenvy::dotenv().ok();
+
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test_cost_tracking: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let generator = get_text_generator();
+    let root = ChatNode::root("You are a helpful assistant. Be very brief.");
+    let user = root.add_user("Say 'Hi' and nothing else.");
+
+    // Track costs using a shared counter
+    let total_cost = Arc::new(Mutex::new(0.0_f64));
+    let total_tokens = Arc::new(Mutex::new(0_u32));
+    let callback_called = Arc::new(Mutex::new(false));
+
+    let cost_tracker = total_cost.clone();
+    let token_tracker = total_tokens.clone();
+    let called_tracker = callback_called.clone();
+
+    let params = NodeCompletionParameters::new()
+        .with_openrouter_cost_tracking()
+        .with_cost_callback(move |info: CostInfo| {
+            println!("\n=== COST CALLBACK RECEIVED ===");
+            println!("Cost: {} credits", info.cost);
+            println!("Prompt tokens: {}", info.prompt_tokens);
+            println!("Completion tokens: {}", info.completion_tokens);
+            println!("Total tokens: {}", info.total_tokens);
+            println!("Model: {}", info.model);
+            println!("Response ID: {}", info.response_id);
+            if let Some(cached) = info.cached_tokens {
+                println!("Cached tokens: {}", cached);
+            }
+            println!("==============================\n");
+
+            *cost_tracker.lock().unwrap() += info.cost;
+            *token_tracker.lock().unwrap() += info.total_tokens;
+            *called_tracker.lock().unwrap() = true;
+        });
+
+    let result = user.complete(&generator, Some(&params)).await;
+
+    match result {
+        Ok(response) => {
+            println!("Response: {:?}", response.text());
+            assert!(response.text().is_some());
+        }
+        Err(e) => {
+            panic!("Completion failed: {:?}", e);
+        }
+    }
+
+    // Verify callback was called
+    assert!(
+        *callback_called.lock().unwrap(),
+        "Cost callback was not called!"
+    );
+
+    // Verify we got some token count
+    let tokens = *total_tokens.lock().unwrap();
+    assert!(tokens > 0, "Expected non-zero token count, got {}", tokens);
+
+    println!("Total cost: {} credits", *total_cost.lock().unwrap());
+    println!("Total tokens: {}", tokens);
+}
+
+#[tokio::test]
+async fn test_cost_tracking_multiple_requests() {
+    dotenvy::dotenv().ok();
+
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let generator = get_text_generator();
+
+    // Track cumulative costs
+    let total_cost = Arc::new(Mutex::new(0.0_f64));
+    let request_count = Arc::new(Mutex::new(0_u32));
+
+    let cost_tracker = total_cost.clone();
+    let count_tracker = request_count.clone();
+
+    let params = NodeCompletionParameters::new()
+        .with_openrouter_cost_tracking()
+        .with_cost_callback(move |info: CostInfo| {
+            *cost_tracker.lock().unwrap() += info.cost;
+            *count_tracker.lock().unwrap() += 1;
+            println!(
+                "Request cost: {} credits (cumulative: {})",
+                info.cost,
+                *cost_tracker.lock().unwrap()
+            );
+        });
+
+    // Make 3 requests
+    let root = ChatNode::root("Be very brief.");
+    let mut current = root.add_user("Say 'one'");
+    current = current.complete(&generator, Some(&params)).await.unwrap();
+
+    current = current.add_user("Say 'two'");
+    current = current.complete(&generator, Some(&params)).await.unwrap();
+
+    current = current.add_user("Say 'three'");
+    let _ = current.complete(&generator, Some(&params)).await.unwrap();
+
+    // Verify all 3 callbacks were called
+    assert_eq!(
+        *request_count.lock().unwrap(),
+        3,
+        "Expected 3 cost callbacks"
+    );
+
+    println!(
+        "\nFinal cumulative cost: {} credits",
+        *total_cost.lock().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_cost_tracking_streaming() {
+    dotenvy::dotenv().ok();
+
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test_cost_tracking_streaming: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let generator = get_text_generator();
+    let root = ChatNode::root("You are a helpful assistant. Be very brief.");
+    let user = root.add_user("Say 'Hello' and nothing else.");
+
+    // Track costs
+    let callback_called = Arc::new(Mutex::new(false));
+    let cost_received = Arc::new(Mutex::new(0.0_f64));
+    let tokens_received = Arc::new(Mutex::new(0_u32));
+
+    let called_tracker = callback_called.clone();
+    let cost_tracker = cost_received.clone();
+    let token_tracker = tokens_received.clone();
+
+    let params = NodeCompletionParameters::new()
+        .with_openrouter_cost_tracking()
+        .with_cost_callback(move |info: CostInfo| {
+            println!("\n=== STREAMING COST CALLBACK ===");
+            println!("Cost: {} credits", info.cost);
+            println!("Total tokens: {}", info.total_tokens);
+            println!("===============================\n");
+
+            *called_tracker.lock().unwrap() = true;
+            *cost_tracker.lock().unwrap() = info.cost;
+            *token_tracker.lock().unwrap() = info.total_tokens;
+        });
+
+    // Use streaming collect
+    let result = user
+        .complete_streaming_collect(&generator, Some(&params))
+        .await;
+
+    match result {
+        Ok(response) => {
+            println!("Streaming response: {:?}", response.text());
+            assert!(response.text().is_some());
+        }
+        Err(e) => {
+            panic!("Streaming completion failed: {:?}", e);
+        }
+    }
+
+    // Verify callback was called
+    assert!(
+        *callback_called.lock().unwrap(),
+        "Cost callback was not called for streaming!"
+    );
+
+    let tokens = *tokens_received.lock().unwrap();
+    assert!(
+        tokens > 0,
+        "Expected non-zero token count for streaming, got {}",
+        tokens
+    );
+
+    println!("Streaming cost: {} credits", *cost_received.lock().unwrap());
+    println!("Streaming tokens: {}", tokens);
+}
 
 #[tokio::test]
 async fn test_simple_completion() {
@@ -878,7 +1682,7 @@ async fn test_llm_client_direct() {
         Ok(response) => {
             println!("Direct client response: {}", response.content);
             assert!(!response.content.is_empty());
-            assert!(response.id.len() > 0);
+            assert!(!response.id.is_empty());
         }
         Err(e) => {
             panic!("Direct client call failed: {:?}", e);
@@ -1109,33 +1913,33 @@ async fn test_multi_threaded_completions() {
     let gi = get_cheap_generator();
     let params = NodeCompletionParameters::default()
         .with_params(CompletionParameters::default().with_max_tokens(20));
-    
+
     // Create a shared root node
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
-    
+
     // Spawn 10 threads, each making a completion
     let mut handles = vec![];
-    
+
     for i in 0..10 {
         let gi_clone = gi.clone();
         let params_clone = params.clone();
         let root_clone = Arc::clone(&root);
-        
+
         let handle = std::thread::spawn(move || {
             // Each thread creates its own runtime for the async call
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 // Add a user message as a child
                 let user_node = root_clone.add_user(format!("Say the number {}", i));
-                
+
                 let result = user_node.complete(&gi_clone, Some(&params_clone)).await;
                 (i, result.is_ok())
             })
         });
-        
+
         handles.push(handle);
     }
-    
+
     // Collect results
     let mut successes = 0;
     for handle in handles {
@@ -1145,10 +1949,14 @@ async fn test_multi_threaded_completions() {
             successes += 1;
         }
     }
-    
+
     // All should succeed
-    assert!(successes >= 8, "At least 8/10 threads should succeed, got {}", successes);
-    
+    assert!(
+        successes >= 8,
+        "At least 8/10 threads should succeed, got {}",
+        successes
+    );
+
     // Verify tree structure - root should have 10 children
     let children_count = root.child_count();
     assert_eq!(children_count, 10, "Root should have 10 children");
@@ -1161,38 +1969,42 @@ async fn test_async_concurrent_completions() {
     let gi = get_cheap_generator();
     let params = NodeCompletionParameters::default()
         .with_params(CompletionParameters::default().with_max_tokens(20));
-    
+
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
-    
+
     // Create 10 futures for concurrent execution
     let mut futures = vec![];
-    
+
     for i in 0..10 {
         let gi_clone = gi.clone();
         let params_clone = params.clone();
         let root_clone = Arc::clone(&root);
-        
+
         // Create the future (doesn't execute yet)
         let future = async move {
             let user_node = root_clone.add_user(format!("What is {} + 1?", i));
-            
+
             let result = user_node.complete(&gi_clone, Some(&params_clone)).await;
             (i, result)
         };
-        
+
         futures.push(future);
     }
-    
+
     // Execute all futures concurrently (like asyncio.gather)
     let results = futures::future::join_all(futures).await;
-    
+
     // Check results
     let mut successes = 0;
     for (i, result) in results {
         match result {
             Ok(response_node) => {
                 let content = response_node.message.content.get_text().unwrap_or("");
-                println!("Request {}: OK - {}", i, content.chars().take(50).collect::<String>());
+                println!(
+                    "Request {}: OK - {}",
+                    i,
+                    content.chars().take(50).collect::<String>()
+                );
                 successes += 1;
             }
             Err(e) => {
@@ -1200,9 +2012,13 @@ async fn test_async_concurrent_completions() {
             }
         }
     }
-    
-    assert!(successes >= 8, "At least 8/10 concurrent requests should succeed, got {}", successes);
-    
+
+    assert!(
+        successes >= 8,
+        "At least 8/10 concurrent requests should succeed, got {}",
+        successes
+    );
+
     // Verify tree structure - root should have 10 children (user messages)
     // Each user message should have 1 child (assistant response)
     let children_count = root.child_count();

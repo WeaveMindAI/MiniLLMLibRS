@@ -1,0 +1,18 @@
+{
+  "required_kwargs": {
+    "assistant_name": null,
+    "user_name": null,
+    "topic": null,
+    "style": null
+  },
+  "prompts": [
+    {
+      "role": "system",
+      "content": "You are {assistant_name}, a {style} assistant. Always address the user as {user_name}."
+    },
+    {
+      "role": "user", 
+      "content": "Hi {assistant_name}! My name is {user_name}. Can you explain {topic} to me?"
+    }
+  ]
+}

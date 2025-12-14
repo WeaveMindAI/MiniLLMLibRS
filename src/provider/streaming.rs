@@ -85,15 +85,16 @@ impl StreamingCompletion {
                 // Accumulate content
                 self.accumulated.push_str(&chunk.delta);
 
-                // Check for finish
+                // Record finish reason (but don't stop yet - usage may come after)
                 if let Some(reason) = &chunk.finish_reason {
-                    self.finished = true;
                     self.finish_reason = Some(reason.clone());
                 }
 
                 // Store usage if present
                 if chunk.usage.is_some() {
                     self.usage = chunk.usage.clone();
+                    // If we have usage, we're truly done
+                    self.finished = true;
                 }
 
                 Some(Ok(chunk))
@@ -103,6 +104,7 @@ impl StreamingCompletion {
                 Some(Err(e))
             }
             None => {
+                // Channel closed - we're done
                 self.finished = true;
                 None
             }
@@ -154,13 +156,15 @@ impl Stream for StreamingCompletion {
             Poll::Ready(Some(Ok(chunk))) => {
                 self.accumulated.push_str(&chunk.delta);
 
+                // Record finish reason (but don't stop yet - usage may come after)
                 if let Some(reason) = &chunk.finish_reason {
-                    self.finished = true;
                     self.finish_reason = Some(reason.clone());
                 }
 
                 if chunk.usage.is_some() {
                     self.usage = chunk.usage.clone();
+                    // If we have usage, we're truly done
+                    self.finished = true;
                 }
 
                 Poll::Ready(Some(Ok(chunk)))
@@ -170,6 +174,7 @@ impl Stream for StreamingCompletion {
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => {
+                // Channel closed - we're done
                 self.finished = true;
                 Poll::Ready(None)
             }

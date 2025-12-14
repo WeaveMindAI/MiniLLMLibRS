@@ -30,6 +30,10 @@ pub struct ChatNode {
 
     /// Metadata for this node
     pub metadata: RwLock<serde_json::Value>,
+
+    /// Format kwargs for template substitution (e.g., {name} -> "Alice")
+    /// These are stored on each node and propagated to the root
+    format_kwargs: RwLock<std::collections::HashMap<String, String>>,
 }
 
 impl ChatNode {
@@ -42,6 +46,7 @@ impl ChatNode {
             children: RwLock::new(Vec::new()),
             parent: RwLock::new(None),
             metadata: RwLock::new(serde_json::json!({})),
+            format_kwargs: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -53,6 +58,7 @@ impl ChatNode {
             children: RwLock::new(Vec::new()),
             parent: RwLock::new(None),
             metadata: RwLock::new(serde_json::json!({})),
+            format_kwargs: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -117,6 +123,14 @@ impl ChatNode {
         self.parent.read().unwrap().is_none()
     }
 
+    /// Get the root node of the tree
+    pub fn get_root(self: &Arc<Self>) -> Arc<ChatNode> {
+        match self.parent() {
+            Some(parent) => parent.get_root(),
+            None => self.clone(),
+        }
+    }
+
     /// Check if this is a leaf node
     pub fn is_leaf(&self) -> bool {
         self.children.read().unwrap().is_empty()
@@ -179,6 +193,91 @@ impl ChatNode {
         }
     }
 
+    // =========================================================================
+    // Tree manipulation
+    // =========================================================================
+
+    /// Detach this node from its parent
+    ///
+    /// Removes this node from its parent's children list and clears the parent reference.
+    /// Returns self for chaining.
+    pub fn detach(self: &Arc<Self>) -> Arc<ChatNode> {
+        // Remove from parent's children
+        if let Some(parent) = self.parent() {
+            let mut children = parent.children.write().unwrap();
+            children.retain(|c| c.id != self.id);
+        }
+
+        // Clear parent reference
+        {
+            let mut parent_lock = self.parent.write().unwrap();
+            *parent_lock = None;
+        }
+
+        self.clone()
+    }
+
+    /// Merge another tree into this node
+    ///
+    /// Attaches the root of the other tree as a child of this node.
+    /// Returns the leaf of the merged tree.
+    pub fn merge(self: &Arc<Self>, other: &Arc<ChatNode>) -> Arc<ChatNode> {
+        let other_root = other.get_root();
+        self.add_child(other_root);
+        other.get_leaf()
+    }
+
+    // =========================================================================
+    // Tree iteration
+    // =========================================================================
+
+    /// Iterate over all nodes in the subtree rooted at this node (depth-first, pre-order)
+    pub fn iter_depth_first(self: &Arc<Self>) -> Vec<Arc<ChatNode>> {
+        let mut result = vec![self.clone()];
+        for child in self.children() {
+            result.extend(child.iter_depth_first());
+        }
+        result
+    }
+
+    /// Iterate over all nodes in the subtree rooted at this node (breadth-first)
+    pub fn iter_breadth_first(self: &Arc<Self>) -> Vec<Arc<ChatNode>> {
+        let mut result = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(self.clone());
+
+        while let Some(node) = queue.pop_front() {
+            result.push(node.clone());
+            for child in node.children() {
+                queue.push_back(child);
+            }
+        }
+
+        result
+    }
+
+    /// Get all leaf nodes in the subtree rooted at this node
+    pub fn iter_leaves(self: &Arc<Self>) -> Vec<Arc<ChatNode>> {
+        if self.is_leaf() {
+            return vec![self.clone()];
+        }
+
+        let mut result = Vec::new();
+        for child in self.children() {
+            result.extend(child.iter_leaves());
+        }
+        result
+    }
+
+    /// Count total nodes in the subtree rooted at this node
+    pub fn node_count(self: &Arc<Self>) -> usize {
+        1 + self
+            .children()
+            .iter()
+            .map(|c| c.node_count())
+            .sum::<usize>()
+    }
+
     /// Set metadata for this node
     pub fn set_metadata(&self, key: &str, value: serde_json::Value) {
         let mut metadata = self.metadata.write().unwrap();
@@ -189,6 +288,118 @@ impl ChatNode {
     pub fn get_metadata(&self, key: &str) -> Option<serde_json::Value> {
         let metadata = self.metadata.read().unwrap();
         metadata.get(key).cloned()
+    }
+
+    // =========================================================================
+    // Format kwargs (template substitution)
+    // =========================================================================
+
+    /// Set a format kwarg for this node
+    ///
+    /// Format kwargs are used for template substitution in message content.
+    /// For example, if the message content is "Hello {name}", calling
+    /// `set_format_kwarg("name", "Alice")` will substitute it.
+    pub fn set_format_kwarg(&self, key: &str, value: &str) {
+        let mut kwargs = self.format_kwargs.write().unwrap();
+        kwargs.insert(key.to_string(), value.to_string());
+    }
+
+    /// Set multiple format kwargs at once
+    pub fn set_format_kwargs(&self, kwargs: &std::collections::HashMap<String, String>) {
+        let mut current = self.format_kwargs.write().unwrap();
+        for (k, v) in kwargs {
+            current.insert(k.clone(), v.clone());
+        }
+    }
+
+    /// Get a format kwarg value
+    pub fn get_format_kwarg(&self, key: &str) -> Option<String> {
+        let kwargs = self.format_kwargs.read().unwrap();
+        kwargs.get(key).cloned()
+    }
+
+    /// Get all format kwargs for this node
+    pub fn get_format_kwargs(&self) -> std::collections::HashMap<String, String> {
+        self.format_kwargs.read().unwrap().clone()
+    }
+
+    /// Update format kwargs and propagate to parent nodes
+    ///
+    /// This mimics Python's behavior where format_kwargs are propagated up to the root.
+    pub fn update_format_kwargs(
+        self: &Arc<Self>,
+        kwargs: &std::collections::HashMap<String, String>,
+        propagate: bool,
+    ) {
+        // Update this node's kwargs
+        {
+            let mut current = self.format_kwargs.write().unwrap();
+            for (k, v) in kwargs {
+                current.insert(k.clone(), v.clone());
+            }
+        }
+
+        // Propagate to parent if requested
+        if propagate {
+            if let Some(parent) = self.parent() {
+                parent.update_format_kwargs(kwargs, true);
+            }
+        }
+    }
+
+    /// Get the formatted text content of this node's message
+    ///
+    /// Applies format_kwargs substitution to the message content.
+    pub fn formatted_text(&self) -> Option<String> {
+        let text = self.message.content.get_text()?;
+        Some(self.format_string(text))
+    }
+
+    /// Format a string using this node's format_kwargs
+    pub fn format_string(&self, template: &str) -> String {
+        let kwargs = self.format_kwargs.read().unwrap();
+        let mut result = template.to_string();
+        for (key, value) in kwargs.iter() {
+            let placeholder = format!("{{{}}}", key);
+            result = result.replace(&placeholder, value);
+        }
+        result
+    }
+
+    /// Get the thread with format_kwargs applied to all messages
+    pub fn formatted_thread(&self) -> Vec<Message> {
+        // Collect all format_kwargs from root to this node
+        let mut all_kwargs = std::collections::HashMap::new();
+        self.collect_format_kwargs(&mut all_kwargs);
+
+        // Apply formatting to each message
+        self.thread()
+            .into_iter()
+            .map(|mut msg| {
+                if let Some(text) = msg.content.get_text() {
+                    let mut formatted = text.to_string();
+                    for (key, value) in &all_kwargs {
+                        let placeholder = format!("{{{}}}", key);
+                        formatted = formatted.replace(&placeholder, value);
+                    }
+                    msg.content = MessageContent::text(formatted);
+                }
+                msg
+            })
+            .collect()
+    }
+
+    /// Helper to collect format_kwargs from all ancestors
+    fn collect_format_kwargs(&self, kwargs: &mut std::collections::HashMap<String, String>) {
+        // First collect from parent (so child values override parent)
+        if let Some(parent) = self.parent() {
+            parent.collect_format_kwargs(kwargs);
+        }
+        // Then add this node's kwargs
+        let my_kwargs = self.format_kwargs.read().unwrap();
+        for (k, v) in my_kwargs.iter() {
+            kwargs.insert(k.clone(), v.clone());
+        }
     }
 
     // =========================================================================
@@ -212,8 +423,8 @@ impl ChatNode {
         generator: &GeneratorInfo,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<Arc<ChatNode>> {
-        // Build messages
-        let mut messages = self.merged_thread();
+        // Build messages with format_kwargs applied, then merge contiguous
+        let mut messages = merge_contiguous_messages(self.formatted_thread());
 
         // Add system prompt if specified in params
         if let Some(p) = params {
@@ -248,6 +459,14 @@ impl ChatNode {
         let crash_on_empty = params.map(|p| p.crash_on_empty_response).unwrap_or(false);
         let force_prepend = params.and_then(|p| p.force_prepend.clone());
 
+        // Cost tracking
+        use crate::provider::CostTrackingType;
+        let cost_tracking = params
+            .map(|p| p.cost_tracking)
+            .unwrap_or(CostTrackingType::None);
+        let cost_callback = params.and_then(|p| p.cost_callback.clone());
+        let include_usage = cost_tracking == CostTrackingType::OpenRouter;
+
         let mut last_error: Option<MiniLLMError> = None;
         let mut current_back_off = back_off_time;
 
@@ -266,9 +485,14 @@ impl ChatNode {
                 tracing::debug!(attempt = attempt, "Retrying completion request");
             }
 
-            // Make the request
+            // Make the request (with usage tracking if enabled)
             let response = match client
-                .complete(generator, &messages, &completion_params)
+                .complete_with_usage_tracking(
+                    generator,
+                    &messages,
+                    &completion_params,
+                    include_usage,
+                )
                 .await
             {
                 Ok(r) => r,
@@ -315,6 +539,24 @@ impl ChatNode {
             }
             if let Some(finish_reason) = &response.finish_reason {
                 assistant_node.set_metadata("finish_reason", serde_json::json!(finish_reason));
+            }
+
+            // Call cost callback if provided
+            if let Some(ref callback) = cost_callback {
+                if let Some(usage) = &response.usage {
+                    use crate::provider::CostInfo;
+                    let cost_info = CostInfo {
+                        cost: usage.cost.unwrap_or(0.0),
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        total_tokens: usage.total_tokens,
+                        cached_tokens: usage.cached_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
+                        model: response.model.clone(),
+                        response_id: response.id.clone(),
+                    };
+                    callback(cost_info);
+                }
             }
 
             return Ok(self.add_child(assistant_node));
@@ -367,8 +609,8 @@ impl ChatNode {
         generator: &GeneratorInfo,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<StreamingCompletion> {
-        // Build messages
-        let mut messages = self.merged_thread();
+        // Build messages with format_kwargs applied, then merge contiguous
+        let mut messages = merge_contiguous_messages(self.formatted_thread());
 
         // Add system prompt if specified
         if let Some(p) = params {
@@ -385,9 +627,16 @@ impl ChatNode {
             .map(|p| generator.default_params.merge(p))
             .unwrap_or_else(|| generator.default_params.clone());
 
-        // Start streaming
+        // Check if cost tracking is enabled
+        use crate::provider::CostTrackingType;
+        let cost_tracking = params
+            .map(|p| p.cost_tracking)
+            .unwrap_or(CostTrackingType::None);
+        let include_usage = cost_tracking == CostTrackingType::OpenRouter;
+
+        // Start streaming (with usage tracking if enabled)
         client
-            .complete_streaming(generator, &messages, &completion_params)
+            .complete_streaming_with_usage(generator, &messages, &completion_params, include_usage)
             .await
     }
 
@@ -426,6 +675,26 @@ impl ChatNode {
         assistant_node.set_metadata("model", serde_json::json!(response.model));
         if let Some(usage) = &response.usage {
             assistant_node.set_metadata("usage", serde_json::json!(usage));
+        }
+
+        // Call cost callback if provided
+        if let Some(p) = params {
+            if let Some(ref callback) = p.cost_callback {
+                if let Some(usage) = &response.usage {
+                    use crate::provider::CostInfo;
+                    let cost_info = CostInfo {
+                        cost: usage.cost.unwrap_or(0.0),
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        total_tokens: usage.total_tokens,
+                        cached_tokens: usage.cached_tokens,
+                        reasoning_tokens: usage.reasoning_tokens,
+                        model: response.model.clone(),
+                        response_id: response.id.clone(),
+                    };
+                    callback(cost_info);
+                }
+            }
         }
 
         Ok(self.add_child(assistant_node))
@@ -543,7 +812,8 @@ pub fn pretty_messages(node: &Arc<ChatNode>, config: Option<&PrettyPrintConfig>)
     let default_config = PrettyPrintConfig::default();
     let config = config.unwrap_or(&default_config);
 
-    let messages = node.thread();
+    // Use formatted_thread to apply format_kwargs
+    let messages = node.formatted_thread();
     let mut result = String::new();
 
     for (i, msg) in messages.iter().enumerate() {
@@ -619,5 +889,211 @@ impl ConversationBuilder {
     /// Build and return the current node
     pub fn build(self) -> Arc<ChatNode> {
         self.current
+    }
+}
+
+// =========================================================================
+// Thread Serialization/Deserialization
+// =========================================================================
+
+use serde::{Deserialize, Serialize};
+
+/// Serializable representation of a thread (for saving/loading)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadData {
+    /// List of messages in the thread
+    pub prompts: Vec<ThreadMessage>,
+
+    /// Format kwargs for template substitution
+    /// Values can be null (meaning "placeholder, not yet set") or strings
+    #[serde(default)]
+    pub required_kwargs: std::collections::HashMap<String, Option<String>>,
+}
+
+impl ThreadData {
+    /// Get only the non-null kwargs as a HashMap<String, String>
+    pub fn get_kwargs(&self) -> std::collections::HashMap<String, String> {
+        self.required_kwargs
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|val| (k.clone(), val.clone())))
+            .collect()
+    }
+
+    /// Get the list of kwargs that are null (placeholders)
+    pub fn get_placeholder_keys(&self) -> Vec<String> {
+        self.required_kwargs
+            .iter()
+            .filter_map(|(k, v)| if v.is_none() { Some(k.clone()) } else { None })
+            .collect()
+    }
+}
+
+/// A single message in a serialized thread
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadMessage {
+    /// Role of the message sender
+    pub role: String,
+
+    /// Text content of the message
+    pub content: String,
+
+    /// Optional image data
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_data: Option<ThreadImageData>,
+
+    /// Optional audio data
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_data: Option<ThreadAudioData>,
+}
+
+/// Serializable image data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadImageData {
+    /// List of image URLs or base64 data
+    pub images: Vec<String>,
+}
+
+/// Serializable audio data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadAudioData {
+    /// List of audio file paths
+    #[serde(default)]
+    pub audio_paths: Vec<String>,
+
+    /// Map of audio IDs
+    #[serde(default)]
+    pub audio_ids: std::collections::HashMap<String, String>,
+}
+
+impl ChatNode {
+    /// Save the thread (path from root to this node) to a JSON file
+    pub fn save_thread(&self, path: &str) -> Result<()> {
+        let thread_data = self.to_thread_data();
+        let json = serde_json::to_string_pretty(&thread_data)
+            .map_err(|e| MiniLLMError::Other(format!("Failed to serialize thread: {}", e)))?;
+
+        std::fs::write(path, json)
+            .map_err(|e| MiniLLMError::Other(format!("Failed to write file: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Convert the thread to serializable ThreadData
+    pub fn to_thread_data(&self) -> ThreadData {
+        let messages = self.thread();
+
+        let prompts: Vec<ThreadMessage> = messages
+            .iter()
+            .map(|msg| ThreadMessage {
+                role: msg.role.as_str().to_string(),
+                content: msg.content.get_text().unwrap_or("").to_string(),
+                image_data: None, // TODO: Extract image data if present
+                audio_data: None, // TODO: Extract audio data if present
+            })
+            .collect();
+
+        // Collect all format_kwargs from the tree and wrap in Some()
+        let mut all_kwargs = std::collections::HashMap::new();
+        self.collect_format_kwargs(&mut all_kwargs);
+        let required_kwargs = all_kwargs.into_iter().map(|(k, v)| (k, Some(v))).collect();
+
+        ThreadData {
+            prompts,
+            required_kwargs,
+        }
+    }
+
+    /// Load a thread from a JSON file
+    ///
+    /// Returns a tuple of (root_node, leaf_node) so the caller can keep the root alive.
+    pub fn from_thread_file(path: &str) -> Result<(Arc<ChatNode>, Arc<ChatNode>)> {
+        let json = std::fs::read_to_string(path)
+            .map_err(|e| MiniLLMError::Other(format!("Failed to read file: {}", e)))?;
+
+        Self::from_thread_json(&json)
+    }
+
+    /// Load a thread from a JSON string
+    ///
+    /// Returns a tuple of (root_node, leaf_node) so the caller can keep the root alive.
+    pub fn from_thread_json(json: &str) -> Result<(Arc<ChatNode>, Arc<ChatNode>)> {
+        let thread_data: ThreadData = serde_json::from_str(json)
+            .map_err(|e| MiniLLMError::Other(format!("Failed to parse thread JSON: {}", e)))?;
+
+        Self::from_thread_data(&thread_data)
+    }
+
+    /// Load a thread from ThreadData
+    ///
+    /// Returns a tuple of (root_node, leaf_node) so the caller can keep the root alive.
+    /// If you only need the leaf, make sure to keep the root in scope.
+    pub fn from_thread_data(data: &ThreadData) -> Result<(Arc<ChatNode>, Arc<ChatNode>)> {
+        if data.prompts.is_empty() {
+            return Err(MiniLLMError::Other("Thread has no messages".to_string()));
+        }
+
+        let mut root: Option<Arc<ChatNode>> = None;
+        let mut current: Option<Arc<ChatNode>> = None;
+
+        for msg in &data.prompts {
+            let role = match msg.role.as_str() {
+                "system" => Role::System,
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                "tool" => Role::Tool,
+                _ => return Err(MiniLLMError::Other(format!("Unknown role: {}", msg.role))),
+            };
+
+            let message = Message {
+                role,
+                content: MessageContent::text(&msg.content),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            };
+
+            let node = ChatNode::new(message);
+
+            current = Some(match current {
+                Some(parent) => parent.add_child(node),
+                None => {
+                    root = Some(node.clone());
+                    node
+                }
+            });
+        }
+
+        // Apply format_kwargs to the root node (only non-null values)
+        if let Some(ref root_node) = root {
+            root_node.set_format_kwargs(&data.get_kwargs());
+        }
+
+        Ok((root.unwrap(), current.unwrap()))
+    }
+
+    /// Load a thread from a list of messages
+    ///
+    /// Returns a tuple of (root_node, leaf_node) so the caller can keep the root alive.
+    pub fn from_messages(messages: &[Message]) -> Result<(Arc<ChatNode>, Arc<ChatNode>)> {
+        if messages.is_empty() {
+            return Err(MiniLLMError::Other("No messages provided".to_string()));
+        }
+
+        let mut root: Option<Arc<ChatNode>> = None;
+        let mut current: Option<Arc<ChatNode>> = None;
+
+        for msg in messages {
+            let node = ChatNode::new(msg.clone());
+
+            current = Some(match current {
+                Some(parent) => parent.add_child(node),
+                None => {
+                    root = Some(node.clone());
+                    node
+                }
+            });
+        }
+
+        Ok((root.unwrap(), current.unwrap()))
     }
 }
