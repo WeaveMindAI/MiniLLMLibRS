@@ -489,8 +489,9 @@ impl NodeCompletionParameters {
     /// Set a callback function to be called with cost info after each completion
     ///
     /// # Example
-    /// ```ignore
+    /// ```
     /// use std::sync::{Arc, Mutex};
+    /// use minillmlib::NodeCompletionParameters;
     ///
     /// let total_cost = Arc::new(Mutex::new(0.0));
     /// let cost_tracker = total_cost.clone();

@@ -795,12 +795,17 @@ impl PrettyPrintConfig {
 /// Pretty print a conversation thread
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use minillmlib::{ChatNode, pretty_messages};
+///
 /// let root = ChatNode::root("You are helpful");
 /// let user = root.add_user("Hello");
 /// let assistant = user.add_assistant("Hi there!");
 ///
 /// let pretty = pretty_messages(&assistant, None);
+/// assert!(pretty.contains("SYSTEM: You are helpful"));
+/// assert!(pretty.contains("USER: Hello"));
+/// assert!(pretty.contains("ASSISTANT: Hi there!"));
 /// // Output:
 /// // SYSTEM: You are helpful
 /// //
