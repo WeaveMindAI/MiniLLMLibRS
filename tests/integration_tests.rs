@@ -440,42 +440,54 @@ async fn test_image_completion_from_url() {
 #[test]
 fn test_content_part_json_serialization() {
     use minillmlib::message::ContentPart;
-    
+
     // Test image serialization matches Python format
     let image = ImageData::from_url("https://example.com/image.jpg");
     let image_part = ContentPart::image(&image);
     let json = serde_json::to_value(&image_part).unwrap();
-    println!("Image part JSON: {}", serde_json::to_string_pretty(&json).unwrap());
+    println!(
+        "Image part JSON: {}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
     assert_eq!(json["type"], "image_url");
     assert_eq!(json["image_url"]["url"], "https://example.com/image.jpg");
-    
+
     // Test audio serialization matches Python format
     let audio = AudioData::from_bytes(&[0u8; 10], "mp3");
     let audio_part = ContentPart::audio(&audio);
     let json = serde_json::to_value(&audio_part).unwrap();
-    println!("Audio part JSON: {}", serde_json::to_string_pretty(&json).unwrap());
+    println!(
+        "Audio part JSON: {}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
     assert_eq!(json["type"], "input_audio");
     assert!(json["input_audio"]["data"].as_str().is_some());
     assert_eq!(json["input_audio"]["format"], "mp3");
-    
+
     // Test video serialization matches Python format
     let video = VideoData::from_url("https://example.com/video.mp4");
     let video_part = ContentPart::video(&video);
     let json = serde_json::to_value(&video_part).unwrap();
-    println!("Video part JSON: {}", serde_json::to_string_pretty(&json).unwrap());
+    println!(
+        "Video part JSON: {}",
+        serde_json::to_string_pretty(&json).unwrap()
+    );
     assert_eq!(json["type"], "video_url");
     assert_eq!(json["video_url"]["url"], "https://example.com/video.mp4");
-    
+
     // Test full multimodal content
     let content = MessageContent::with_video("Describe this", &[video]);
     let api_format = content.to_api_format();
-    println!("Full content JSON: {}", serde_json::to_string_pretty(&api_format).unwrap());
+    println!(
+        "Full content JSON: {}",
+        serde_json::to_string_pretty(&api_format).unwrap()
+    );
     let parts = api_format.as_array().unwrap();
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["type"], "text");
     assert_eq!(parts[0]["text"], "Describe this");
     assert_eq!(parts[1]["type"], "video_url");
-    
+
     // Test with local file to see data URL format
     let image_path = "./data/test.jpg";
     if std::path::Path::new(image_path).exists() {
@@ -483,9 +495,12 @@ fn test_content_part_json_serialization() {
         let image_part = ContentPart::image(&image);
         let json = serde_json::to_value(&image_part).unwrap();
         let url = json["image_url"]["url"].as_str().unwrap();
-        println!("Image from file - URL prefix: {}...", &url[..80.min(url.len())]);
+        println!(
+            "Image from file - URL prefix: {}...",
+            &url[..80.min(url.len())]
+        );
     }
-    
+
     // Test full message payload format (what gets sent to API)
     use minillmlib::message::messages_to_payload;
     let image = ImageData::from_url("https://example.com/image.jpg");
@@ -538,9 +553,18 @@ fn test_video_data_with_metadata() {
 fn test_video_data_mime_types() {
     assert_eq!(VideoData::from_bytes(&[], "mp4").mime_type(), "video/mp4");
     assert_eq!(VideoData::from_bytes(&[], "webm").mime_type(), "video/webm");
-    assert_eq!(VideoData::from_bytes(&[], "mov").mime_type(), "video/quicktime");
-    assert_eq!(VideoData::from_bytes(&[], "avi").mime_type(), "video/x-msvideo");
-    assert_eq!(VideoData::from_bytes(&[], "mkv").mime_type(), "video/x-matroska");
+    assert_eq!(
+        VideoData::from_bytes(&[], "mov").mime_type(),
+        "video/quicktime"
+    );
+    assert_eq!(
+        VideoData::from_bytes(&[], "avi").mime_type(),
+        "video/x-msvideo"
+    );
+    assert_eq!(
+        VideoData::from_bytes(&[], "mkv").mime_type(),
+        "video/x-matroska"
+    );
 }
 
 // =============================================================================
@@ -551,7 +575,7 @@ fn test_video_data_mime_types() {
 fn test_media_from_image() {
     let image = ImageData::from_url("https://example.com/image.jpg");
     let media = Media::from(image.clone());
-    
+
     assert!(media.is_image());
     assert!(!media.is_audio());
     assert!(!media.is_video());
@@ -562,7 +586,7 @@ fn test_media_from_image() {
 fn test_media_from_audio() {
     let audio = AudioData::from_bytes(&[0u8; 100], "wav");
     let media = Media::from(audio.clone());
-    
+
     assert!(!media.is_image());
     assert!(media.is_audio());
     assert!(!media.is_video());
@@ -573,7 +597,7 @@ fn test_media_from_audio() {
 fn test_media_from_video() {
     let video = VideoData::from_bytes(&[0u8; 100], "mp4");
     let media = Media::from(video.clone());
-    
+
     assert!(!media.is_image());
     assert!(!media.is_audio());
     assert!(media.is_video());
@@ -593,13 +617,9 @@ fn test_message_content_with_media() {
     let image = ImageData::from_url("https://example.com/image.jpg");
     let audio = AudioData::from_bytes(&[0u8; 100], "wav");
     let video = VideoData::from_url("https://example.com/video.mp4");
-    
-    let media = vec![
-        Media::from(image),
-        Media::from(audio),
-        Media::from(video),
-    ];
-    
+
+    let media = vec![Media::from(image), Media::from(audio), Media::from(video)];
+
     let content = MessageContent::with_media("Describe all this media", &media);
     assert!(content.has_multimodal());
     assert_eq!(content.get_text(), Some("Describe all this media"));

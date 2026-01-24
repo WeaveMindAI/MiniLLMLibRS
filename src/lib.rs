@@ -50,7 +50,9 @@ pub use generator::{
     CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings,
 };
 pub use json_repair::{loads, repair_json, JsonValue, RepairOptions};
-pub use message::{AudioData, ImageData, Media, MediaData, Message, MessageContent, Role, VideoData};
+pub use message::{
+    AudioData, ImageData, Media, MediaData, Message, MessageContent, Role, VideoData,
+};
 pub use provider::{
     CompletionResponse, CostCallback, CostInfo, CostTrackingType, LLMClient, StreamingCompletion,
 };
