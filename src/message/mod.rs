@@ -3,12 +3,16 @@
 mod audio;
 mod content;
 mod image;
+mod media;
 mod role;
+mod video;
 
 pub use audio::AudioData;
-pub use content::{ContentPart, MessageContent};
+pub use content::{ContentPart, MessageContent, VideoUrl};
 pub use image::ImageData;
+pub use media::{Media, MediaData};
 pub use role::Role;
+pub use video::VideoData;
 
 use serde::{Deserialize, Serialize};
 

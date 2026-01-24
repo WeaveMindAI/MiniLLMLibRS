@@ -1,5 +1,6 @@
 //! Image data handling
 
+use super::media::MediaData;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -18,9 +19,20 @@ pub struct ImageData {
     pub detail: Option<String>,
 }
 
-impl ImageData {
-    /// Create ImageData from base64 string
-    pub fn from_base64(base64_data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+impl MediaData for ImageData {
+    fn base64_data(&self) -> &str {
+        &self.base64_data
+    }
+
+    fn format_id(&self) -> &str {
+        &self.mime_type
+    }
+
+    fn mime_type(&self) -> String {
+        self.mime_type.clone()
+    }
+
+    fn from_base64(base64_data: impl Into<String>, mime_type: impl Into<String>) -> Self {
         Self {
             base64_data: base64_data.into(),
             mime_type: mime_type.into(),
@@ -28,29 +40,39 @@ impl ImageData {
         }
     }
 
+    fn guess_format(path: &Path) -> String {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            Some("svg") => "image/svg+xml",
+            _ => "application/octet-stream",
+        }
+        .to_string()
+    }
+}
+
+impl ImageData {
+    /// Create ImageData from base64 string
+    pub fn from_base64(base64_data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        <Self as MediaData>::from_base64(base64_data, mime_type)
+    }
+
     /// Create ImageData from raw bytes
     pub fn from_bytes(bytes: &[u8], mime_type: impl Into<String>) -> Self {
-        Self {
-            base64_data: BASE64.encode(bytes),
-            mime_type: mime_type.into(),
-            detail: None,
-        }
+        <Self as MediaData>::from_bytes(bytes, mime_type)
     }
 
     /// Load ImageData from a file path
     pub fn from_file(path: impl AsRef<Path>) -> crate::error::Result<Self> {
-        let path = path.as_ref();
-        let bytes = std::fs::read(path)?;
-        let mime_type = Self::guess_mime_type(path);
-        Ok(Self::from_bytes(&bytes, mime_type))
+        <Self as MediaData>::from_file(path)
     }
 
     /// Load ImageData from a file path (async)
-    pub async fn from_file_async(path: impl AsRef<Path>) -> crate::error::Result<Self> {
-        let path = path.as_ref();
-        let bytes = tokio::fs::read(path).await?;
-        let mime_type = Self::guess_mime_type(path);
-        Ok(Self::from_bytes(&bytes, mime_type))
+    pub async fn from_file_async(path: impl AsRef<Path> + Send) -> crate::error::Result<Self> {
+        <Self as MediaData>::from_file_async(path).await
     }
 
     /// Create ImageData from a URL (the URL will be used directly)
@@ -71,7 +93,6 @@ impl ImageData {
     /// Convert to data URL format for API
     pub fn to_data_url(&self) -> String {
         if self.mime_type == "url" {
-            // Already a URL, return as-is
             self.base64_data.clone()
         } else {
             format!("data:{};base64,{}", self.mime_type, self.base64_data)
@@ -81,19 +102,5 @@ impl ImageData {
     /// Decode the base64 data to bytes
     pub fn to_bytes(&self) -> crate::error::Result<Vec<u8>> {
         Ok(BASE64.decode(&self.base64_data)?)
-    }
-
-    /// Guess MIME type from file extension
-    fn guess_mime_type(path: &Path) -> String {
-        match path.extension().and_then(|e| e.to_str()) {
-            Some("png") => "image/png",
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("gif") => "image/gif",
-            Some("webp") => "image/webp",
-            Some("bmp") => "image/bmp",
-            Some("svg") => "image/svg+xml",
-            _ => "application/octet-stream",
-        }
-        .to_string()
     }
 }

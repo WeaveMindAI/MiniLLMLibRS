@@ -8,7 +8,7 @@
 use minillmlib::{
     chat_node::ChatNode,
     generator::{CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings},
-    message::{AudioData, ImageData, Message, MessageContent, Role},
+    message::{AudioData, ImageData, Media, Message, MessageContent, Role, VideoData},
     provider::{CostInfo, LLMClient},
 };
 use std::sync::{Arc, Mutex};
@@ -344,6 +344,265 @@ fn test_audio_data_with_metadata() {
 
     assert_eq!(audio.sample_rate, Some(44100));
     assert_eq!(audio.channels, Some(2));
+}
+
+// =============================================================================
+// VideoData Tests
+// =============================================================================
+
+#[tokio::test]
+async fn test_video_completion() {
+    dotenvy::dotenv().ok();
+
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let video_path = "./data/test.mp4";
+    if !std::path::Path::new(video_path).exists() {
+        eprintln!("Skipping test_video_completion: test.mp4 not found");
+        return;
+    }
+
+    let generator = get_test_generator();
+    let video = VideoData::from_file(video_path).unwrap();
+
+    let content = MessageContent::with_video("What do you see in this video? Be brief.", &[video]);
+
+    let root = ChatNode::root("You are a helpful assistant.");
+    let user_node = root.add_child(ChatNode::new(Message {
+        role: Role::User,
+        content,
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+    }));
+
+    let result = user_node.complete(&generator, None).await;
+
+    match result {
+        Ok(response) => {
+            println!("Video description: {:?}", response.text());
+            assert!(response.text().is_some());
+            assert!(!response.text().unwrap().is_empty());
+        }
+        Err(e) => {
+            panic!("Video completion failed: {:?}", e);
+        }
+    }
+}
+
+#[test]
+fn test_video_data_from_url() {
+    let video = VideoData::from_url("https://example.com/video.mp4");
+    assert_eq!(video.to_data_url(), "https://example.com/video.mp4");
+    assert_eq!(video.format, "url");
+}
+
+#[tokio::test]
+async fn test_image_completion_from_url() {
+    dotenvy::dotenv().ok();
+
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let generator = get_test_generator();
+    let image = ImageData::from_url("https://cdn.mos.cms.futurecdn.net/nbaR6JXZ3Z7mzuW9bh4nQN.jpg");
+
+    let content = MessageContent::with_images("Describe this image in one sentence.", &[image]);
+
+    let root = ChatNode::root("You are a helpful assistant. Be very brief.");
+    let user_node = root.add_child(ChatNode::new(Message {
+        role: Role::User,
+        content,
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+    }));
+
+    let result = user_node.complete(&generator, None).await;
+
+    match result {
+        Ok(response) => {
+            println!("Image (URL) description: {:?}", response.text());
+            assert!(response.text().is_some());
+            assert!(!response.text().unwrap().is_empty());
+        }
+        Err(e) => {
+            panic!("Image URL completion failed: {:?}", e);
+        }
+    }
+}
+
+#[test]
+fn test_content_part_json_serialization() {
+    use minillmlib::message::ContentPart;
+    
+    // Test image serialization matches Python format
+    let image = ImageData::from_url("https://example.com/image.jpg");
+    let image_part = ContentPart::image(&image);
+    let json = serde_json::to_value(&image_part).unwrap();
+    println!("Image part JSON: {}", serde_json::to_string_pretty(&json).unwrap());
+    assert_eq!(json["type"], "image_url");
+    assert_eq!(json["image_url"]["url"], "https://example.com/image.jpg");
+    
+    // Test audio serialization matches Python format
+    let audio = AudioData::from_bytes(&[0u8; 10], "mp3");
+    let audio_part = ContentPart::audio(&audio);
+    let json = serde_json::to_value(&audio_part).unwrap();
+    println!("Audio part JSON: {}", serde_json::to_string_pretty(&json).unwrap());
+    assert_eq!(json["type"], "input_audio");
+    assert!(json["input_audio"]["data"].as_str().is_some());
+    assert_eq!(json["input_audio"]["format"], "mp3");
+    
+    // Test video serialization matches Python format
+    let video = VideoData::from_url("https://example.com/video.mp4");
+    let video_part = ContentPart::video(&video);
+    let json = serde_json::to_value(&video_part).unwrap();
+    println!("Video part JSON: {}", serde_json::to_string_pretty(&json).unwrap());
+    assert_eq!(json["type"], "video_url");
+    assert_eq!(json["video_url"]["url"], "https://example.com/video.mp4");
+    
+    // Test full multimodal content
+    let content = MessageContent::with_video("Describe this", &[video]);
+    let api_format = content.to_api_format();
+    println!("Full content JSON: {}", serde_json::to_string_pretty(&api_format).unwrap());
+    let parts = api_format.as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["type"], "text");
+    assert_eq!(parts[0]["text"], "Describe this");
+    assert_eq!(parts[1]["type"], "video_url");
+    
+    // Test with local file to see data URL format
+    let image_path = "./data/test.jpg";
+    if std::path::Path::new(image_path).exists() {
+        let image = ImageData::from_file(image_path).unwrap();
+        let image_part = ContentPart::image(&image);
+        let json = serde_json::to_value(&image_part).unwrap();
+        let url = json["image_url"]["url"].as_str().unwrap();
+        println!("Image from file - URL prefix: {}...", &url[..80.min(url.len())]);
+    }
+    
+    // Test full message payload format (what gets sent to API)
+    use minillmlib::message::messages_to_payload;
+    let image = ImageData::from_url("https://example.com/image.jpg");
+    let content = MessageContent::with_images("Describe this image", &[image]);
+    let msg = Message {
+        role: Role::User,
+        content,
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+    };
+    let payload = messages_to_payload(&[msg]);
+    println!("\nFull message payload:");
+    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+}
+
+#[test]
+fn test_video_data_from_bytes() {
+    let bytes = vec![0x00, 0x00, 0x00, 0x1C, 0x66, 0x74, 0x79, 0x70]; // MP4 header
+    let video = VideoData::from_bytes(&bytes, "mp4");
+    assert_eq!(video.format, "mp4");
+    assert_eq!(video.mime_type(), "video/mp4");
+    assert!(video.to_data_url().starts_with("data:video/mp4;base64,"));
+}
+
+#[test]
+fn test_video_data_from_file() {
+    let path = "./data/test.mp4";
+    if std::path::Path::new(path).exists() {
+        let video = VideoData::from_file(path).unwrap();
+        assert_eq!(video.format, "mp4");
+        assert!(!video.base64_data.is_empty());
+    }
+}
+
+#[test]
+fn test_video_data_with_metadata() {
+    let video = VideoData::from_bytes(&[0u8; 100], "mp4")
+        .with_duration(120.5)
+        .with_dimensions(1920, 1080)
+        .with_frame_rate(30.0);
+
+    assert_eq!(video.duration_secs, Some(120.5));
+    assert_eq!(video.width, Some(1920));
+    assert_eq!(video.height, Some(1080));
+    assert_eq!(video.frame_rate, Some(30.0));
+}
+
+#[test]
+fn test_video_data_mime_types() {
+    assert_eq!(VideoData::from_bytes(&[], "mp4").mime_type(), "video/mp4");
+    assert_eq!(VideoData::from_bytes(&[], "webm").mime_type(), "video/webm");
+    assert_eq!(VideoData::from_bytes(&[], "mov").mime_type(), "video/quicktime");
+    assert_eq!(VideoData::from_bytes(&[], "avi").mime_type(), "video/x-msvideo");
+    assert_eq!(VideoData::from_bytes(&[], "mkv").mime_type(), "video/x-matroska");
+}
+
+// =============================================================================
+// Media (Unified) Tests
+// =============================================================================
+
+#[test]
+fn test_media_from_image() {
+    let image = ImageData::from_url("https://example.com/image.jpg");
+    let media = Media::from(image.clone());
+    
+    assert!(media.is_image());
+    assert!(!media.is_audio());
+    assert!(!media.is_video());
+    assert!(media.as_image().is_some());
+}
+
+#[test]
+fn test_media_from_audio() {
+    let audio = AudioData::from_bytes(&[0u8; 100], "wav");
+    let media = Media::from(audio.clone());
+    
+    assert!(!media.is_image());
+    assert!(media.is_audio());
+    assert!(!media.is_video());
+    assert!(media.as_audio().is_some());
+}
+
+#[test]
+fn test_media_from_video() {
+    let video = VideoData::from_bytes(&[0u8; 100], "mp4");
+    let media = Media::from(video.clone());
+    
+    assert!(!media.is_image());
+    assert!(!media.is_audio());
+    assert!(media.is_video());
+    assert!(media.as_video().is_some());
+}
+
+#[test]
+fn test_message_content_with_video() {
+    let video = VideoData::from_url("https://example.com/video.mp4");
+    let content = MessageContent::with_video("Describe this video", &[video]);
+    assert!(content.has_multimodal());
+    assert_eq!(content.get_text(), Some("Describe this video"));
+}
+
+#[test]
+fn test_message_content_with_media() {
+    let image = ImageData::from_url("https://example.com/image.jpg");
+    let audio = AudioData::from_bytes(&[0u8; 100], "wav");
+    let video = VideoData::from_url("https://example.com/video.mp4");
+    
+    let media = vec![
+        Media::from(image),
+        Media::from(audio),
+        Media::from(video),
+    ];
+    
+    let content = MessageContent::with_media("Describe all this media", &media);
+    assert!(content.has_multimodal());
+    assert_eq!(content.get_text(), Some("Describe all this media"));
 }
 
 // =============================================================================

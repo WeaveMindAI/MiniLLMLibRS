@@ -8,7 +8,7 @@
 
 use crate::error::{MiniLLMError, Result};
 use crate::generator::{GeneratorInfo, NodeCompletionParameters};
-use crate::message::{merge_contiguous_messages, Message, MessageContent, Role};
+use crate::message::{merge_contiguous_messages, ContentPart, Message, MessageContent, Role};
 use crate::provider::{global_client, LLMClient, StreamingCompletion};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
@@ -376,13 +376,35 @@ impl ChatNode {
         self.thread()
             .into_iter()
             .map(|mut msg| {
-                if let Some(text) = msg.content.get_text() {
-                    let mut formatted = text.to_string();
-                    for (key, value) in &all_kwargs {
-                        let placeholder = format!("{{{}}}", key);
-                        formatted = formatted.replace(&placeholder, value);
+                // Only apply formatting to text-only content, preserve multimodal content
+                match &msg.content {
+                    MessageContent::Text(text) => {
+                        let mut formatted = text.clone();
+                        for (key, value) in &all_kwargs {
+                            let placeholder = format!("{{{}}}", key);
+                            formatted = formatted.replace(&placeholder, value);
+                        }
+                        msg.content = MessageContent::Text(formatted);
                     }
-                    msg.content = MessageContent::text(formatted);
+                    MessageContent::Parts(parts) => {
+                        // Format text parts while preserving other parts
+                        let formatted_parts: Vec<_> = parts
+                            .iter()
+                            .map(|part| {
+                                if let Some(text) = part.as_text() {
+                                    let mut formatted = text.to_string();
+                                    for (key, value) in &all_kwargs {
+                                        let placeholder = format!("{{{}}}", key);
+                                        formatted = formatted.replace(&placeholder, value);
+                                    }
+                                    ContentPart::text(formatted)
+                                } else {
+                                    part.clone()
+                                }
+                            })
+                            .collect();
+                        msg.content = MessageContent::Parts(formatted_parts);
+                    }
                 }
                 msg
             })

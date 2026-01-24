@@ -1,6 +1,6 @@
 //! Message content types
 
-use super::{AudioData, ImageData};
+use super::{AudioData, ImageData, Media, VideoData};
 use serde::{Deserialize, Serialize};
 
 /// A single part of message content
@@ -18,6 +18,10 @@ pub enum ContentPart {
     /// Audio content (for models that support it)
     #[serde(rename = "input_audio")]
     Audio { input_audio: AudioInput },
+
+    /// Video content (for models that support it)
+    #[serde(rename = "video_url")]
+    Video { video_url: VideoUrl },
 }
 
 /// Image URL structure for API
@@ -33,6 +37,14 @@ pub struct ImageUrl {
 pub struct AudioInput {
     pub data: String,
     pub format: String,
+}
+
+/// Video URL structure for API
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoUrl {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f64>,
 }
 
 impl ContentPart {
@@ -58,6 +70,25 @@ impl ContentPart {
                 data: audio.base64_data.clone(),
                 format: audio.format.clone(),
             },
+        }
+    }
+
+    /// Create a video content part from VideoData
+    pub fn video(video: &VideoData) -> Self {
+        Self::Video {
+            video_url: VideoUrl {
+                url: video.to_data_url(),
+                duration_secs: video.duration_secs,
+            },
+        }
+    }
+
+    /// Create a content part from any Media type
+    pub fn from_media(media: &Media) -> Self {
+        match media {
+            Media::Image(img) => Self::image(img),
+            Media::Audio(audio) => Self::audio(audio),
+            Media::Video(video) => Self::video(video),
         }
     }
 
@@ -108,6 +139,20 @@ impl MessageContent {
     pub fn with_audio(text: impl Into<String>, audio: &[AudioData]) -> Self {
         let mut parts = vec![ContentPart::text(text)];
         parts.extend(audio.iter().map(ContentPart::audio));
+        Self::Parts(parts)
+    }
+
+    /// Create content with text and video
+    pub fn with_video(text: impl Into<String>, video: &[VideoData]) -> Self {
+        let mut parts = vec![ContentPart::text(text)];
+        parts.extend(video.iter().map(ContentPart::video));
+        Self::Parts(parts)
+    }
+
+    /// Create content with text and any media types
+    pub fn with_media(text: impl Into<String>, media: &[Media]) -> Self {
+        let mut parts = vec![ContentPart::text(text)];
+        parts.extend(media.iter().map(ContentPart::from_media));
         Self::Parts(parts)
     }
 
