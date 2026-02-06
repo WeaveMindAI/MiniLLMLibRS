@@ -74,7 +74,7 @@ impl LLMClient {
     }
 
     /// Build request body with optional usage tracking
-    fn build_body_with_usage(
+    pub(crate) fn build_body_with_usage(
         &self,
         generator: &GeneratorInfo,
         messages: &[Message],
@@ -112,6 +112,9 @@ impl LLMClient {
         if let Some(presence_penalty) = params.presence_penalty {
             body["presence_penalty"] = serde_json::json!(presence_penalty);
         }
+        if let Some(repetition_penalty) = params.repetition_penalty {
+            body["repetition_penalty"] = serde_json::json!(repetition_penalty);
+        }
         if let Some(stop) = &params.stop {
             body["stop"] = serde_json::json!(stop);
         }
@@ -126,6 +129,14 @@ impl LLMClient {
         }
         if let Some(tool_choice) = &params.tool_choice {
             body["tool_choice"] = tool_choice.clone();
+        }
+        if let Some(provider) = &params.provider {
+            body["provider"] = serde_json::to_value(provider).unwrap_or_default();
+        }
+        if let Some(extra) = &params.extra {
+            for (key, value) in extra {
+                body[key] = value.clone();
+            }
         }
 
         body
@@ -248,4 +259,272 @@ static GLOBAL_CLIENT: std::sync::OnceLock<LLMClient> = std::sync::OnceLock::new(
 /// Get the global shared client
 pub fn global_client() -> &'static LLMClient {
     GLOBAL_CLIENT.get_or_init(LLMClient::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::generator::{CompletionParameters, GeneratorInfo, ProviderSettings};
+    use crate::message::Message;
+
+    fn test_generator() -> GeneratorInfo {
+        GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model")
+    }
+
+    fn test_messages() -> Vec<Message> {
+        vec![
+            Message::system("You are helpful."),
+            Message::user("Hello"),
+        ]
+    }
+
+    #[test]
+    fn test_body_includes_basic_fields() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters::new()
+            .with_temperature(0.5)
+            .with_max_tokens(1024);
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["temperature"], 0.5);
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("usage").is_none());
+    }
+
+    #[test]
+    fn test_body_includes_usage_when_requested() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters::new();
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, true);
+
+        assert_eq!(body["usage"]["include"], true);
+    }
+
+    #[test]
+    fn test_body_includes_all_sampling_params() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters {
+            max_tokens: Some(512),
+            temperature: Some(0.9),
+            top_p: Some(0.95),
+            top_k: Some(40),
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.3),
+            repetition_penalty: Some(1.2),
+            stop: Some(vec!["END".to_string()]),
+            seed: Some(42),
+            stream: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            provider: None,
+            extra: None,
+        };
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+
+        assert_eq!(body["max_tokens"], 512);
+        let temp = body["temperature"].as_f64().unwrap();
+        assert!((temp - 0.9).abs() < 1e-6, "temperature: {}", temp);
+        let top_p = body["top_p"].as_f64().unwrap();
+        assert!((top_p - 0.95).abs() < 1e-6, "top_p: {}", top_p);
+        assert_eq!(body["top_k"], 40);
+        assert_eq!(body["frequency_penalty"], 0.5);
+        let presence = body["presence_penalty"].as_f64().unwrap();
+        assert!((presence - 0.3).abs() < 1e-6, "presence_penalty: {}", presence);
+        let rep = body["repetition_penalty"].as_f64().unwrap();
+        assert!((rep - 1.2).abs() < 1e-6, "repetition_penalty: {}", rep);
+        assert_eq!(body["stop"][0], "END");
+        assert_eq!(body["seed"], 42);
+    }
+
+    #[test]
+    fn test_body_includes_provider_settings() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters::new()
+            .with_provider(ProviderSettings::new().deny_data_collection());
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+
+        assert_eq!(body["provider"]["data_collection"], "deny");
+    }
+
+    #[test]
+    fn test_body_includes_provider_order_and_sort() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters::new().with_provider(
+            ProviderSettings::new()
+                .with_order(vec!["Anthropic".to_string(), "OpenAI".to_string()])
+                .sort_by_latency()
+                .with_fallbacks(false),
+        );
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+
+        assert_eq!(body["provider"]["order"][0], "Anthropic");
+        assert_eq!(body["provider"]["order"][1], "OpenAI");
+        assert_eq!(body["provider"]["sort"], "latency");
+        assert_eq!(body["provider"]["allow_fallbacks"], false);
+    }
+
+    #[test]
+    fn test_body_includes_extra_params() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters::new()
+            .with_extra("custom_field", serde_json::json!("custom_value"))
+            .with_extra("custom_number", serde_json::json!(42));
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+
+        assert_eq!(body["custom_field"], "custom_value");
+        assert_eq!(body["custom_number"], 42);
+    }
+
+    #[test]
+    fn test_body_includes_tools_and_tool_choice() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        });
+        let params = CompletionParameters {
+            tools: Some(vec![tool.clone()]),
+            tool_choice: Some(serde_json::json!("auto")),
+            ..CompletionParameters::new()
+        };
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+
+        assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn test_body_includes_response_format() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters::new().with_json_response();
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+
+        assert_eq!(body["response_format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn test_body_omits_none_fields() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters {
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            stop: None,
+            seed: None,
+            stream: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            provider: None,
+            extra: None,
+        };
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+
+        // Only model, messages, stream should be present
+        assert!(body.get("max_tokens").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("top_k").is_none());
+        assert!(body.get("frequency_penalty").is_none());
+        assert!(body.get("presence_penalty").is_none());
+        assert!(body.get("repetition_penalty").is_none());
+        assert!(body.get("stop").is_none());
+        assert!(body.get("seed").is_none());
+        assert!(body.get("response_format").is_none());
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert!(body.get("provider").is_none());
+    }
+
+    #[test]
+    fn test_body_stream_flag() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters::new();
+
+        let body_no_stream = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        assert_eq!(body_no_stream["stream"], false);
+
+        let body_stream = client.build_body_with_usage(&gen, &test_messages(), &params, true, false);
+        assert_eq!(body_stream["stream"], true);
+    }
+
+    #[test]
+    fn test_body_messages_serialization() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        let params = CompletionParameters::new();
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "You are helpful.");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "Hello");
+    }
+
+    #[test]
+    fn test_custom_timeout_creates_working_client() {
+        let client = LLMClient::with_timeout(Duration::from_secs(5));
+        let gen = test_generator();
+        let params = CompletionParameters::new();
+        // Verify the client can still build bodies (it's functional)
+        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        assert_eq!(body["model"], "test-model");
+    }
+
+    #[tokio::test]
+    async fn test_timeout_is_respected() {
+        // Start a TCP listener that accepts but never responds
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept connections but never send a response
+        tokio::spawn(async move {
+            loop {
+                let (_socket, _) = listener.accept().await.unwrap();
+                // Hold the connection open, never respond
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+
+        let client = LLMClient::with_timeout(Duration::from_secs(1));
+        let gen = GeneratorInfo::new("Test", &format!("http://{}", addr), "test-model")
+            .with_api_key("fake-key");
+        let messages = vec![Message::user("Hello")];
+        let params = CompletionParameters::new();
+
+        let start = std::time::Instant::now();
+        let result = client.complete(&gen, &messages, &params).await;
+        let elapsed = start.elapsed();
+
+        // Should fail (timeout or connection error)
+        assert!(result.is_err(), "Expected timeout error, got success");
+        // Should complete in roughly 1-3 seconds, not 120
+        assert!(
+            elapsed.as_secs() < 5,
+            "Timeout took too long: {:?} (expected ~1s)",
+            elapsed
+        );
+    }
 }

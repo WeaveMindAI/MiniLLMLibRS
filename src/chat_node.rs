@@ -478,6 +478,10 @@ impl ChatNode {
         generator: &GeneratorInfo,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<Arc<ChatNode>> {
+        if let Some(secs) = params.and_then(|p| p.timeout_secs) {
+            let client = LLMClient::with_timeout(Duration::from_secs(secs));
+            return self.complete_with_client(&client, generator, params).await;
+        }
         let client = global_client();
         self.complete_with_client(client, generator, params).await
     }
@@ -663,6 +667,10 @@ impl ChatNode {
         generator: &GeneratorInfo,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<StreamingCompletion> {
+        if let Some(secs) = params.and_then(|p| p.timeout_secs) {
+            let client = LLMClient::with_timeout(Duration::from_secs(secs));
+            return self.complete_streaming_with_client(&client, generator, params).await;
+        }
         let client = global_client();
         self.complete_streaming_with_client(client, generator, params)
             .await
