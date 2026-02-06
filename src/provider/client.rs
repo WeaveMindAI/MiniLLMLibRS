@@ -272,10 +272,7 @@ mod tests {
     }
 
     fn test_messages() -> Vec<Message> {
-        vec![
-            Message::system("You are helpful."),
-            Message::user("Hello"),
-        ]
+        vec![Message::system("You are helpful."), Message::user("Hello")]
     }
 
     #[test]
@@ -335,7 +332,11 @@ mod tests {
         assert_eq!(body["top_k"], 40);
         assert_eq!(body["frequency_penalty"], 0.5);
         let presence = body["presence_penalty"].as_f64().unwrap();
-        assert!((presence - 0.3).abs() < 1e-6, "presence_penalty: {}", presence);
+        assert!(
+            (presence - 0.3).abs() < 1e-6,
+            "presence_penalty: {}",
+            presence
+        );
         let rep = body["repetition_penalty"].as_f64().unwrap();
         assert!((rep - 1.2).abs() < 1e-6, "repetition_penalty: {}", rep);
         assert_eq!(body["stop"][0], "END");
@@ -461,10 +462,12 @@ mod tests {
         let gen = test_generator();
         let params = CompletionParameters::new();
 
-        let body_no_stream = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body_no_stream =
+            client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
         assert_eq!(body_no_stream["stream"], false);
 
-        let body_stream = client.build_body_with_usage(&gen, &test_messages(), &params, true, false);
+        let body_stream =
+            client.build_body_with_usage(&gen, &test_messages(), &params, true, false);
         assert_eq!(body_stream["stream"], true);
     }
 

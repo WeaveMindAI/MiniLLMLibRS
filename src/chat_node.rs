@@ -669,7 +669,9 @@ impl ChatNode {
     ) -> Result<StreamingCompletion> {
         if let Some(secs) = params.and_then(|p| p.timeout_secs) {
             let client = LLMClient::with_timeout(Duration::from_secs(secs));
-            return self.complete_streaming_with_client(&client, generator, params).await;
+            return self
+                .complete_streaming_with_client(&client, generator, params)
+                .await;
         }
         let client = global_client();
         self.complete_streaming_with_client(client, generator, params)
