@@ -28,6 +28,10 @@ pub struct ChatNode {
     /// Parent node (weak reference to avoid cycles)
     parent: RwLock<Option<Weak<ChatNode>>>,
 
+    /// Strong reference to the root node, keeping it alive as long as any
+    /// descendant exists. Root nodes have this set to None (they ARE the root).
+    root_ref: RwLock<Option<Arc<ChatNode>>>,
+
     /// Metadata for this node
     pub metadata: RwLock<serde_json::Value>,
 
@@ -45,6 +49,7 @@ impl ChatNode {
             message: Message::system(prompt),
             children: RwLock::new(Vec::new()),
             parent: RwLock::new(None),
+            root_ref: RwLock::new(None),
             metadata: RwLock::new(serde_json::json!({})),
             format_kwargs: RwLock::new(std::collections::HashMap::new()),
         })
@@ -57,6 +62,7 @@ impl ChatNode {
             message,
             children: RwLock::new(Vec::new()),
             parent: RwLock::new(None),
+            root_ref: RwLock::new(None),
             metadata: RwLock::new(serde_json::json!({})),
             format_kwargs: RwLock::new(std::collections::HashMap::new()),
         })
@@ -78,6 +84,15 @@ impl ChatNode {
         {
             let mut parent_lock = child.parent.write().unwrap();
             *parent_lock = Some(Arc::downgrade(self));
+        }
+
+        // Propagate root_ref: if self is the root (root_ref is None), child points to self;
+        // otherwise child inherits self's root_ref
+        {
+            let self_root = self.root_ref.read().unwrap().clone();
+            let root = self_root.unwrap_or_else(|| self.clone());
+            let mut child_root = child.root_ref.write().unwrap();
+            *child_root = Some(root);
         }
 
         // Add to children
@@ -125,10 +140,7 @@ impl ChatNode {
 
     /// Get the root node of the tree
     pub fn get_root(self: &Arc<Self>) -> Arc<ChatNode> {
-        match self.parent() {
-            Some(parent) => parent.get_root(),
-            None => self.clone(),
-        }
+        self.root_ref.read().unwrap().clone().unwrap_or_else(|| self.clone())
     }
 
     /// Check if this is a leaf node
@@ -194,12 +206,39 @@ impl ChatNode {
     }
 
     // =========================================================================
+    // Root reference management
+    // =========================================================================
+
+    /// Recursively clear root_ref for this node and all descendants
+    fn clear_root_ref(self: &Arc<Self>) {
+        {
+            let mut root = self.root_ref.write().unwrap();
+            *root = None;
+        }
+        for child in self.children() {
+            child.clear_root_ref();
+        }
+    }
+
+    /// Recursively set root_ref for this node and all descendants
+    fn set_root_ref_recursive(self: &Arc<Self>, root: &Arc<ChatNode>) {
+        {
+            let mut root_lock = self.root_ref.write().unwrap();
+            *root_lock = Some(root.clone());
+        }
+        for child in self.children() {
+            child.set_root_ref_recursive(root);
+        }
+    }
+
+    // =========================================================================
     // Tree manipulation
     // =========================================================================
 
     /// Detach this node from its parent
     ///
     /// Removes this node from its parent's children list and clears the parent reference.
+    /// Also clears root_ref for this node and all descendants.
     /// Returns self for chaining.
     pub fn detach(self: &Arc<Self>) -> Arc<ChatNode> {
         // Remove from parent's children
@@ -214,6 +253,9 @@ impl ChatNode {
             *parent_lock = None;
         }
 
+        // Clear root_ref for this subtree (this node becomes its own root)
+        self.clear_root_ref();
+
         self.clone()
     }
 
@@ -223,7 +265,12 @@ impl ChatNode {
     /// Returns the leaf of the merged tree.
     pub fn merge(self: &Arc<Self>, other: &Arc<ChatNode>) -> Arc<ChatNode> {
         let other_root = other.get_root();
-        self.add_child(other_root);
+        let merged_root = self.add_child(other_root);
+        // add_child only sets root_ref on the direct child; propagate to all descendants
+        let tree_root = self.get_root();
+        for child in merged_root.children() {
+            child.set_root_ref_recursive(&tree_root);
+        }
         other.get_leaf()
     }
 
