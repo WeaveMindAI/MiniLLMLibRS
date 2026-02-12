@@ -2332,7 +2332,13 @@ fn make_test_context(
         isByok: is_byok,
     };
 
-    let ctx = CompletionContext::new(generator, meta, callback, "https://test.example.com", "TestApp");
+    let ctx = CompletionContext::new(
+        generator,
+        meta,
+        callback,
+        "https://test.example.com",
+        "TestApp",
+    );
     (ctx, captured)
 }
 
@@ -2361,20 +2367,44 @@ fn test_completion_context_byok() {
 fn test_completion_context_injects_app_headers() {
     // Start with a generator that has library-default headers
     let gen = GeneratorInfo::openrouter("test-model");
-    assert!(gen.custom_headers.iter().any(|(k, v)| k == "X-Title" && v == "MiniLLMLib"));
+    assert!(gen
+        .custom_headers
+        .iter()
+        .any(|(k, v)| k == "X-Title" && v == "MiniLLMLib"));
 
     let (ctx, _captured) = make_test_context(gen, false);
 
     // CompletionContext should have replaced the library defaults with the test app identity
-    let referer = ctx.generator.custom_headers.iter().find(|(k, _)| k == "HTTP-Referer");
-    let title = ctx.generator.custom_headers.iter().find(|(k, _)| k == "X-Title");
+    let referer = ctx
+        .generator
+        .custom_headers
+        .iter()
+        .find(|(k, _)| k == "HTTP-Referer");
+    let title = ctx
+        .generator
+        .custom_headers
+        .iter()
+        .find(|(k, _)| k == "X-Title");
 
     assert_eq!(referer.unwrap().1, "https://test.example.com");
     assert_eq!(title.unwrap().1, "TestApp");
     // No duplicate headers
-    let referer_count = ctx.generator.custom_headers.iter().filter(|(k, _)| k == "HTTP-Referer").count();
-    let title_count = ctx.generator.custom_headers.iter().filter(|(k, _)| k == "X-Title").count();
-    assert_eq!(referer_count, 1, "Should have exactly one HTTP-Referer header");
+    let referer_count = ctx
+        .generator
+        .custom_headers
+        .iter()
+        .filter(|(k, _)| k == "HTTP-Referer")
+        .count();
+    let title_count = ctx
+        .generator
+        .custom_headers
+        .iter()
+        .filter(|(k, _)| k == "X-Title")
+        .count();
+    assert_eq!(
+        referer_count, 1,
+        "Should have exactly one HTTP-Referer header"
+    );
     assert_eq!(title_count, 1, "Should have exactly one X-Title header");
 }
 
@@ -2470,7 +2500,11 @@ async fn test_complete_tracked_fires_callback() {
     let user_node = root.add_user("Say hello in exactly 3 words.");
 
     let result = user_node.complete_tracked(&ctx, None).await;
-    assert!(result.is_ok(), "complete_tracked failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "complete_tracked failed: {:?}",
+        result.err()
+    );
 
     let response = result.unwrap();
     let text = response.text().unwrap_or_default();
@@ -2484,7 +2518,10 @@ async fn test_complete_tracked_fires_callback() {
     let cost = &costs[0];
     println!("[complete_tracked] Cost: ${:.6}", cost.cost);
     println!("[complete_tracked] Prompt tokens: {}", cost.prompt_tokens);
-    println!("[complete_tracked] Completion tokens: {}", cost.completion_tokens);
+    println!(
+        "[complete_tracked] Completion tokens: {}",
+        cost.completion_tokens
+    );
     println!("[complete_tracked] Model: {}", cost.model);
     println!("[complete_tracked] Response ID: {}", cost.response_id);
 
@@ -2492,12 +2529,18 @@ async fn test_complete_tracked_fires_callback() {
     assert!(cost.cost >= 0.0, "Cost should be non-negative");
     // Tokens should be non-zero for a real completion
     assert!(cost.prompt_tokens > 0, "Prompt tokens should be > 0");
-    assert!(cost.completion_tokens > 0, "Completion tokens should be > 0");
+    assert!(
+        cost.completion_tokens > 0,
+        "Completion tokens should be > 0"
+    );
     assert!(cost.total_tokens > 0, "Total tokens should be > 0");
     // Model should be populated
     assert!(!cost.model.is_empty(), "Model should not be empty");
     // Response ID should be populated
-    assert!(!cost.response_id.is_empty(), "Response ID should not be empty");
+    assert!(
+        !cost.response_id.is_empty(),
+        "Response ID should not be empty"
+    );
 }
 
 #[tokio::test]
@@ -2511,14 +2554,21 @@ async fn test_complete_tracked_with_params() {
     let gen = get_text_generator();
     let (ctx, captured) = make_test_context(gen, false);
 
-    let params = NodeCompletionParameters::new()
-        .with_params(CompletionParameters::new().with_max_tokens(50).with_temperature(0.0));
+    let params = NodeCompletionParameters::new().with_params(
+        CompletionParameters::new()
+            .with_max_tokens(50)
+            .with_temperature(0.0),
+    );
 
     let root = ChatNode::root("You are a helpful assistant.");
     let user_node = root.add_user("What is 2+2?");
 
     let result = user_node.complete_tracked(&ctx, Some(&params)).await;
-    assert!(result.is_ok(), "complete_tracked with params failed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "complete_tracked with params failed: {:?}",
+        result.err()
+    );
 
     let response = result.unwrap();
     let text = response.text().unwrap_or_default();
@@ -2544,8 +2594,14 @@ async fn test_complete_streaming_collect_tracked() {
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
     let user_node = root.add_user("Count from 1 to 5.");
 
-    let result = user_node.complete_streaming_collect_tracked(&ctx, None).await;
-    assert!(result.is_ok(), "streaming collect tracked failed: {:?}", result.err());
+    let result = user_node
+        .complete_streaming_collect_tracked(&ctx, None)
+        .await;
+    assert!(
+        result.is_ok(),
+        "streaming collect tracked failed: {:?}",
+        result.err()
+    );
 
     let response = result.unwrap();
     let text = response.text().unwrap_or_default();
@@ -2554,12 +2610,18 @@ async fn test_complete_streaming_collect_tracked() {
 
     // Verify callback was fired
     let costs = captured.lock().unwrap();
-    assert_eq!(costs.len(), 1, "Callback should fire exactly once after collect");
+    assert_eq!(
+        costs.len(),
+        1,
+        "Callback should fire exactly once after collect"
+    );
 
     let cost = &costs[0];
     println!("[streaming_collect_tracked] Cost: ${:.6}", cost.cost);
-    println!("[streaming_collect_tracked] Tokens: {} prompt + {} completion = {} total",
-        cost.prompt_tokens, cost.completion_tokens, cost.total_tokens);
+    println!(
+        "[streaming_collect_tracked] Tokens: {} prompt + {} completion = {} total",
+        cost.prompt_tokens, cost.completion_tokens, cost.total_tokens
+    );
 
     assert!(cost.prompt_tokens > 0);
     assert!(cost.completion_tokens > 0);
@@ -2581,7 +2643,11 @@ async fn test_complete_streaming_tracked_manual_consume() {
     let user_node = root.add_user("Say 'hello world'.");
 
     let stream_result = user_node.complete_streaming_tracked(&ctx, None).await;
-    assert!(stream_result.is_ok(), "streaming tracked failed: {:?}", stream_result.err());
+    assert!(
+        stream_result.is_ok(),
+        "streaming tracked failed: {:?}",
+        stream_result.err()
+    );
 
     let mut stream = stream_result.unwrap();
 
@@ -2606,7 +2672,11 @@ async fn test_complete_streaming_tracked_manual_consume() {
     assert!(response.is_ok());
 
     let costs = captured.lock().unwrap();
-    assert_eq!(costs.len(), 1, "Callback should fire once after collect_and_report");
+    assert_eq!(
+        costs.len(),
+        1,
+        "Callback should fire once after collect_and_report"
+    );
     assert!(!costs[0].model.is_empty());
 }
 
@@ -2652,7 +2722,10 @@ async fn test_tracked_stream_drop_reports_cost() {
     println!("[drop_test] Captured {} cost report(s)", costs.len());
     // The Drop impl spawns a background task — it should have reported by now
     assert_eq!(costs.len(), 1, "Drop should have triggered cost reporting");
-    println!("[drop_test] Cost from cancelled stream: ${:.6}", costs[0].cost);
+    println!(
+        "[drop_test] Cost from cancelled stream: ${:.6}",
+        costs[0].cost
+    );
 }
 
 #[tokio::test]

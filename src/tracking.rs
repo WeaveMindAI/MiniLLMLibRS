@@ -16,11 +16,8 @@ use std::sync::Arc;
 
 /// Async cost callback that can write to a database or HTTP endpoint.
 /// Returns a future so the caller can await the write (or fire-and-forget via spawn).
-pub type AsyncCostCallback = Arc<
-    dyn Fn(CostInfo, CompletionMeta) -> Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
->;
+pub type AsyncCostCallback =
+    Arc<dyn Fn(CostInfo, CompletionMeta) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Metadata about the completion context (passed to the cost callback alongside CostInfo)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -93,10 +90,7 @@ impl CompletionContext {
     /// Query OpenRouter's /api/v1/generation endpoint to get cost for a
     /// generation that may have been cancelled mid-stream.
     /// Returns CostInfo if the generation is found, None otherwise.
-    pub(crate) async fn query_generation_cost(
-        &self,
-        generation_id: &str,
-    ) -> Option<CostInfo> {
+    pub(crate) async fn query_generation_cost(&self, generation_id: &str) -> Option<CostInfo> {
         query_generation_cost_static(&self.generator, generation_id).await
     }
 }
@@ -131,12 +125,16 @@ impl TrackedStream {
     }
 
     /// Get the next chunk from the underlying stream.
-    pub async fn next_chunk(&mut self) -> Option<crate::error::Result<crate::provider::StreamChunk>> {
+    pub async fn next_chunk(
+        &mut self,
+    ) -> Option<crate::error::Result<crate::provider::StreamChunk>> {
         self.inner.next_chunk().await
     }
 
     /// Collect all chunks, report cost, and return the final CompletionResponse.
-    pub async fn collect_and_report(&mut self) -> crate::error::Result<crate::provider::CompletionResponse> {
+    pub async fn collect_and_report(
+        &mut self,
+    ) -> crate::error::Result<crate::provider::CompletionResponse> {
         // Drain the stream
         while let Some(result) = self.inner.next_chunk().await {
             result?;
@@ -250,13 +248,15 @@ impl Drop for TrackedStream {
                 let mut result = None;
                 for delay_secs in [1, 2, 4] {
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                    if let Some(info) = query_generation_cost_static(&generator, &response_id).await {
+                    if let Some(info) = query_generation_cost_static(&generator, &response_id).await
+                    {
                         result = Some(info);
                         break;
                     }
                     tracing::debug!(
                         "Generation {} not found yet, retrying in {}s",
-                        response_id, delay_secs * 2
+                        response_id,
+                        delay_secs * 2
                     );
                 }
                 result.unwrap_or_default()
@@ -278,12 +278,9 @@ async fn query_generation_cost_static(
     use secrecy::ExposeSecret;
 
     let api_key = generator.api_key.as_ref()?;
-    let encoded_id = url::form_urlencoded::byte_serialize(generation_id.as_bytes())
-        .collect::<String>();
-    let url = format!(
-        "https://openrouter.ai/api/v1/generation?id={}",
-        encoded_id
-    );
+    let encoded_id =
+        url::form_urlencoded::byte_serialize(generation_id.as_bytes()).collect::<String>();
+    let url = format!("https://openrouter.ai/api/v1/generation?id={}", encoded_id);
 
     let client = reqwest::Client::new();
     let response = client
@@ -320,9 +317,7 @@ async fn query_generation_cost_static(
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
         cached_tokens: data["native_tokens_cached"].as_u64().map(|v| v as u32),
-        reasoning_tokens: data["native_tokens_reasoning"]
-            .as_u64()
-            .map(|v| v as u32),
+        reasoning_tokens: data["native_tokens_reasoning"].as_u64().map(|v| v as u32),
         model,
         response_id: gen_id,
     })

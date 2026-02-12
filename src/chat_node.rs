@@ -826,14 +826,11 @@ impl ChatNode {
                     crate::provider::CostInfo {
                         cost: usage_val["cost"].as_f64().unwrap_or(0.0),
                         prompt_tokens: usage_val["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-                        completion_tokens: usage_val["completion_tokens"]
-                            .as_u64()
-                            .unwrap_or(0) as u32,
+                        completion_tokens: usage_val["completion_tokens"].as_u64().unwrap_or(0)
+                            as u32,
                         total_tokens: usage_val["total_tokens"].as_u64().unwrap_or(0) as u32,
                         cached_tokens: usage_val["cached_tokens"].as_u64().map(|v| v as u32),
-                        reasoning_tokens: usage_val["reasoning_tokens"]
-                            .as_u64()
-                            .map(|v| v as u32),
+                        reasoning_tokens: usage_val["reasoning_tokens"].as_u64().map(|v| v as u32),
                         model: model.clone(),
                         response_id: response_id.clone(),
                     }
