@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-02-12
+
+### Added
+
+- **CompletionContext**: Enforced cost tracking wrapper for LLM completions. Wraps a `GeneratorInfo` and guarantees every completion reports cost via an async callback. This is the mechanism WeaveMind uses to track AI usage costs.
+  - `CompletionContext::new()`, `report_cost()`, `is_byok()`
+  - `CompletionMeta` struct with userId, workflowId, executionId, nodeId, isByok
+  - `AsyncCostCallback` type for async cost ingestion (database writes, HTTP, etc.)
+- **TrackedStream**: Streaming completion wrapper that automatically reports cost when the stream finishes or is cancelled (dropped).
+  - `next_chunk()`, `collect_and_report()`, `accumulated()`, `is_finished()`
+  - Drop impl spawns background cost query for cancelled streams
+- **Tracked completion methods on ChatNode**:
+  - `complete_tracked()` — non-streaming with enforced cost reporting
+  - `complete_streaming_tracked()` — returns a `TrackedStream`
+  - `complete_streaming_collect_tracked()` — streaming collect with cost reporting
+- **OpenRouter generation cost fallback**: When usage data is missing (cancelled streams, some providers), queries OpenRouter's `/api/v1/generation` endpoint with retry backoff
+
+### Changed
+
+- `CompletionMeta` derives `Serialize` and `Deserialize` for downstream use
+- Drop-based cost reporting uses `Handle::try_current()` guard (no panic if dropped outside tokio runtime)
+- Generation cost query URL-encodes the generation ID parameter
+- Cancelled stream cost query retries 3 times (1s, 2s, 4s backoff) instead of a single 2s wait
+
 ## [0.2.0] - 2025-12-14
 
 ### Added

@@ -777,6 +777,156 @@ impl ChatNode {
     }
 
     // =========================================================================
+    // Tracked completion methods (enforced cost tracking via CompletionContext)
+    // =========================================================================
+
+    /// Complete with enforced cost tracking via CompletionContext.
+    ///
+    /// This is the method WeaveMind nodes must use. It always enables OpenRouter
+    /// usage tracking and fires the cost callback on every completion.
+    /// On cancelled streams or missing usage data, it falls back to querying
+    /// OpenRouter's /api/v1/generation endpoint.
+    pub async fn complete_tracked(
+        self: &Arc<Self>,
+        ctx: &crate::tracking::CompletionContext,
+        params: Option<&NodeCompletionParameters>,
+    ) -> Result<Arc<ChatNode>> {
+        // Force OpenRouter cost tracking on
+        let tracked_params = match params {
+            Some(p) => {
+                let mut cloned = p.clone();
+                cloned.cost_tracking = crate::provider::CostTrackingType::OpenRouter;
+                cloned.cost_callback = None; // We handle callback ourselves
+                cloned
+            }
+            None => {
+                let mut p = NodeCompletionParameters::new();
+                p.cost_tracking = crate::provider::CostTrackingType::OpenRouter;
+                p
+            }
+        };
+
+        let result = self.complete(&ctx.generator, Some(&tracked_params)).await;
+
+        match &result {
+            Ok(node) => {
+                // Extract cost info from the response metadata
+                let usage_meta = node.get_metadata("usage");
+                let response_id = node
+                    .get_metadata("response_id")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                let model = node
+                    .get_metadata("model")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| ctx.generator.model.clone());
+
+                let cost_info = if let Some(usage_val) = usage_meta {
+                    // Usage was in the response — parse it
+                    crate::provider::CostInfo {
+                        cost: usage_val["cost"].as_f64().unwrap_or(0.0),
+                        prompt_tokens: usage_val["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+                        completion_tokens: usage_val["completion_tokens"]
+                            .as_u64()
+                            .unwrap_or(0) as u32,
+                        total_tokens: usage_val["total_tokens"].as_u64().unwrap_or(0) as u32,
+                        cached_tokens: usage_val["cached_tokens"].as_u64().map(|v| v as u32),
+                        reasoning_tokens: usage_val["reasoning_tokens"]
+                            .as_u64()
+                            .map(|v| v as u32),
+                        model: model.clone(),
+                        response_id: response_id.clone(),
+                    }
+                } else if !response_id.is_empty() {
+                    // No usage in response — query OpenRouter generation endpoint
+                    tracing::info!(
+                        "No usage in response for {}, querying generation endpoint",
+                        response_id
+                    );
+                    ctx.query_generation_cost(&response_id)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    crate::provider::CostInfo::default()
+                };
+
+                ctx.report_cost(cost_info).await;
+            }
+            Err(_) => {
+                // Request failed — no cost to report
+            }
+        }
+
+        result
+    }
+
+    /// Complete streaming with enforced cost tracking.
+    ///
+    /// Returns a TrackedStream that will automatically report costs when
+    /// the stream finishes or is dropped (cancelled).
+    pub async fn complete_streaming_tracked(
+        self: &Arc<Self>,
+        ctx: &crate::tracking::CompletionContext,
+        params: Option<&NodeCompletionParameters>,
+    ) -> Result<crate::tracking::TrackedStream> {
+        // Force OpenRouter cost tracking on
+        let tracked_params = match params {
+            Some(p) => {
+                let mut cloned = p.clone();
+                cloned.cost_tracking = crate::provider::CostTrackingType::OpenRouter;
+                cloned.cost_callback = None;
+                cloned
+            }
+            None => {
+                let mut p = NodeCompletionParameters::new();
+                p.cost_tracking = crate::provider::CostTrackingType::OpenRouter;
+                p
+            }
+        };
+
+        let stream = self
+            .complete_streaming(&ctx.generator, Some(&tracked_params))
+            .await?;
+
+        Ok(crate::tracking::TrackedStream::new(stream, ctx))
+    }
+
+    /// Complete streaming, collect all chunks, and report cost. Tracked variant.
+    pub async fn complete_streaming_collect_tracked(
+        self: &Arc<Self>,
+        ctx: &crate::tracking::CompletionContext,
+        params: Option<&NodeCompletionParameters>,
+    ) -> Result<Arc<ChatNode>> {
+        let mut tracked_stream = self.complete_streaming_tracked(ctx, params).await?;
+        let response = tracked_stream.collect_and_report().await?;
+
+        let parse_json = params.map(|p| p.parse_json).unwrap_or(false);
+        let crash_on_refusal = params.map(|p| p.crash_on_refusal).unwrap_or(false);
+        let force_prepend = params.and_then(|p| p.force_prepend.clone());
+
+        let mut content = response.content;
+
+        if let Some(ref prepend) = force_prepend {
+            if !content.starts_with(prepend) {
+                content = format!("{}{}", prepend, content);
+            }
+        }
+
+        if parse_json {
+            content = self.process_json_response(&content, crash_on_refusal)?;
+        }
+
+        let assistant_node = Self::new(Message::assistant(content));
+        assistant_node.set_metadata("response_id", serde_json::json!(response.id));
+        assistant_node.set_metadata("model", serde_json::json!(response.model));
+        if let Some(usage) = &response.usage {
+            assistant_node.set_metadata("usage", serde_json::json!(usage));
+        }
+
+        Ok(self.add_child(assistant_node))
+    }
+
+    // =========================================================================
     // Convenience methods for common patterns
     // =========================================================================
 

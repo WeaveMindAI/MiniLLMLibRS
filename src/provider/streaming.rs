@@ -142,6 +142,16 @@ impl StreamingCompletion {
     pub fn usage(&self) -> Option<&Usage> {
         self.usage.as_ref()
     }
+
+    /// Get the response ID
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Get the model name
+    pub fn model(&self) -> &str {
+        &self.model
+    }
 }
 
 impl Stream for StreamingCompletion {

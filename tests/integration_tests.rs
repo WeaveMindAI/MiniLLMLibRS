@@ -10,6 +10,7 @@ use minillmlib::{
     generator::{CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings},
     message::{AudioData, ImageData, Media, Message, MessageContent, Role, VideoData},
     provider::{CostInfo, LLMClient},
+    tracking::{AsyncCostCallback, CompletionContext, CompletionMeta},
 };
 use std::sync::{Arc, Mutex};
 
@@ -2302,4 +2303,397 @@ async fn test_async_concurrent_completions() {
     // Each user message should have 1 child (assistant response)
     let children_count = root.child_count();
     assert_eq!(children_count, 10, "Root should have 10 children");
+}
+
+// =============================================================================
+// CompletionContext & Tracking Tests (Unit — no API calls)
+// =============================================================================
+
+/// Helper: build a CompletionContext with a mock callback that captures CostInfo
+fn make_test_context(
+    generator: GeneratorInfo,
+    is_byok: bool,
+) -> (CompletionContext, Arc<Mutex<Vec<CostInfo>>>) {
+    let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+
+    let callback: AsyncCostCallback = Arc::new(move |cost_info, _meta| {
+        let captured = captured_clone.clone();
+        Box::pin(async move {
+            captured.lock().unwrap().push(cost_info);
+        })
+    });
+
+    let meta = CompletionMeta {
+        userId: "test-user".to_string(),
+        workflowId: Some("wf-123".to_string()),
+        executionId: Some("exec-456".to_string()),
+        nodeId: Some("node-789".to_string()),
+        isByok: is_byok,
+    };
+
+    let ctx = CompletionContext::new(generator, meta, callback, "https://test.example.com", "TestApp");
+    (ctx, captured)
+}
+
+#[test]
+fn test_completion_context_creation() {
+    let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model");
+    let (ctx, _captured) = make_test_context(gen, false);
+
+    assert_eq!(ctx.meta.userId, "test-user");
+    assert_eq!(ctx.meta.workflowId, Some("wf-123".to_string()));
+    assert_eq!(ctx.meta.executionId, Some("exec-456".to_string()));
+    assert_eq!(ctx.meta.nodeId, Some("node-789".to_string()));
+    assert!(!ctx.is_byok());
+}
+
+#[test]
+fn test_completion_context_byok() {
+    let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model")
+        .with_api_key("user-provided-key");
+    let (ctx, _captured) = make_test_context(gen, true);
+
+    assert!(ctx.is_byok());
+}
+
+#[test]
+fn test_completion_context_injects_app_headers() {
+    // Start with a generator that has library-default headers
+    let gen = GeneratorInfo::openrouter("test-model");
+    assert!(gen.custom_headers.iter().any(|(k, v)| k == "X-Title" && v == "MiniLLMLib"));
+
+    let (ctx, _captured) = make_test_context(gen, false);
+
+    // CompletionContext should have replaced the library defaults with the test app identity
+    let referer = ctx.generator.custom_headers.iter().find(|(k, _)| k == "HTTP-Referer");
+    let title = ctx.generator.custom_headers.iter().find(|(k, _)| k == "X-Title");
+
+    assert_eq!(referer.unwrap().1, "https://test.example.com");
+    assert_eq!(title.unwrap().1, "TestApp");
+    // No duplicate headers
+    let referer_count = ctx.generator.custom_headers.iter().filter(|(k, _)| k == "HTTP-Referer").count();
+    let title_count = ctx.generator.custom_headers.iter().filter(|(k, _)| k == "X-Title").count();
+    assert_eq!(referer_count, 1, "Should have exactly one HTTP-Referer header");
+    assert_eq!(title_count, 1, "Should have exactly one X-Title header");
+}
+
+#[tokio::test]
+async fn test_completion_context_report_cost() {
+    let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model");
+    let (ctx, captured) = make_test_context(gen, false);
+
+    let cost_info = CostInfo {
+        cost: 0.00042,
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        total_tokens: 150,
+        cached_tokens: None,
+        reasoning_tokens: None,
+        model: "test-model".to_string(),
+        response_id: "gen-abc123".to_string(),
+    };
+
+    ctx.report_cost(cost_info).await;
+
+    let costs = captured.lock().unwrap();
+    assert_eq!(costs.len(), 1);
+    assert_eq!(costs[0].cost, 0.00042);
+    assert_eq!(costs[0].prompt_tokens, 100);
+    assert_eq!(costs[0].completion_tokens, 50);
+    assert_eq!(costs[0].total_tokens, 150);
+    assert_eq!(costs[0].model, "test-model");
+    assert_eq!(costs[0].response_id, "gen-abc123");
+}
+
+#[tokio::test]
+async fn test_completion_context_callback_receives_meta() {
+    let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model");
+
+    let captured_meta: Arc<Mutex<Vec<CompletionMeta>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured_meta.clone();
+
+    let callback: AsyncCostCallback = Arc::new(move |_cost_info, meta| {
+        let captured = captured_clone.clone();
+        Box::pin(async move {
+            captured.lock().unwrap().push(meta);
+        })
+    });
+
+    let meta = CompletionMeta {
+        userId: "user-42".to_string(),
+        workflowId: Some("wf-abc".to_string()),
+        executionId: Some("exec-def".to_string()),
+        nodeId: Some("node-ghi".to_string()),
+        isByok: true,
+    };
+
+    let ctx = CompletionContext::new(gen, meta, callback, "https://test.example.com", "TestApp");
+    ctx.report_cost(CostInfo::default()).await;
+
+    let metas = captured_meta.lock().unwrap();
+    assert_eq!(metas.len(), 1);
+    assert_eq!(metas[0].userId, "user-42");
+    assert_eq!(metas[0].workflowId, Some("wf-abc".to_string()));
+    assert_eq!(metas[0].executionId, Some("exec-def".to_string()));
+    assert_eq!(metas[0].nodeId, Some("node-ghi".to_string()));
+    assert!(metas[0].isByok);
+}
+
+#[test]
+fn test_completion_context_debug() {
+    let gen = GeneratorInfo::new("TestProvider", "https://api.example.com/v1", "test-model");
+    let (ctx, _) = make_test_context(gen, false);
+
+    let debug_str = format!("{:?}", ctx);
+    assert!(debug_str.contains("CompletionContext"));
+    assert!(debug_str.contains("TestProvider"));
+    assert!(debug_str.contains("test-model"));
+}
+
+// =============================================================================
+// Tracked Completion Integration Tests (real API calls)
+// =============================================================================
+
+#[tokio::test]
+async fn test_complete_tracked_fires_callback() {
+    dotenvy::dotenv().ok();
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let gen = get_text_generator();
+    let (ctx, captured) = make_test_context(gen, false);
+
+    let root = ChatNode::root("You are a helpful assistant. Be very brief.");
+    let user_node = root.add_user("Say hello in exactly 3 words.");
+
+    let result = user_node.complete_tracked(&ctx, None).await;
+    assert!(result.is_ok(), "complete_tracked failed: {:?}", result.err());
+
+    let response = result.unwrap();
+    let text = response.text().unwrap_or_default();
+    println!("[complete_tracked] Response: {}", text);
+    assert!(!text.is_empty(), "Response should not be empty");
+
+    // Verify callback was fired exactly once
+    let costs = captured.lock().unwrap();
+    assert_eq!(costs.len(), 1, "Callback should fire exactly once");
+
+    let cost = &costs[0];
+    println!("[complete_tracked] Cost: ${:.6}", cost.cost);
+    println!("[complete_tracked] Prompt tokens: {}", cost.prompt_tokens);
+    println!("[complete_tracked] Completion tokens: {}", cost.completion_tokens);
+    println!("[complete_tracked] Model: {}", cost.model);
+    println!("[complete_tracked] Response ID: {}", cost.response_id);
+
+    // Cost should be non-negative (could be 0 for free models)
+    assert!(cost.cost >= 0.0, "Cost should be non-negative");
+    // Tokens should be non-zero for a real completion
+    assert!(cost.prompt_tokens > 0, "Prompt tokens should be > 0");
+    assert!(cost.completion_tokens > 0, "Completion tokens should be > 0");
+    assert!(cost.total_tokens > 0, "Total tokens should be > 0");
+    // Model should be populated
+    assert!(!cost.model.is_empty(), "Model should not be empty");
+    // Response ID should be populated
+    assert!(!cost.response_id.is_empty(), "Response ID should not be empty");
+}
+
+#[tokio::test]
+async fn test_complete_tracked_with_params() {
+    dotenvy::dotenv().ok();
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let gen = get_text_generator();
+    let (ctx, captured) = make_test_context(gen, false);
+
+    let params = NodeCompletionParameters::new()
+        .with_params(CompletionParameters::new().with_max_tokens(50).with_temperature(0.0));
+
+    let root = ChatNode::root("You are a helpful assistant.");
+    let user_node = root.add_user("What is 2+2?");
+
+    let result = user_node.complete_tracked(&ctx, Some(&params)).await;
+    assert!(result.is_ok(), "complete_tracked with params failed: {:?}", result.err());
+
+    let response = result.unwrap();
+    let text = response.text().unwrap_or_default();
+    println!("[complete_tracked+params] Response: {}", text);
+    assert!(text.contains("4"), "Response should contain '4'");
+
+    let costs = captured.lock().unwrap();
+    assert_eq!(costs.len(), 1);
+    assert!(costs[0].prompt_tokens > 0);
+}
+
+#[tokio::test]
+async fn test_complete_streaming_collect_tracked() {
+    dotenvy::dotenv().ok();
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let gen = get_text_generator();
+    let (ctx, captured) = make_test_context(gen, false);
+
+    let root = ChatNode::root("You are a helpful assistant. Be very brief.");
+    let user_node = root.add_user("Count from 1 to 5.");
+
+    let result = user_node.complete_streaming_collect_tracked(&ctx, None).await;
+    assert!(result.is_ok(), "streaming collect tracked failed: {:?}", result.err());
+
+    let response = result.unwrap();
+    let text = response.text().unwrap_or_default();
+    println!("[streaming_collect_tracked] Response: {}", text);
+    assert!(!text.is_empty());
+
+    // Verify callback was fired
+    let costs = captured.lock().unwrap();
+    assert_eq!(costs.len(), 1, "Callback should fire exactly once after collect");
+
+    let cost = &costs[0];
+    println!("[streaming_collect_tracked] Cost: ${:.6}", cost.cost);
+    println!("[streaming_collect_tracked] Tokens: {} prompt + {} completion = {} total",
+        cost.prompt_tokens, cost.completion_tokens, cost.total_tokens);
+
+    assert!(cost.prompt_tokens > 0);
+    assert!(cost.completion_tokens > 0);
+    assert!(!cost.model.is_empty());
+}
+
+#[tokio::test]
+async fn test_complete_streaming_tracked_manual_consume() {
+    dotenvy::dotenv().ok();
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let gen = get_text_generator();
+    let (ctx, captured) = make_test_context(gen, false);
+
+    let root = ChatNode::root("You are a helpful assistant. Be very brief.");
+    let user_node = root.add_user("Say 'hello world'.");
+
+    let stream_result = user_node.complete_streaming_tracked(&ctx, None).await;
+    assert!(stream_result.is_ok(), "streaming tracked failed: {:?}", stream_result.err());
+
+    let mut stream = stream_result.unwrap();
+
+    // Manually consume chunks
+    let mut chunk_count = 0;
+    while let Some(chunk_result) = stream.next_chunk().await {
+        match chunk_result {
+            Ok(_chunk) => chunk_count += 1,
+            Err(e) => panic!("Stream chunk error: {:?}", e),
+        }
+    }
+    println!("[streaming_tracked] Consumed {} chunks", chunk_count);
+    assert!(chunk_count > 0, "Should have received at least one chunk");
+
+    // Accumulated content should be non-empty
+    let accumulated = stream.accumulated().to_string();
+    println!("[streaming_tracked] Accumulated: {}", accumulated);
+    assert!(!accumulated.is_empty());
+
+    // Now collect_and_report to fire the callback
+    let response = stream.collect_and_report().await;
+    assert!(response.is_ok());
+
+    let costs = captured.lock().unwrap();
+    assert_eq!(costs.len(), 1, "Callback should fire once after collect_and_report");
+    assert!(!costs[0].model.is_empty());
+}
+
+#[tokio::test]
+async fn test_tracked_stream_drop_reports_cost() {
+    dotenvy::dotenv().ok();
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let gen = get_text_generator();
+    let (ctx, captured) = make_test_context(gen, false);
+
+    let root = ChatNode::root("You are a helpful assistant.");
+    let user_node = root.add_user("Write a long essay about the history of computing.");
+
+    let stream_result = user_node.complete_streaming_tracked(&ctx, None).await;
+    assert!(stream_result.is_ok());
+
+    {
+        let mut stream = stream_result.unwrap();
+
+        // Read only a few chunks then drop (simulating cancellation)
+        let mut chunks_read = 0;
+        while let Some(chunk_result) = stream.next_chunk().await {
+            if chunk_result.is_ok() {
+                chunks_read += 1;
+            }
+            if chunks_read >= 3 {
+                break; // Stop early — cancel the stream
+            }
+        }
+        println!("[drop_test] Read {} chunks before dropping", chunks_read);
+        // stream is dropped here — Drop impl should spawn background cost reporting
+    }
+
+    // Give the background task time to query OpenRouter and report.
+    // Drop retry schedule is 1s + 2s + 4s = 7s worst case, plus query time.
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    let costs = captured.lock().unwrap();
+    println!("[drop_test] Captured {} cost report(s)", costs.len());
+    // The Drop impl spawns a background task — it should have reported by now
+    assert_eq!(costs.len(), 1, "Drop should have triggered cost reporting");
+    println!("[drop_test] Cost from cancelled stream: ${:.6}", costs[0].cost);
+}
+
+#[tokio::test]
+async fn test_complete_tracked_byok_flag() {
+    dotenvy::dotenv().ok();
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
+        return;
+    }
+
+    let gen = get_text_generator();
+
+    // Simulate BYOK: user provided their own key (even though it's the same key for testing)
+    let captured_meta: Arc<Mutex<Vec<CompletionMeta>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_clone = captured_meta.clone();
+
+    let callback: AsyncCostCallback = Arc::new(move |_cost_info, meta| {
+        let captured = captured_clone.clone();
+        Box::pin(async move {
+            captured.lock().unwrap().push(meta);
+        })
+    });
+
+    let meta = CompletionMeta {
+        userId: "byok-user".to_string(),
+        workflowId: None,
+        executionId: None,
+        nodeId: None,
+        isByok: true,
+    };
+
+    let ctx = CompletionContext::new(gen, meta, callback, "https://test.example.com", "TestApp");
+
+    let root = ChatNode::root("Be brief.");
+    let user_node = root.add_user("Hi");
+
+    let result = user_node.complete_tracked(&ctx, None).await;
+    assert!(result.is_ok());
+
+    let metas = captured_meta.lock().unwrap();
+    assert_eq!(metas.len(), 1);
+    assert!(metas[0].isByok, "BYOK flag should be preserved in callback");
+    assert_eq!(metas[0].userId, "byok-user");
 }
