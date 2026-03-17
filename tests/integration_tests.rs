@@ -2177,7 +2177,7 @@ fn test_validate_json_response_missing_content() {
 // Multi-threading and Async Concurrency Tests
 // =============================================================================
 
-const CHEAP_MODEL: &str = "meta-llama/llama-3.2-3b-instruct";
+const CHEAP_MODEL: &str = "openai/gpt-oss-20b";
 
 fn get_cheap_generator() -> GeneratorInfo {
     dotenvy::dotenv().ok();
