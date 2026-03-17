@@ -94,7 +94,10 @@ impl LLMClient {
         }
 
         // Add completion parameters
+        // Send both: max_completion_tokens (OpenRouter's preferred name) and
+        // max_tokens (for non-OpenRouter OpenAI-compatible providers)
         if let Some(max_tokens) = params.max_tokens {
+            body["max_completion_tokens"] = serde_json::json!(max_tokens);
             body["max_tokens"] = serde_json::json!(max_tokens);
         }
         if let Some(temperature) = params.temperature {
