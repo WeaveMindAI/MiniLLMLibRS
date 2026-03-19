@@ -4,4 +4,6 @@ mod info;
 mod params;
 
 pub use info::GeneratorInfo;
-pub use params::{CompletionParameters, NodeCompletionParameters, ProviderSettings};
+pub use params::{
+    CompletionParameters, NodeCompletionParameters, ProviderSettings, ReasoningConfig,
+};

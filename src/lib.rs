@@ -49,6 +49,7 @@ pub use chat_node::{
 pub use error::{MiniLLMError, Result};
 pub use generator::{
     CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings,
+    ReasoningConfig,
 };
 pub use json_repair::{loads, repair_json, JsonValue, RepairOptions};
 pub use message::{

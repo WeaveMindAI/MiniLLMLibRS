@@ -63,10 +63,33 @@ pub struct CompletionParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderSettings>,
 
+    /// Reasoning configuration (for models that support extended thinking).
+    /// When set, enables reasoning tokens with the specified effort/budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
+
     /// Extra parameters to pass directly to the API
     /// These are merged into the request body as-is
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub extra: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+/// Reasoning configuration for models that support extended thinking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReasoningConfig {
+    /// Effort level: "none", "minimal", "low", "medium", "high", "xhigh"
+    /// "none" disables reasoning entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+
+    /// Explicit reasoning token budget (used by Anthropic, Gemini).
+    /// When set, overrides effort-based calculation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+
+    /// If true, reasoning is performed but excluded from the response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude: Option<bool>,
 }
 
 /// OpenRouter provider routing settings
@@ -171,6 +194,7 @@ impl Default for CompletionParameters {
             tools: None,
             tool_choice: None,
             provider: None,
+            reasoning: None,
             extra: None,
         }
     }
@@ -224,6 +248,12 @@ impl CompletionParameters {
         self
     }
 
+    /// Set reasoning configuration
+    pub fn with_reasoning(mut self, reasoning: ReasoningConfig) -> Self {
+        self.reasoning = Some(reasoning);
+        self
+    }
+
     /// Merge with another set of parameters (other takes precedence)
     pub fn merge(&self, other: &CompletionParameters) -> CompletionParameters {
         // Merge extra params - combine both, with other taking precedence
@@ -259,6 +289,7 @@ impl CompletionParameters {
                 .clone()
                 .or_else(|| self.tool_choice.clone()),
             provider: other.provider.clone().or_else(|| self.provider.clone()),
+            reasoning: other.reasoning.clone().or_else(|| self.reasoning.clone()),
             extra: merged_extra,
         }
     }

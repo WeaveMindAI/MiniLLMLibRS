@@ -26,7 +26,7 @@ impl LLMClient {
     /// Create a new LLM client with default settings
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(600))
             .build()
             .expect("Failed to create HTTP client");
 
@@ -136,6 +136,9 @@ impl LLMClient {
         if let Some(provider) = &params.provider {
             body["provider"] = serde_json::to_value(provider).unwrap_or_default();
         }
+        if let Some(reasoning) = &params.reasoning {
+            body["reasoning"] = serde_json::to_value(reasoning).unwrap_or_default();
+        }
         if let Some(extra) = &params.extra {
             for (key, value) in extra {
                 body[key] = value.clone();
@@ -188,7 +191,28 @@ impl LLMClient {
             });
         }
 
-        let raw: serde_json::Value = response.json().await?;
+        let response_bytes = response.bytes().await.map_err(|e| {
+            tracing::error!("Failed to read LLM response body: {}", e);
+            MiniLLMError::Other(format!(
+                "Failed to read response body (possible timeout or connection drop): {}",
+                e
+            ))
+        })?;
+
+        let raw: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|e| {
+            let preview = String::from_utf8_lossy(&response_bytes[..response_bytes.len().min(500)]);
+            tracing::error!(
+                "Failed to parse LLM response as JSON: {}. Body preview: {}",
+                e,
+                preview
+            );
+            MiniLLMError::Other(format!(
+                "Failed to parse LLM response as JSON: {}. Body starts with: {}",
+                e,
+                &preview[..preview.len().min(200)]
+            ))
+        })?;
+
         tracing::debug!("Received completion response");
 
         parse_completion_response(raw)
@@ -323,6 +347,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             provider: None,
+            reasoning: None,
             extra: None,
         };
         let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
@@ -439,6 +464,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             provider: None,
+            reasoning: None,
             extra: None,
         };
         let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
