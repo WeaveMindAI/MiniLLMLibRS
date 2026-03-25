@@ -2324,13 +2324,13 @@ fn make_test_context(
         })
     });
 
-    let meta = CompletionMeta {
-        userId: "test-user".to_string(),
-        workflowId: Some("wf-123".to_string()),
-        executionId: Some("exec-456".to_string()),
-        nodeId: Some("node-789".to_string()),
-        isByok: is_byok,
-    };
+    let meta = serde_json::json!({
+        "userId": "test-user",
+        "workflowId": "wf-123",
+        "executionId": "exec-456",
+        "nodeId": "node-789",
+        "isByok": is_byok,
+    });
 
     let ctx = CompletionContext::new(
         generator,
@@ -2347,10 +2347,10 @@ fn test_completion_context_creation() {
     let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model");
     let (ctx, _captured) = make_test_context(gen, false);
 
-    assert_eq!(ctx.meta.userId, "test-user");
-    assert_eq!(ctx.meta.workflowId, Some("wf-123".to_string()));
-    assert_eq!(ctx.meta.executionId, Some("exec-456".to_string()));
-    assert_eq!(ctx.meta.nodeId, Some("node-789".to_string()));
+    assert_eq!(ctx.meta["userId"], "test-user");
+    assert_eq!(ctx.meta["workflowId"], "wf-123");
+    assert_eq!(ctx.meta["executionId"], "exec-456");
+    assert_eq!(ctx.meta["nodeId"], "node-789");
     assert!(!ctx.is_byok());
 }
 
@@ -2450,24 +2450,24 @@ async fn test_completion_context_callback_receives_meta() {
         })
     });
 
-    let meta = CompletionMeta {
-        userId: "user-42".to_string(),
-        workflowId: Some("wf-abc".to_string()),
-        executionId: Some("exec-def".to_string()),
-        nodeId: Some("node-ghi".to_string()),
-        isByok: true,
-    };
+    let meta = serde_json::json!({
+        "userId": "user-42",
+        "workflowId": "wf-abc",
+        "executionId": "exec-def",
+        "nodeId": "node-ghi",
+        "isByok": true,
+    });
 
     let ctx = CompletionContext::new(gen, meta, callback, "https://test.example.com", "TestApp");
     ctx.report_cost(CostInfo::default()).await;
 
     let metas = captured_meta.lock().unwrap();
     assert_eq!(metas.len(), 1);
-    assert_eq!(metas[0].userId, "user-42");
-    assert_eq!(metas[0].workflowId, Some("wf-abc".to_string()));
-    assert_eq!(metas[0].executionId, Some("exec-def".to_string()));
-    assert_eq!(metas[0].nodeId, Some("node-ghi".to_string()));
-    assert!(metas[0].isByok);
+    assert_eq!(metas[0]["userId"], "user-42");
+    assert_eq!(metas[0]["workflowId"], "wf-abc");
+    assert_eq!(metas[0]["executionId"], "exec-def");
+    assert_eq!(metas[0]["nodeId"], "node-ghi");
+    assert_eq!(metas[0]["isByok"], true);
 }
 
 #[test]
@@ -2749,13 +2749,10 @@ async fn test_complete_tracked_byok_flag() {
         })
     });
 
-    let meta = CompletionMeta {
-        userId: "byok-user".to_string(),
-        workflowId: None,
-        executionId: None,
-        nodeId: None,
-        isByok: true,
-    };
+    let meta = serde_json::json!({
+        "userId": "byok-user",
+        "isByok": true,
+    });
 
     let ctx = CompletionContext::new(gen, meta, callback, "https://test.example.com", "TestApp");
 
@@ -2767,6 +2764,9 @@ async fn test_complete_tracked_byok_flag() {
 
     let metas = captured_meta.lock().unwrap();
     assert_eq!(metas.len(), 1);
-    assert!(metas[0].isByok, "BYOK flag should be preserved in callback");
-    assert_eq!(metas[0].userId, "byok-user");
+    assert_eq!(
+        metas[0]["isByok"], true,
+        "BYOK flag should be preserved in callback"
+    );
+    assert_eq!(metas[0]["userId"], "byok-user");
 }
