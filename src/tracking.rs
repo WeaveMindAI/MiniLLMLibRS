@@ -1,12 +1,12 @@
 //! CompletionContext - Enforced cost tracking wrapper for LLM completions
 //!
 //! CompletionContext wraps a GeneratorInfo and guarantees that every completion
-//! call reports cost information via a callback. This is the mechanism WeaveMind
-//! uses to track AI usage costs.
+//! call reports cost information via a callback.
 //!
-//! External library users can still use `ChatNode.complete()` directly with a
-//! raw GeneratorInfo (no cost tracking). But WeaveMind nodes must use
-//! `ChatNode.complete_tracked()` which requires a CompletionContext.
+//! Users can still use `ChatNode.complete()` directly with a raw GeneratorInfo
+//! (no cost tracking). For tracked usage, use `ChatNode.complete_tracked()`
+//! which requires a CompletionContext with opaque metadata passed through
+//! to the cost callback.
 
 use crate::generator::GeneratorInfo;
 use crate::provider::CostInfo;
@@ -16,19 +16,13 @@ use std::sync::Arc;
 
 /// Async cost callback that can write to a database or HTTP endpoint.
 /// Returns a future so the caller can await the write (or fire-and-forget via spawn).
-pub type AsyncCostCallback =
-    Arc<dyn Fn(CostInfo, CompletionMeta) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type AsyncCostCallback = Arc<
+    dyn Fn(CostInfo, serde_json::Value) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
+>;
 
-/// Metadata about the completion context (passed to the cost callback alongside CostInfo)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[allow(non_snake_case)]
-pub struct CompletionMeta {
-    pub userId: String,
-    pub workflowId: Option<String>,
-    pub executionId: Option<String>,
-    pub nodeId: Option<String>,
-    pub isByok: bool,
-}
+/// Opaque metadata passed through to the cost callback.
+/// The library never inspects this, consumers define its shape.
+pub type CompletionMeta = serde_json::Value;
 
 /// Wraps a GeneratorInfo with enforced cost tracking.
 ///
@@ -74,10 +68,12 @@ impl CompletionContext {
     }
 
     /// Detect whether this is a BYOK (Bring Your Own Key) setup.
-    /// BYOK = the generator has a user-provided API key that differs from the
-    /// platform key (OPENROUTER_API_KEY env var).
+    /// Reads "isByok" from the metadata JSON (defaults to false if absent).
     pub fn is_byok(&self) -> bool {
-        self.meta.isByok
+        self.meta
+            .get("isByok")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
     }
 
     /// Fire the cost callback. Called internally by complete_tracked().
