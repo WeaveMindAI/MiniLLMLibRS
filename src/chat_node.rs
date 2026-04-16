@@ -616,7 +616,7 @@ impl ChatNode {
                 if let Some(usage) = &response.usage {
                     use crate::provider::CostInfo;
                     let cost_info = CostInfo {
-                        cost: usage.cost.unwrap_or(0.0),
+                        cost: usage.total_cost(),
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
                         total_tokens: usage.total_tokens,
@@ -759,7 +759,7 @@ impl ChatNode {
                 if let Some(usage) = &response.usage {
                     use crate::provider::CostInfo;
                     let cost_info = CostInfo {
-                        cost: usage.cost.unwrap_or(0.0),
+                        cost: usage.total_cost(),
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
                         total_tokens: usage.total_tokens,

@@ -149,7 +149,7 @@ impl TrackedStream {
         // Report cost from usage if available
         let cost_info = if let Some(usage) = &response.usage {
             CostInfo {
-                cost: usage.cost.unwrap_or(0.0),
+                cost: usage.total_cost(),
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
                 total_tokens: usage.total_tokens,
@@ -206,7 +206,7 @@ impl Drop for TrackedStream {
         // Stream was dropped before collect_and_report() — likely cancelled.
         // Check if we have usage from partial consumption.
         let cost_info_from_usage = self.inner.usage().map(|usage| CostInfo {
-            cost: usage.cost.unwrap_or(0.0),
+            cost: usage.total_cost(),
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
@@ -301,7 +301,9 @@ async fn query_generation_cost_static(
     let json: serde_json::Value = response.json().await.ok()?;
     let data = json.get("data")?;
 
-    let total_cost = data["total_cost"].as_f64().unwrap_or(0.0);
+    let or_cost = data["total_cost"].as_f64().unwrap_or(0.0);
+    let upstream_cost = data["upstream_inference_cost"].as_f64().unwrap_or(0.0);
+    let total_cost = or_cost + upstream_cost;
     let prompt_tokens = data["tokens_prompt"].as_u64().unwrap_or(0) as u32;
     let completion_tokens = data["tokens_completion"].as_u64().unwrap_or(0) as u32;
     let model = data["model"].as_str().unwrap_or("").to_string();

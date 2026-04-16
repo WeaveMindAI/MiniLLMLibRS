@@ -18,9 +18,18 @@ pub struct Usage {
     #[serde(default)]
     pub total_tokens: u32,
 
-    /// Cost in credits (OpenRouter specific)
+    /// Cost in credits (OpenRouter fee, may be 0 for BYOK free tier)
     #[serde(default)]
     pub cost: Option<f64>,
+
+    /// Upstream inference cost (only for BYOK requests, the actual
+    /// cost charged by the provider like Google Vertex or Bedrock)
+    #[serde(default)]
+    pub upstream_inference_cost: Option<f64>,
+
+    /// Whether this request used a BYOK (Bring Your Own Key) provider key
+    #[serde(default)]
+    pub is_byok: Option<bool>,
 
     /// Cached tokens (tokens read from cache)
     #[serde(default)]
@@ -29,6 +38,18 @@ pub struct Usage {
     /// Reasoning tokens (for models that support it)
     #[serde(default)]
     pub reasoning_tokens: Option<u32>,
+}
+
+impl Usage {
+    /// Total real cost: OpenRouter fee + upstream inference cost (for BYOK).
+    /// For non-BYOK requests, cost already includes everything.
+    /// For BYOK requests, cost is the 5% OpenRouter fee (possibly 0 in free tier),
+    /// and upstream_inference_cost is the actual provider charge.
+    pub fn total_cost(&self) -> f64 {
+        let or_cost = self.cost.unwrap_or(0.0);
+        let upstream = self.upstream_inference_cost.unwrap_or(0.0);
+        or_cost + upstream
+    }
 }
 
 /// Detailed cost information from a completion
@@ -201,6 +222,8 @@ pub fn parse_completion_response(
         completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
         total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
         cost: u["cost"].as_f64(),
+        upstream_inference_cost: u["cost_details"]["upstream_inference_cost"].as_f64(),
+        is_byok: u["is_byok"].as_bool(),
         cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
             .as_u64()
             .map(|v| v as u32),
@@ -246,6 +269,8 @@ pub fn parse_stream_chunk(data: &str) -> Option<StreamChunk> {
                 completion_tokens: u["completion_tokens"].as_u64().unwrap_or(0) as u32,
                 total_tokens: u["total_tokens"].as_u64().unwrap_or(0) as u32,
                 cost: u["cost"].as_f64(),
+                upstream_inference_cost: u["cost_details"]["upstream_inference_cost"].as_f64(),
+                is_byok: u["is_byok"].as_bool(),
                 cached_tokens: u["prompt_tokens_details"]["cached_tokens"]
                     .as_u64()
                     .map(|v| v as u32),
