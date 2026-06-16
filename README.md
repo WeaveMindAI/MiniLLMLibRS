@@ -4,7 +4,7 @@ A minimalist, async-first Rust library for LLM interactions with streaming suppo
 
 [![Crates.io](https://img.shields.io/crates/v/minillmlib.svg)](https://crates.io/crates/minillmlib)
 [![Documentation](https://docs.rs/minillmlib/badge.svg)](https://docs.rs/minillmlib)
-[![CI](https://github.com/qfeuilla/MiniLLMLibRS/actions/workflows/ci.yml/badge.svg)](https://github.com/qfeuilla/MiniLLMLibRS/actions/workflows/ci.yml)
+[![CI](https://github.com/WeaveMindAI/MiniLLMLibRS/actions/workflows/ci.yml/badge.svg)](https://github.com/WeaveMindAI/MiniLLMLibRS/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Features
