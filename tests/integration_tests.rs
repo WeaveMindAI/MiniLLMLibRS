@@ -14,9 +14,56 @@ use minillmlib::{
 };
 use std::sync::{Arc, Mutex};
 
-// Test model - small and cheap for testing
-const TEST_MODEL: &str = "google/gemini-2.0-flash-lite-001";
-const TEXT_ONLY_MODEL: &str = "google/gemini-2.0-flash-lite-001";
+// Test models: small, cheap, and verified live on OpenRouter (2026-06-16).
+// TEST_MODEL is multimodal (text+image+audio+video) for the multimodal tests;
+// TEXT_ONLY_MODEL is a cheap text model. The previous gemini-2.0-flash-lite-001
+// was retired ("No endpoints found") and 404'd every live test.
+const TEST_MODEL: &str = "google/gemini-2.5-flash-lite";
+const TEXT_ONLY_MODEL: &str = "meta-llama/llama-3.1-8b-instruct";
+
+// Anthropic test models (verified live 2026-06-16). Haiku is the cheapest.
+#[allow(dead_code)]
+const ANTHROPIC_TEST_MODEL: &str = "claude-haiku-4-5";
+
+/// Skip a live test unless the `live` Cargo feature is enabled AND the required
+/// env var is present. The `live` gate keeps a plain `cargo test` free, offline,
+/// and deterministic even when a `.env` holds real keys; the env-var check then
+/// skips gracefully under `--features live` when a particular key is absent.
+macro_rules! require_live {
+    ($env_var:literal) => {
+        dotenvy::dotenv().ok();
+        if !cfg!(feature = "live") {
+            eprintln!("Skipping live test (enable with `cargo test --features live`)");
+            return;
+        }
+        if std::env::var($env_var).is_err() {
+            eprintln!("Skipping live test: {} not set", $env_var);
+            return;
+        }
+    };
+}
+
+/// Skip a live subscription test unless the `live` feature is on AND a Claude
+/// subscription token actually resolves (from `ANTHROPIC_AUTH_TOKEN` OR the
+/// Claude Code credential at `~/.claude/.credentials.json`). Gating on the real
+/// resolver (not just the env var) means the test runs whenever the library could
+/// actually authenticate, instead of silently passing-by-skip on a machine that
+/// has the file credential but no env var set.
+macro_rules! require_subscription {
+    () => {
+        dotenvy::dotenv().ok();
+        if !cfg!(feature = "live") {
+            eprintln!("Skipping live test (enable with `cargo test --features live`)");
+            return;
+        }
+        if !minillmlib::resolve_claude_subscription_auth().is_some() {
+            eprintln!(
+                "Skipping subscription test: no token (set ANTHROPIC_AUTH_TOKEN or log into Claude Code)"
+            );
+            return;
+        }
+    };
+}
 
 fn get_test_generator() -> GeneratorInfo {
     dotenvy::dotenv().ok();
@@ -38,14 +85,14 @@ fn test_generator_info_creation() {
     assert_eq!(gen.name, "Test");
     assert_eq!(gen.base_url, "https://api.example.com/v1");
     assert_eq!(gen.model, "test-model");
-    assert!(gen.api_key.is_none());
+    assert!(!gen.auth.is_some());
 }
 
 #[test]
 fn test_generator_info_with_api_key() {
     let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model")
         .with_api_key("test-key-123");
-    assert!(gen.api_key.is_some());
+    assert!(gen.auth.is_some());
 }
 
 #[test]
@@ -55,8 +102,9 @@ fn test_generator_info_openrouter() {
     assert_eq!(gen.name, "OpenRouter");
     assert_eq!(gen.base_url, "https://openrouter.ai/api/v1");
     assert_eq!(gen.model, "anthropic/claude-3.5-sonnet");
-    // Should have custom headers for OpenRouter
-    assert!(!gen.custom_headers.is_empty());
+    // OpenRouter attribution is carried as the app identity (the provider turns it
+    // into HTTP-Referer/X-Title headers at request time).
+    assert!(gen.app_attribution.is_some());
 }
 
 #[test]
@@ -154,7 +202,6 @@ fn test_completion_parameters_json_response() {
 fn test_node_completion_parameters() {
     let params = NodeCompletionParameters::new()
         .with_system_prompt("You are a helpful assistant")
-        .with_streaming(true)
         .expecting_json()
         .with_timeout(60);
 
@@ -162,7 +209,6 @@ fn test_node_completion_parameters() {
         params.system_prompt,
         Some("You are a helpful assistant".to_string())
     );
-    assert_eq!(params.stream, Some(true));
     assert!(params.parse_json);
     assert_eq!(params.timeout_secs, Some(60));
 }
@@ -210,20 +256,23 @@ fn test_provider_settings() {
 }
 
 #[test]
-fn test_completion_parameters_with_provider() {
+fn test_completion_parameters_openrouter_routing_goes_to_extra() {
     use minillmlib::{CompletionParameters, ProviderSettings};
 
     let provider = ProviderSettings::new()
         .sort_by_throughput()
         .deny_data_collection();
 
+    // OpenRouter routing is provider-specific → it lives under extra["provider"],
+    // not as a universal field on the normalized params.
     let params = CompletionParameters::new()
         .with_temperature(0.7)
-        .with_provider(provider);
+        .with_openrouter_routing(provider);
 
-    assert!(params.provider.is_some());
-    let p = params.provider.unwrap();
-    assert_eq!(p.sort, Some("throughput".to_string()));
+    let extra = params.extra.expect("routing stored in extra");
+    let routing = &extra["provider"];
+    assert_eq!(routing["sort"], "throughput");
+    assert_eq!(routing["data_collection"], "deny");
 }
 
 #[test]
@@ -288,7 +337,8 @@ fn test_message_content_multimodal() {
 fn test_image_data_from_url() {
     let image = ImageData::from_url("https://example.com/image.jpg");
     assert_eq!(image.to_data_url(), "https://example.com/image.jpg");
-    assert_eq!(image.mime_type, "url");
+    // URL is flagged by the explicit `is_url` bool, not a magic mime string.
+    assert!(image.is_url());
 }
 
 #[test]
@@ -355,10 +405,7 @@ fn test_audio_data_with_metadata() {
 async fn test_video_completion() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let video_path = "./data/test.mp4";
     if !std::path::Path::new(video_path).exists() {
@@ -372,13 +419,16 @@ async fn test_video_completion() {
     let content = MessageContent::with_video("What do you see in this video? Be brief.", &[video]);
 
     let root = ChatNode::root("You are a helpful assistant.");
-    let user_node = root.add_child(ChatNode::new(Message {
-        role: Role::User,
-        content,
-        name: None,
-        tool_call_id: None,
-        tool_calls: None,
-    }));
+    let user_node = root
+        .add_child(ChatNode::new(Message {
+            role: Role::User,
+            content,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            cache_breakpoint: false,
+        }))
+        .unwrap();
 
     let result = user_node.complete(&generator, None).await;
 
@@ -398,17 +448,15 @@ async fn test_video_completion() {
 fn test_video_data_from_url() {
     let video = VideoData::from_url("https://example.com/video.mp4");
     assert_eq!(video.to_data_url(), "https://example.com/video.mp4");
-    assert_eq!(video.format, "url");
+    // URL is flagged by the explicit `is_url` bool, not a magic format string.
+    assert!(video.is_url());
 }
 
 #[tokio::test]
 async fn test_image_completion_from_url() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_test_generator();
     let image = ImageData::from_url("https://cdn.mos.cms.futurecdn.net/nbaR6JXZ3Z7mzuW9bh4nQN.jpg");
@@ -416,13 +464,16 @@ async fn test_image_completion_from_url() {
     let content = MessageContent::with_images("Describe this image in one sentence.", &[image]);
 
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
-    let user_node = root.add_child(ChatNode::new(Message {
-        role: Role::User,
-        content,
-        name: None,
-        tool_call_id: None,
-        tool_calls: None,
-    }));
+    let user_node = root
+        .add_child(ChatNode::new(Message {
+            role: Role::User,
+            content,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            cache_breakpoint: false,
+        }))
+        .unwrap();
 
     let result = user_node.complete(&generator, None).await;
 
@@ -512,6 +563,7 @@ fn test_content_part_json_serialization() {
         name: None,
         tool_call_id: None,
         tool_calls: None,
+        cache_breakpoint: false,
     };
     let payload = messages_to_payload(&[msg]);
     println!("\nFull message payload:");
@@ -736,18 +788,25 @@ fn test_chat_node_merge() {
     let u2 = root2.add_user("User 2");
     let a2 = u2.add_assistant("Assistant 2");
 
-    // Merge second tree into first
-    let merged_leaf = u1.merge(&a2);
+    // Merge the second tree into the first. `merge` COPIES other's subtree into
+    // this tree (the two arenas stay independent), returning a handle to the
+    // copied leaf in tree 1. The original tree-2 handles are untouched.
+    let merged_leaf = u1.merge(&a2).unwrap();
 
-    // The merged leaf should be the leaf of the second tree
-    assert_eq!(merged_leaf.id, a2.id);
+    // The merged leaf carries the same content as a2 (a fresh copy, fresh id).
+    assert_eq!(merged_leaf.text(), Some("Assistant 2"));
+    assert_ne!(merged_leaf.id, a2.id);
 
-    // root1 should now have the second tree as a subtree
-    // Structure: root1 -> u1 -> root2 -> u2 -> a2
+    // root1 now contains the copied second tree as a subtree:
+    // root1 -> u1 -> [copy of root2 -> u2 -> a2]
     assert_eq!(root1.node_count(), 5);
+    // Navigate via the returned (in-tree-1) handle: its root is root1.
+    assert_eq!(merged_leaf.get_root().id, root1.id);
+    assert_eq!(merged_leaf.thread().len(), 5);
 
-    // root2's parent should now be u1
-    assert_eq!(root2.parent().unwrap().id, u1.id);
+    // The original tree 2 is unchanged (copy, not move).
+    assert!(root2.is_root());
+    assert_eq!(root2.node_count(), 3);
 }
 
 #[test]
@@ -905,8 +964,8 @@ fn test_chat_node_detach_and_reattach() {
     assert_eq!(a1.node_count(), 2);
     assert_eq!(u2.get_root().id, a1.id);
 
-    // Reattach a1 to root directly
-    root.add_child(a1.clone());
+    // Reattach a1 to root directly (a1 is a detached subtree, not an ancestor of root)
+    root.add_child(a1.clone()).unwrap();
 
     // Now structure is: root -> [u1, a1 -> u2]
     assert_eq!(root.node_count(), 4);
@@ -927,19 +986,20 @@ fn test_chat_node_multiple_merges() {
     let tree3_root = ChatNode::root("System 3");
     let tree3_u = tree3_root.add_user("Tree3 User");
 
-    // Merge tree2 into tree1
-    tree1_u.merge(&tree2_a);
-    // Structure: tree1_root -> tree1_u -> tree2_root -> tree2_u -> tree2_a
+    // Merge tree2 into tree1. `merge` copies tree2's subtree into tree1 and
+    // returns the copied leaf (in tree1); continue from THAT handle.
+    let merged2 = tree1_u.merge(&tree2_a).unwrap();
+    // tree1: tree1_root -> tree1_u -> [copy of tree2_root -> tree2_u -> tree2_a]
     assert_eq!(tree1_root.node_count(), 5);
 
-    // Merge tree3 into tree2_a
-    tree2_a.merge(&tree3_u);
-    // Structure: tree1_root -> tree1_u -> tree2_root -> tree2_u -> tree2_a -> tree3_root -> tree3_u
+    // Merge tree3 into the copied tree2 leaf (still in tree1).
+    let merged3 = merged2.merge(&tree3_u).unwrap();
+    // tree1 now: ... -> tree2_a(copy) -> [copy of tree3_root -> tree3_u]
     assert_eq!(tree1_root.node_count(), 7);
 
-    // Verify the chain
-    assert_eq!(tree3_u.get_root().id, tree1_root.id);
-    assert_eq!(tree3_u.depth(), 6);
+    // Verify the chain via the in-tree-1 handles.
+    assert_eq!(merged3.get_root().id, tree1_root.id);
+    assert_eq!(merged3.depth(), 6);
 }
 
 #[test]
@@ -993,70 +1053,53 @@ fn test_chat_node_iter_with_branching() {
 
 #[test]
 fn test_chat_node_format_kwargs_with_merge() {
-    // Tree 1 with format kwargs
+    // Node-level kwargs are scoped to the node they're set on. Each node holds
+    // the kwargs for the placeholders in its own text.
     let tree1 = ChatNode::root("Hello {name}, I am {bot}.");
     tree1.set_format_kwarg("name", "Alice");
     tree1.set_format_kwarg("bot", "Claude");
     let tree1_u = tree1.add_user("Hi {bot}!");
+    tree1_u.set_format_kwarg("bot", "Claude");
 
-    // Tree 2 with different format kwargs
     let tree2 = ChatNode::root("Switching to {mode} mode.");
     tree2.set_format_kwarg("mode", "expert");
     let tree2_u = tree2.add_user("Tell me about {topic}.");
     tree2_u.set_format_kwarg("topic", "Rust");
 
-    // Merge tree2 into tree1
-    tree1_u.merge(&tree2_u);
+    // Merge tree2 into tree1. The copy carries each node's own kwargs. Continue
+    // from the returned merged leaf (in tree1) to read the full 4-node thread.
+    let merged_leaf = tree1_u.merge(&tree2_u).unwrap();
 
-    // Get formatted thread from the deepest node
-    let formatted = tree2_u.formatted_thread();
-
-    // Should have 4 messages
+    let formatted = merged_leaf.formatted_thread();
     assert_eq!(formatted.len(), 4);
 
-    // Check that format kwargs from both trees are applied
-    // tree1's kwargs should apply to tree1's messages
+    // Each message resolved with its own node's kwargs (copied alongside).
     assert!(formatted[0].content.get_text().unwrap().contains("Alice"));
     assert!(formatted[0].content.get_text().unwrap().contains("Claude"));
     assert!(formatted[1].content.get_text().unwrap().contains("Claude"));
-
-    // tree2's kwargs should apply to tree2's messages
     assert!(formatted[2].content.get_text().unwrap().contains("expert"));
     assert!(formatted[3].content.get_text().unwrap().contains("Rust"));
 }
 
 #[test]
-fn test_chat_node_detach_preserves_format_kwargs() {
+fn test_chat_node_detach_preserves_own_format_kwargs() {
+    // Node-level kwargs are per-node, so each node's text is filled by its own
+    // kwargs only. Detaching keeps the node's own kwargs intact.
     let root = ChatNode::root("Hello {name}");
     root.set_format_kwarg("name", "World");
-    let u1 = root.add_user("Goodbye {name}");
+    let u1 = root.add_user("Goodbye {who}");
+    u1.set_format_kwarg("who", "Alice");
 
-    // Verify format kwargs work before detach
-    let formatted_before = u1.formatted_thread();
-    assert!(formatted_before[0]
-        .content
-        .get_text()
-        .unwrap()
-        .contains("World"));
-    assert!(formatted_before[1]
-        .content
-        .get_text()
-        .unwrap()
-        .contains("World"));
+    let before = u1.formatted_thread();
+    assert!(before[0].content.get_text().unwrap().contains("World")); // root's own
+    assert!(before[1].content.get_text().unwrap().contains("Alice")); // u1's own
 
-    // Detach u1
     u1.detach();
 
-    // u1 should still have its own format kwargs (none set directly)
-    // But root's kwargs should no longer be accessible
-    let formatted_after = u1.formatted_thread();
-    assert_eq!(formatted_after.len(), 1); // Only u1's message
-                                          // The placeholder should NOT be replaced since root's kwargs are gone
-    assert!(formatted_after[0]
-        .content
-        .get_text()
-        .unwrap()
-        .contains("{name}"));
+    // u1 is now its own root; its own kwarg still fills its own text.
+    let after = u1.formatted_thread();
+    assert_eq!(after.len(), 1);
+    assert!(after[0].content.get_text().unwrap().contains("Alice"));
 }
 
 #[test]
@@ -1068,21 +1111,24 @@ fn test_chat_node_to_thread_data() {
     let thread_data = a1.to_thread_data();
 
     assert_eq!(thread_data.prompts.len(), 3);
-    assert_eq!(thread_data.prompts[0].role, "system");
-    assert_eq!(thread_data.prompts[0].content, "You are helpful");
-    assert_eq!(thread_data.prompts[1].role, "user");
-    assert_eq!(thread_data.prompts[1].content, "Hello");
-    assert_eq!(thread_data.prompts[2].role, "assistant");
-    assert_eq!(thread_data.prompts[2].content, "Hi there!");
+    assert_eq!(thread_data.prompts[0].message.role, Role::System);
+    assert_eq!(
+        thread_data.prompts[0].message.text(),
+        Some("You are helpful")
+    );
+    assert_eq!(thread_data.prompts[1].message.role, Role::User);
+    assert_eq!(thread_data.prompts[1].message.text(), Some("Hello"));
+    assert_eq!(thread_data.prompts[2].message.role, Role::Assistant);
+    assert_eq!(thread_data.prompts[2].message.text(), Some("Hi there!"));
 }
 
 #[test]
 fn test_chat_node_from_thread_json() {
     let json = r#"{
         "prompts": [
-            {"role": "system", "content": "You are helpful"},
-            {"role": "user", "content": "Hello"},
-            {"role": "assistant", "content": "Hi!"}
+            {"message": {"role": "system", "content": "You are helpful"}},
+            {"message": {"role": "user", "content": "Hello"}},
+            {"message": {"role": "assistant", "content": "Hi!"}}
         ]
     }"#;
 
@@ -1167,10 +1213,13 @@ fn test_chat_node_format_kwargs_multiple() {
 
 #[test]
 fn test_chat_node_formatted_thread() {
+    // Node-level kwargs are per-node: each node fills the placeholders in its
+    // own text from its own kwargs.
     let root = ChatNode::root("You are {bot_name}.");
     root.set_format_kwarg("bot_name", "Assistant");
 
     let user = root.add_user("Hi {bot_name}!");
+    user.set_format_kwarg("bot_name", "Assistant");
     let assistant = user.add_assistant("Hello {user_name}!");
     assistant.set_format_kwarg("user_name", "Bob");
 
@@ -1182,49 +1231,119 @@ fn test_chat_node_formatted_thread() {
 }
 
 #[test]
-fn test_chat_node_format_kwargs_propagate() {
+fn test_chat_node_format_kwargs_are_node_scoped() {
+    // A node-level kwarg only fills placeholders in its OWN message; it does not
+    // bleed into ancestor or descendant text.
+    let root = ChatNode::root("Hi {who} from {where}");
+    root.set_format_kwarg("who", "Alice");
+    let user = root.add_user("Still {who}, now in {where}");
+    user.set_format_kwarg("where", "Paris");
+
+    let formatted = user.formatted_thread();
+    // Root fills only its own "who"; "where" is unset on root so stays a placeholder.
+    assert_eq!(
+        formatted[0].content.get_text(),
+        Some("Hi Alice from {where}")
+    );
+    // Leaf fills only its own "where"; "who" is unset on the leaf so stays a placeholder.
+    assert_eq!(
+        formatted[1].content.get_text(),
+        Some("Still {who}, now in Paris")
+    );
+}
+
+#[test]
+fn test_completion_format_kwargs_base_with_node_override() {
+    // Completion-level kwargs are the base layer; a per-node override wins on
+    // collision. Verified through formatted_thread_with_base (the resolution the
+    // completion path uses).
+    let root = ChatNode::root("I am {bot} in {mode} mode");
+    let user = root.add_user("Hello from {bot}");
+    user.set_format_kwarg("bot", "Override"); // node override
+
+    let mut base = std::collections::HashMap::new();
+    base.insert("bot".to_string(), "Base".to_string());
+    base.insert("mode".to_string(), "expert".to_string());
+
+    let formatted = user.formatted_thread_with_base(&base);
+    // Root has no override, so it resolves "bot" from the completion base; the
+    // leaf's override is node-scoped and does not reach the root.
+    assert_eq!(
+        formatted[0].content.get_text(),
+        Some("I am Base in expert mode")
+    );
+    // The leaf's own override wins over the base for the leaf's text.
+    assert_eq!(formatted[1].content.get_text(), Some("Hello from Override"));
+
+    // The plain formatted_thread (no base) sees neither the completion-level
+    // kwargs nor the leaf's node-scoped override: the root has no own kwargs, so
+    // its placeholders stay unfilled; the leaf fills only its own "bot".
+    let plain = user.formatted_thread();
+    assert_eq!(
+        plain[0].content.get_text(),
+        Some("I am {bot} in {mode} mode")
+    );
+    assert_eq!(plain[1].content.get_text(), Some("Hello from Override"));
+}
+
+#[test]
+fn test_clone_tree_is_isolated_from_original() {
     let root = ChatNode::root("System");
     let user = root.add_user("Hello");
-    let assistant = user.add_assistant("Hi");
+    let _assistant = user.add_assistant("Hi");
 
-    // Update from leaf with propagation
-    let mut kwargs = std::collections::HashMap::new();
-    kwargs.insert("key".to_string(), "value".to_string());
-    assistant.update_format_kwargs(&kwargs, true);
+    // Clone the tree from a mid-node; we get back the counterpart of `user`.
+    let cloned_user = user.clone_tree();
+    assert_ne!(cloned_user.id, user.id, "clone has fresh ids");
+    assert_eq!(cloned_user.text(), Some("Hello"));
 
-    // All nodes should have the kwarg
-    assert_eq!(root.get_format_kwarg("key"), Some("value".to_string()));
-    assert_eq!(user.get_format_kwarg("key"), Some("value".to_string()));
-    assert_eq!(assistant.get_format_kwarg("key"), Some("value".to_string()));
+    // The clone keeps its full ancestor spine (root), with fresh ids.
+    let cloned_root = cloned_user.get_root();
+    assert_eq!(cloned_root.text(), Some("System"));
+    assert_ne!(cloned_root.id, root.id);
+    assert_eq!(cloned_user.thread().len(), 2); // System, Hello
+
+    // Mutating (or extending) the clone leaves the original untouched.
+    cloned_user.set_format_kwarg("k", "v");
+    assert_eq!(cloned_user.get_format_kwarg("k"), Some("v".to_string()));
+    assert_eq!(user.get_format_kwarg("k"), None);
+    let _new = cloned_user.add_assistant("forked reply");
+    assert_eq!(user.child_count(), 1, "original's children unchanged");
 }
 
 #[test]
 fn test_chat_node_format_kwargs_save_load() {
     use std::fs;
 
+    // Per-node kwargs round-trip: each node's own kwargs save into its own JSON
+    // entry and reload onto the matching node.
     let root = ChatNode::root("Hello {name}!");
     root.set_format_kwarg("name", "World");
-    let user = root.add_user("Goodbye {name}!");
+    let user = root.add_user("Goodbye {other}!");
+    user.set_format_kwarg("other", "Mars");
 
-    // Save
     let temp_path = "/tmp/test_format_kwargs.json";
     user.save_thread(temp_path).unwrap();
 
-    // Load
     let (loaded_root, loaded_leaf) = ChatNode::from_thread_file(temp_path).unwrap();
 
-    // Check format_kwargs were preserved
+    // Each node restored its OWN kwargs, not a flattened root dump.
     assert_eq!(
         loaded_root.get_format_kwarg("name"),
         Some("World".to_string())
     );
+    assert_eq!(loaded_root.get_format_kwarg("other"), None);
+    assert_eq!(
+        loaded_leaf.get_format_kwarg("other"),
+        Some("Mars".to_string())
+    );
+    assert_eq!(loaded_leaf.get_format_kwarg("name"), None);
 
-    // Check formatted content
+    // Each message fills from its own node's kwargs.
     let formatted = loaded_leaf.formatted_thread();
     assert_eq!(formatted[0].content.get_text(), Some("Hello World!"));
-    assert_eq!(formatted[1].content.get_text(), Some("Goodbye World!"));
+    assert_eq!(formatted[1].content.get_text(), Some("Goodbye Mars!"));
 
-    // Cleanup
     fs::remove_file(temp_path).ok();
 }
 
@@ -1236,53 +1355,40 @@ async fn test_load_data_test_json() {
         return;
     }
 
-    // Load the thread
-    let (root, leaf) = ChatNode::from_thread_file(path).unwrap();
+    // Load the saved prompt template.
+    let (_root, leaf) = ChatNode::from_thread_file(path).unwrap();
 
-    // Set multiple format kwargs
-    root.set_format_kwarg("assistant_name", "Claude");
-    root.set_format_kwarg("user_name", "Alice");
-    root.set_format_kwarg("topic", "quantum computing");
-    root.set_format_kwarg("style", "friendly and concise");
+    // Fill the whole template at completion time via completion-level kwargs
+    // (the thread-wide mechanism for one-shot template fills).
+    let mut fills = std::collections::HashMap::new();
+    fills.insert("assistant_name".to_string(), "Claude".to_string());
+    fills.insert("user_name".to_string(), "Alice".to_string());
+    fills.insert("topic".to_string(), "quantum computing".to_string());
+    fills.insert("style".to_string(), "friendly and concise".to_string());
 
-    // Print the formatted messages that will be sent to the LLM
-    println!("\n=== FORMATTED PROMPT ===");
-    println!("{}", minillmlib::format_conversation(&leaf));
-    println!("========================\n");
-
-    let formatted = leaf.formatted_thread();
-
-    // Verify all placeholders are replaced
+    // Verify all placeholders are replaced thread-wide.
+    let formatted = leaf.formatted_thread_with_base(&fills);
     for msg in &formatted {
         let text = msg.content.get_text().unwrap();
-        assert!(
-            !text.contains("{assistant_name}"),
-            "Placeholder not replaced: {}",
-            text
-        );
-        assert!(
-            !text.contains("{user_name}"),
-            "Placeholder not replaced: {}",
-            text
-        );
-        assert!(
-            !text.contains("{topic}"),
-            "Placeholder not replaced: {}",
-            text
-        );
-        assert!(
-            !text.contains("{style}"),
-            "Placeholder not replaced: {}",
-            text
-        );
+        for placeholder in ["{assistant_name}", "{user_name}", "{topic}", "{style}"] {
+            assert!(
+                !text.contains(placeholder),
+                "Placeholder {} not replaced: {}",
+                placeholder,
+                text
+            );
+        }
     }
 
-    // Now let's actually call the LLM with this
+    // The offline assertions above always run; the live call below is gated.
+    require_live!("OPENROUTER_API_KEY");
+
+    // Now let's actually call the LLM with the fills passed as completion kwargs.
     let gi = get_cheap_generator();
     let params = NodeCompletionParameters::default()
-        .with_params(CompletionParameters::default().with_max_tokens(150));
+        .with_params(CompletionParameters::default().with_max_tokens(150))
+        .with_format_kwargs(fills);
 
-    // Complete from the formatted thread
     let result = leaf.complete(&gi, Some(&params)).await;
     match result {
         Ok(response) => {
@@ -1335,12 +1441,7 @@ fn test_conversation_builder() {
 
 #[tokio::test]
 async fn test_cost_tracking() {
-    dotenvy::dotenv().ok();
-
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test_cost_tracking: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
@@ -1356,7 +1457,7 @@ async fn test_cost_tracking() {
     let called_tracker = callback_called.clone();
 
     let params = NodeCompletionParameters::new()
-        .with_openrouter_cost_tracking()
+        .with_cost_tracking(true)
         .with_cost_callback(move |info: CostInfo| {
             println!("\n=== COST CALLBACK RECEIVED ===");
             println!("Cost: {} credits", info.cost);
@@ -1365,9 +1466,8 @@ async fn test_cost_tracking() {
             println!("Total tokens: {}", info.total_tokens);
             println!("Model: {}", info.model);
             println!("Response ID: {}", info.response_id);
-            if let Some(cached) = info.cached_tokens {
-                println!("Cached tokens: {}", cached);
-            }
+            println!("Cache read tokens: {}", info.cache_read_tokens);
+            println!("Cache write tokens: {}", info.cache_write_tokens);
             println!("==============================\n");
 
             *cost_tracker.lock().unwrap() += info.cost;
@@ -1405,10 +1505,7 @@ async fn test_cost_tracking() {
 async fn test_cost_tracking_multiple_requests() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
 
@@ -1420,7 +1517,7 @@ async fn test_cost_tracking_multiple_requests() {
     let count_tracker = request_count.clone();
 
     let params = NodeCompletionParameters::new()
-        .with_openrouter_cost_tracking()
+        .with_cost_tracking(true)
         .with_cost_callback(move |info: CostInfo| {
             *cost_tracker.lock().unwrap() += info.cost;
             *count_tracker.lock().unwrap() += 1;
@@ -1457,12 +1554,7 @@ async fn test_cost_tracking_multiple_requests() {
 
 #[tokio::test]
 async fn test_cost_tracking_streaming() {
-    dotenvy::dotenv().ok();
-
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test_cost_tracking_streaming: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
@@ -1478,7 +1570,7 @@ async fn test_cost_tracking_streaming() {
     let token_tracker = tokens_received.clone();
 
     let params = NodeCompletionParameters::new()
-        .with_openrouter_cost_tracking()
+        .with_cost_tracking(true)
         .with_cost_callback(move |info: CostInfo| {
             println!("\n=== STREAMING COST CALLBACK ===");
             println!("Cost: {} credits", info.cost);
@@ -1524,12 +1616,7 @@ async fn test_cost_tracking_streaming() {
 
 #[tokio::test]
 async fn test_simple_completion() {
-    dotenvy::dotenv().ok();
-
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test_simple_completion: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
@@ -1554,10 +1641,7 @@ async fn test_simple_completion() {
 async fn test_completion_with_parameters() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     let root = ChatNode::root("You are a helpful assistant.");
@@ -1586,10 +1670,7 @@ async fn test_completion_with_parameters() {
 async fn test_completion_with_system_prompt_override() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     // Start without system prompt
@@ -1625,10 +1706,7 @@ async fn test_completion_with_system_prompt_override() {
 async fn test_streaming_completion() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     let root = ChatNode::root("You are helpful. Be brief.");
@@ -1672,10 +1750,7 @@ async fn test_streaming_completion() {
 async fn test_streaming_collect() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     let root = ChatNode::root("Be brief.");
@@ -1698,10 +1773,7 @@ async fn test_streaming_collect() {
 async fn test_multi_turn_conversation() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
@@ -1728,10 +1800,7 @@ async fn test_multi_turn_conversation() {
 async fn test_chat_convenience_method() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     let root = ChatNode::root("Be brief.");
@@ -1757,10 +1826,7 @@ async fn test_chat_convenience_method() {
 async fn test_image_completion() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let image_path = "./data/test.jpg";
     if !std::path::Path::new(image_path).exists() {
@@ -1774,13 +1840,16 @@ async fn test_image_completion() {
     let content = MessageContent::with_images("Describe this image in one sentence.", &[image]);
 
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
-    let user_node = root.add_child(ChatNode::new(Message {
-        role: Role::User,
-        content,
-        name: None,
-        tool_call_id: None,
-        tool_calls: None,
-    }));
+    let user_node = root
+        .add_child(ChatNode::new(Message {
+            role: Role::User,
+            content,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            cache_breakpoint: false,
+        }))
+        .unwrap();
 
     let result = user_node.complete(&generator, None).await;
 
@@ -1800,10 +1869,7 @@ async fn test_image_completion() {
 async fn test_audio_completion() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let audio_path = "./data/test.mp3";
     if !std::path::Path::new(audio_path).exists() {
@@ -1817,13 +1883,16 @@ async fn test_audio_completion() {
     let content = MessageContent::with_audio("What do you hear in this audio? Be brief.", &[audio]);
 
     let root = ChatNode::root("You are a helpful assistant.");
-    let user_node = root.add_child(ChatNode::new(Message {
-        role: Role::User,
-        content,
-        name: None,
-        tool_call_id: None,
-        tool_calls: None,
-    }));
+    let user_node = root
+        .add_child(ChatNode::new(Message {
+            role: Role::User,
+            content,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            cache_breakpoint: false,
+        }))
+        .unwrap();
 
     let result = user_node.complete(&generator, None).await;
 
@@ -1843,10 +1912,7 @@ async fn test_audio_completion() {
 async fn test_image_and_audio_combined() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let image_path = "./data/test.jpg";
     let audio_path = "./data/test.mp3";
@@ -1870,13 +1936,16 @@ async fn test_image_and_audio_combined() {
     let content = MessageContent::parts(parts);
 
     let root = ChatNode::root("You are a helpful assistant.");
-    let user_node = root.add_child(ChatNode::new(Message {
-        role: Role::User,
-        content,
-        name: None,
-        tool_call_id: None,
-        tool_calls: None,
-    }));
+    let user_node = root
+        .add_child(ChatNode::new(Message {
+            role: Role::User,
+            content,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            cache_breakpoint: false,
+        }))
+        .unwrap();
 
     let result = user_node.complete(&generator, None).await;
 
@@ -1900,10 +1969,7 @@ async fn test_image_and_audio_combined() {
 async fn test_json_response_with_repair() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let generator = get_text_generator();
     let root = ChatNode::root("You are a helpful assistant that responds in JSON format.");
@@ -1942,10 +2008,7 @@ async fn test_json_response_with_repair() {
 async fn test_llm_client_direct() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let client = LLMClient::new();
     let generator = get_text_generator();
@@ -1974,10 +2037,7 @@ async fn test_llm_client_direct() {
 async fn test_llm_client_streaming_direct() {
     dotenvy::dotenv().ok();
 
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let client = LLMClient::new();
     let generator = get_text_generator();
@@ -2010,8 +2070,8 @@ async fn test_llm_client_streaming_direct() {
 
 #[tokio::test]
 async fn test_invalid_api_key() {
-    let generator = GeneratorInfo::openrouter("google/gemini-2.0-flash-lite-001")
-        .with_api_key("invalid-key-12345");
+    require_live!("OPENROUTER_API_KEY");
+    let generator = GeneratorInfo::openrouter(TEXT_ONLY_MODEL).with_api_key("invalid-key-12345");
 
     let root = ChatNode::root("Test");
     let user = root.add_user("Hello");
@@ -2025,12 +2085,9 @@ async fn test_invalid_api_key() {
 
 #[tokio::test]
 async fn test_missing_api_key() {
+    require_live!("OPENROUTER_API_KEY");
     // Create generator without API key
-    let generator = GeneratorInfo::new(
-        "Test",
-        "https://openrouter.ai/api/v1",
-        "google/gemini-2.0-flash-lite-001",
-    );
+    let generator = GeneratorInfo::new("Test", "https://openrouter.ai/api/v1", TEXT_ONLY_MODEL);
 
     let root = ChatNode::root("Test");
     let user = root.add_user("Hello");
@@ -2128,52 +2185,6 @@ fn test_format_conversation() {
 }
 
 // =============================================================================
-// Validate JSON Response Tests
-// =============================================================================
-
-#[test]
-fn test_validate_json_response_valid() {
-    use minillmlib::validate_json_response;
-
-    let response = serde_json::json!({
-        "choices": [{
-            "message": {
-                "content": "Hello world"
-            }
-        }]
-    });
-
-    let result = validate_json_response(&response).unwrap();
-    assert_eq!(result, "Hello world");
-}
-
-#[test]
-fn test_validate_json_response_missing_choices() {
-    use minillmlib::validate_json_response;
-
-    let response = serde_json::json!({
-        "message": "no choices"
-    });
-
-    let result = validate_json_response(&response);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_validate_json_response_missing_content() {
-    use minillmlib::validate_json_response;
-
-    let response = serde_json::json!({
-        "choices": [{
-            "message": {}
-        }]
-    });
-
-    let result = validate_json_response(&response);
-    assert!(result.is_err());
-}
-
-// =============================================================================
 // Multi-threading and Async Concurrency Tests
 // =============================================================================
 
@@ -2183,13 +2194,14 @@ fn get_cheap_generator() -> GeneratorInfo {
     dotenvy::dotenv().ok();
     let provider = ProviderSettings::new().sort_by_price();
     GeneratorInfo::openrouter(CHEAP_MODEL)
-        .with_default_params(CompletionParameters::default().with_provider(provider))
+        .with_default_params(CompletionParameters::default().with_openrouter_routing(provider))
 }
 
 /// Test multi-threaded access to ChatNode
 /// Spawns multiple OS threads that each make a completion request
 #[tokio::test]
 async fn test_multi_threaded_completions() {
+    require_live!("OPENROUTER_API_KEY");
     let gi = get_cheap_generator();
     let params = NodeCompletionParameters::default()
         .with_params(CompletionParameters::default().with_max_tokens(20));
@@ -2203,7 +2215,7 @@ async fn test_multi_threaded_completions() {
     for i in 0..10 {
         let gi_clone = gi.clone();
         let params_clone = params.clone();
-        let root_clone = Arc::clone(&root);
+        let root_clone = root.clone();
 
         let handle = std::thread::spawn(move || {
             // Each thread creates its own runtime for the async call
@@ -2213,21 +2225,25 @@ async fn test_multi_threaded_completions() {
                 let user_node = root_clone.add_user(format!("Say the number {}", i));
 
                 let result = user_node.complete(&gi_clone, Some(&params_clone)).await;
-                (i, result.is_ok())
+                // Return the branch handle so the caller keeps it alive (an unheld
+                // branch is reclaimed once its last handle drops).
+                (i, result.is_ok(), user_node)
             })
         });
 
         handles.push(handle);
     }
 
-    // Collect results
+    // Collect results, holding each branch's handle.
     let mut successes = 0;
+    let mut branches = Vec::new();
     for handle in handles {
-        let (i, ok) = handle.join().expect("Thread panicked");
+        let (i, ok, user_node) = handle.join().expect("Thread panicked");
         println!("Thread {}: {}", i, if ok { "OK" } else { "FAILED" });
         if ok {
             successes += 1;
         }
+        branches.push(user_node);
     }
 
     // All should succeed
@@ -2237,15 +2253,16 @@ async fn test_multi_threaded_completions() {
         successes
     );
 
-    // Verify tree structure - root should have 10 children
-    let children_count = root.child_count();
-    assert_eq!(children_count, 10, "Root should have 10 children");
+    // The 10 branches are held in `branches`, so the root sees all 10.
+    assert_eq!(root.child_count(), 10, "Root should have 10 held children");
+    drop(branches);
 }
 
 /// Test async concurrent completions (like Python's asyncio.gather)
 /// All requests are sent concurrently and awaited together
 #[tokio::test]
 async fn test_async_concurrent_completions() {
+    require_live!("OPENROUTER_API_KEY");
     let gi = get_cheap_generator();
     let params = NodeCompletionParameters::default()
         .with_params(CompletionParameters::default().with_max_tokens(20));
@@ -2258,7 +2275,7 @@ async fn test_async_concurrent_completions() {
     for i in 0..10 {
         let gi_clone = gi.clone();
         let params_clone = params.clone();
-        let root_clone = Arc::clone(&root);
+        let root_clone = root.clone();
 
         // Create the future (doesn't execute yet)
         let future = async move {
@@ -2306,7 +2323,7 @@ async fn test_async_concurrent_completions() {
 }
 
 // =============================================================================
-// CompletionContext & Tracking Tests (Unit — no API calls)
+// CompletionContext & Tracking Tests (Unit, no API calls)
 // =============================================================================
 
 /// Helper: build a CompletionContext with a mock callback that captures CostInfo
@@ -2365,47 +2382,23 @@ fn test_completion_context_byok() {
 
 #[test]
 fn test_completion_context_injects_app_headers() {
-    // Start with a generator that has library-default headers
+    // The library-default OpenRouter generator carries the library's app identity.
     let gen = GeneratorInfo::openrouter("test-model");
-    assert!(gen
-        .custom_headers
-        .iter()
-        .any(|(k, v)| k == "X-Title" && v == "MiniLLMLib"));
+    let default_attr = gen.app_attribution.as_ref().expect("default attribution");
+    assert_eq!(default_attr.title, "MiniLLMLib");
 
     let (ctx, _captured) = make_test_context(gen, false);
 
-    // CompletionContext should have replaced the library defaults with the test app identity
-    let referer = ctx
+    // CompletionContext replaces the app identity with the caller's. Attribution
+    // now lives on the generator (the provider turns it into headers at request
+    // time), not pre-baked into custom_headers.
+    let attr = ctx
         .generator
-        .custom_headers
-        .iter()
-        .find(|(k, _)| k == "HTTP-Referer");
-    let title = ctx
-        .generator
-        .custom_headers
-        .iter()
-        .find(|(k, _)| k == "X-Title");
-
-    assert_eq!(referer.unwrap().1, "https://test.example.com");
-    assert_eq!(title.unwrap().1, "TestApp");
-    // No duplicate headers
-    let referer_count = ctx
-        .generator
-        .custom_headers
-        .iter()
-        .filter(|(k, _)| k == "HTTP-Referer")
-        .count();
-    let title_count = ctx
-        .generator
-        .custom_headers
-        .iter()
-        .filter(|(k, _)| k == "X-Title")
-        .count();
-    assert_eq!(
-        referer_count, 1,
-        "Should have exactly one HTTP-Referer header"
-    );
-    assert_eq!(title_count, 1, "Should have exactly one X-Title header");
+        .app_attribution
+        .as_ref()
+        .expect("context sets attribution");
+    assert_eq!(attr.url, "https://test.example.com");
+    assert_eq!(attr.title, "TestApp");
 }
 
 #[tokio::test]
@@ -2418,10 +2411,12 @@ async fn test_completion_context_report_cost() {
         prompt_tokens: 100,
         completion_tokens: 50,
         total_tokens: 150,
-        cached_tokens: None,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
         reasoning_tokens: None,
         model: "test-model".to_string(),
         response_id: "gen-abc123".to_string(),
+        resolution: minillmlib::CostResolution::Resolved,
     };
 
     ctx.report_cost(cost_info).await;
@@ -2488,10 +2483,7 @@ fn test_completion_context_debug() {
 #[tokio::test]
 async fn test_complete_tracked_fires_callback() {
     dotenvy::dotenv().ok();
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
     let (ctx, captured) = make_test_context(gen, false);
@@ -2546,10 +2538,7 @@ async fn test_complete_tracked_fires_callback() {
 #[tokio::test]
 async fn test_complete_tracked_with_params() {
     dotenvy::dotenv().ok();
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
     let (ctx, captured) = make_test_context(gen, false);
@@ -2583,10 +2572,7 @@ async fn test_complete_tracked_with_params() {
 #[tokio::test]
 async fn test_complete_streaming_collect_tracked() {
     dotenvy::dotenv().ok();
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
     let (ctx, captured) = make_test_context(gen, false);
@@ -2631,10 +2617,7 @@ async fn test_complete_streaming_collect_tracked() {
 #[tokio::test]
 async fn test_complete_streaming_tracked_manual_consume() {
     dotenvy::dotenv().ok();
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
     let (ctx, captured) = make_test_context(gen, false);
@@ -2667,15 +2650,16 @@ async fn test_complete_streaming_tracked_manual_consume() {
     println!("[streaming_tracked] Accumulated: {}", accumulated);
     assert!(!accumulated.is_empty());
 
-    // Now collect_and_report to fire the callback
-    let response = stream.collect_and_report().await;
+    // Collect (no cost yet), then report to fire the callback.
+    let response = stream.collect().await;
     assert!(response.is_ok());
+    stream.report_cost(&response.unwrap()).await;
 
     let costs = captured.lock().unwrap();
     assert_eq!(
         costs.len(),
         1,
-        "Callback should fire once after collect_and_report"
+        "Callback should fire once after report_cost"
     );
     assert!(!costs[0].model.is_empty());
 }
@@ -2683,10 +2667,7 @@ async fn test_complete_streaming_tracked_manual_consume() {
 #[tokio::test]
 async fn test_tracked_stream_drop_reports_cost() {
     dotenvy::dotenv().ok();
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
     let (ctx, captured) = make_test_context(gen, false);
@@ -2707,11 +2688,11 @@ async fn test_tracked_stream_drop_reports_cost() {
                 chunks_read += 1;
             }
             if chunks_read >= 3 {
-                break; // Stop early — cancel the stream
+                break; // Stop early, cancel the stream
             }
         }
         println!("[drop_test] Read {} chunks before dropping", chunks_read);
-        // stream is dropped here — Drop impl should spawn background cost reporting
+        // stream is dropped here; Drop impl should spawn background cost reporting
     }
 
     // Give the background task time to query OpenRouter and report.
@@ -2720,7 +2701,7 @@ async fn test_tracked_stream_drop_reports_cost() {
 
     let costs = captured.lock().unwrap();
     println!("[drop_test] Captured {} cost report(s)", costs.len());
-    // The Drop impl spawns a background task — it should have reported by now
+    // The Drop impl spawns a background task; it should have reported by now
     assert_eq!(costs.len(), 1, "Drop should have triggered cost reporting");
     println!(
         "[drop_test] Cost from cancelled stream: ${:.6}",
@@ -2731,10 +2712,7 @@ async fn test_tracked_stream_drop_reports_cost() {
 #[tokio::test]
 async fn test_complete_tracked_byok_flag() {
     dotenvy::dotenv().ok();
-    if std::env::var("OPENROUTER_API_KEY").is_err() {
-        eprintln!("Skipping test: OPENROUTER_API_KEY not set");
-        return;
-    }
+    require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
 
@@ -2769,4 +2747,754 @@ async fn test_complete_tracked_byok_flag() {
         "BYOK flag should be preserved in callback"
     );
     assert_eq!(metas[0]["userId"], "byok-user");
+}
+
+// =============================================================================
+// Anthropic native + Claude subscription (live, gated behind `--features live`)
+// =============================================================================
+//
+// API-key path needs ANTHROPIC_API_KEY; subscription path needs
+// ANTHROPIC_AUTH_TOKEN (a Pro/Max OAuth token, e.g. from
+// `ant auth print-credentials --env`). Both hit the real `/v1/messages`.
+
+use minillmlib::{CostResolution, TokenPrice};
+
+#[tokio::test]
+async fn test_anthropic_api_key_completion() {
+    require_live!("ANTHROPIC_API_KEY");
+    let generator = GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL);
+    let root = ChatNode::root("You are terse. Reply in one word.");
+    let user = root.add_user("Say OK");
+    let params = NodeCompletionParameters::new()
+        .with_params(CompletionParameters::new().with_max_tokens(10));
+
+    let node = user
+        .complete(&generator, Some(&params))
+        .await
+        .expect("anthropic api-key completion");
+    assert!(
+        !node.text().unwrap_or_default().is_empty(),
+        "expected non-empty Anthropic response"
+    );
+}
+
+#[tokio::test]
+async fn test_anthropic_streaming_collect() {
+    require_live!("ANTHROPIC_API_KEY");
+    let generator = GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL);
+    let root = ChatNode::root("You are terse.");
+    let user = root.add_user("Count: one two three");
+    let params = NodeCompletionParameters::new()
+        .with_params(CompletionParameters::new().with_max_tokens(20));
+
+    let node = user
+        .complete_streaming_collect(&generator, Some(&params))
+        .await
+        .expect("anthropic streaming collect");
+    assert!(!node.text().unwrap_or_default().is_empty());
+}
+
+#[tokio::test]
+async fn test_anthropic_cost_estimate_resolved_with_price() {
+    require_live!("ANTHROPIC_API_KEY");
+    // Anthropic returns token counts but no dollar cost. With a TokenPrice set,
+    // the cost callback must report a Resolved (non-zero) USD ESTIMATE.
+    let generator =
+        GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL).with_token_price(TokenPrice::new(1.0, 5.0));
+
+    let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    let params = NodeCompletionParameters::new()
+        .with_params(CompletionParameters::new().with_max_tokens(10))
+        .with_cost_tracking(true)
+        .with_cost_callback(move |info: CostInfo| sink.lock().unwrap().push(info));
+
+    let root = ChatNode::root("You are terse.");
+    let user = root.add_user("Say OK");
+    user.complete(&generator, Some(&params))
+        .await
+        .expect("anthropic completion with cost tracking");
+
+    let costs = captured.lock().unwrap();
+    assert_eq!(costs.len(), 1, "cost callback fired once");
+    assert_eq!(
+        costs[0].resolution,
+        CostResolution::Resolved,
+        "a TokenPrice makes the estimate Resolved"
+    );
+    assert!(costs[0].cost > 0.0, "estimate should be non-zero");
+    assert!(costs[0].prompt_tokens > 0, "real token counts present");
+}
+
+#[tokio::test]
+async fn test_anthropic_unpriced_without_token_price() {
+    require_live!("ANTHROPIC_API_KEY");
+    // No TokenPrice → cost is Unpriced (real tokens, unknown $), never a fake $0.
+    let generator = GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL);
+    let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    let params = NodeCompletionParameters::new()
+        .with_params(CompletionParameters::new().with_max_tokens(10))
+        .with_cost_tracking(true)
+        .with_cost_callback(move |info: CostInfo| sink.lock().unwrap().push(info));
+
+    let root = ChatNode::root("You are terse.");
+    let user = root.add_user("Say OK");
+    user.complete(&generator, Some(&params))
+        .await
+        .expect("anthropic completion");
+
+    let costs = captured.lock().unwrap();
+    assert_eq!(costs[0].resolution, CostResolution::Unpriced);
+    assert_eq!(costs[0].cost, 0.0);
+    assert!(
+        costs[0].prompt_tokens > 0,
+        "tokens survive for later pricing"
+    );
+}
+
+#[tokio::test]
+async fn test_claude_subscription_completion() {
+    require_subscription!();
+    // Subscription OAuth token: same Anthropic wire, bearer auth, draws on the
+    // subscription quota. With a TokenPrice it yields a Resolved cost estimate.
+    let generator = GeneratorInfo::claude_subscription(ANTHROPIC_TEST_MODEL)
+        .with_token_price(TokenPrice::new(1.0, 5.0));
+
+    let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    let params = NodeCompletionParameters::new()
+        .with_params(CompletionParameters::new().with_max_tokens(10))
+        .with_cost_tracking(true)
+        .with_cost_callback(move |info: CostInfo| sink.lock().unwrap().push(info));
+
+    let root = ChatNode::root("You are terse. Reply in one word.");
+    let user = root.add_user("Say OK");
+    let node = user
+        .complete(&generator, Some(&params))
+        .await
+        .expect("claude subscription completion");
+    assert!(!node.text().unwrap_or_default().is_empty());
+
+    // Real input AND output token counts come back, and the cost ESTIMATE is
+    // exactly tokens × price (Anthropic returns no dollar amount; we derive it).
+    let costs = captured.lock().unwrap();
+    let c = &costs[0];
+    assert_eq!(c.resolution, CostResolution::Resolved);
+    assert!(c.prompt_tokens > 0, "input tokens present");
+    assert!(c.completion_tokens > 0, "output tokens present");
+    assert_eq!(c.total_tokens, c.prompt_tokens + c.completion_tokens);
+    let expected = (c.prompt_tokens as f64 * 1.0 + c.completion_tokens as f64 * 5.0) / 1_000_000.0;
+    assert!(
+        (c.cost - expected).abs() < 1e-12,
+        "cost {} must equal tokens×price {}",
+        c.cost,
+        expected
+    );
+}
+
+#[tokio::test]
+async fn test_claude_subscription_streaming() {
+    require_subscription!();
+    let generator = GeneratorInfo::claude_subscription(ANTHROPIC_TEST_MODEL);
+    let root = ChatNode::root("You are terse.");
+    let user = root.add_user("Count: one two three");
+    let params = NodeCompletionParameters::new()
+        .with_params(CompletionParameters::new().with_max_tokens(20));
+
+    let node = user
+        .complete_streaming_collect(&generator, Some(&params))
+        .await
+        .expect("claude subscription streaming");
+    assert!(!node.text().unwrap_or_default().is_empty());
+}
+
+// =============================================================================
+// Prompt caching (live, gated): proves cache marks drive real write/read and
+// the disjoint-bucket pricing is correct.
+// =============================================================================
+
+/// A system prompt large enough to exceed Haiku's minimum cacheable size.
+fn big_system_prompt() -> String {
+    "You are a meticulous assistant. Follow every instruction exactly. ".repeat(400)
+}
+
+#[tokio::test]
+async fn test_anthropic_cache_write_then_read() {
+    require_subscription!();
+    // read 0.1/Mtok, write 1.25/Mtok (1.25× the 1.0 input rate).
+    let gen = GeneratorInfo::claude_subscription(ANTHROPIC_TEST_MODEL)
+        .with_token_price(TokenPrice::new(1.0, 5.0).with_cache_rates(0.1, 1.25));
+    // Unique per run so call 1 is GUARANTEED cold; a fixed prompt may still be
+    // cached from a recent run (5-min TTL), which would make call 1 a read.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let big = format!("Session {nonce}. {}", big_system_prompt());
+
+    let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let mk = || {
+        let sink = captured.clone();
+        NodeCompletionParameters::new()
+            .with_params(CompletionParameters::new().with_max_tokens(5))
+            .with_cost_tracking(true)
+            .with_cost_callback(move |i: CostInfo| sink.lock().unwrap().push(i))
+    };
+
+    // Call 1: cold → cache WRITE on the marked system prefix.
+    let root = ChatNode::root(big.clone());
+    root.cache_breakpoint();
+    root.add_user("Say A")
+        .complete(&gen, Some(&mk()))
+        .await
+        .expect("write call");
+
+    // Call 2: same system prefix → cache READ.
+    let root2 = ChatNode::root(big);
+    root2.cache_breakpoint();
+    root2
+        .add_user("Say B")
+        .complete(&gen, Some(&mk()))
+        .await
+        .expect("read call");
+
+    let costs = captured.lock().unwrap();
+    assert_eq!(costs.len(), 2);
+    // First call writes the cache; second reads it. (Both Resolved estimates.)
+    assert!(
+        costs[0].cache_write_tokens > 0,
+        "first call writes the cache"
+    );
+    assert!(
+        costs[1].cache_read_tokens > 0,
+        "second call reads the cache"
+    );
+    // The read is far cheaper than the write (the whole point of caching).
+    assert!(
+        costs[1].cost < costs[0].cost,
+        "cache read ({}) must cost less than the write ({})",
+        costs[1].cost,
+        costs[0].cost
+    );
+    assert_eq!(costs[0].resolution, CostResolution::Resolved);
+}
+
+#[tokio::test]
+async fn test_anthropic_ensure_cached_warms_then_cheap_read() {
+    require_subscription!();
+    let gen = GeneratorInfo::claude_subscription(ANTHROPIC_TEST_MODEL)
+        .with_token_price(TokenPrice::new(1.0, 5.0).with_cache_rates(0.1, 1.25));
+
+    // Unique per run so the warm call is a guaranteed cold WRITE.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = ChatNode::root(format!("Session {nonce}. {}", big_system_prompt()));
+    root.cache_breakpoint();
+    let user = root.add_user("Say OK");
+
+    // ensure_cached fires a max_tokens:0 warm request and returns its cost.
+    let warm = user
+        .ensure_cached(&gen, None)
+        .await
+        .expect("ensure_cached warm");
+    // A cold warm pays the write premium and generates no output.
+    assert!(warm.cache_write_tokens > 0, "cold warm writes the cache");
+    assert_eq!(warm.completion_tokens, 0, "warm generates no output");
+
+    // A subsequent real completion should now hit the cache (read), cheaply.
+    let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    let params = NodeCompletionParameters::new()
+        .with_params(CompletionParameters::new().with_max_tokens(5))
+        .with_cost_tracking(true)
+        .with_cost_callback(move |i: CostInfo| sink.lock().unwrap().push(i));
+    user.complete(&gen, Some(&params))
+        .await
+        .expect("real completion after warm");
+
+    let costs = captured.lock().unwrap();
+    assert!(
+        costs[0].cache_read_tokens > 0,
+        "real call after warm hits the cache"
+    );
+}
+
+// =============================================================================
+// Custom / self-hosted provider tests (offline: a tiny in-process mock HTTP
+// server, no API key, no network beyond loopback). These exercise the FULL
+// round-trip (build request -> send over real HTTP -> parse response -> node)
+// for (a) a self-hosted OpenAI-compatible server via the default GenericProvider,
+// and (b) a self-hosted server with a NON-OpenAI wire via a hand-written
+// `impl Provider`. Layer-3 contract tests: real code against a fake server.
+// =============================================================================
+
+mod custom_provider {
+    use super::*;
+    use minillmlib::{
+        provider::{
+            CompletionResponse, CostOutcome, GenericProvider, PostStreamCtx, Provider, StreamChunk,
+            TokenPrice, Usage,
+        },
+        Auth,
+    };
+    use secrecy::ExposeSecret;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// What the mock server captured from the one request it served.
+    #[derive(Debug, Clone, Default)]
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: serde_json::Value,
+    }
+
+    impl CapturedRequest {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// Spin up a one-shot mock HTTP server on a loopback port that serves exactly
+    /// one request: it reads the request line + headers + body, records them, and
+    /// replies with `response_body` (a JSON string) as `200 OK`. Returns the base
+    /// URL (e.g. `http://127.0.0.1:PORT`) and a oneshot receiver that yields the
+    /// captured request once it has been served. Raw `TcpListener` (same idiom as
+    /// the timeout tests) so no HTTP-server dependency is pulled in.
+    async fn mock_server(
+        response_body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<CapturedRequest>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+
+            // Read until we have headers + the full body (Content-Length bytes).
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            loop {
+                let n = socket.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                // Find the header/body split.
+                if let Some(split) = find_subslice(&buf, b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                    let content_len = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    let body_start = split + 4;
+                    if buf.len() - body_start >= content_len {
+                        break; // full body received
+                    }
+                }
+            }
+
+            // Parse the captured request.
+            let split = find_subslice(&buf, b"\r\n\r\n").unwrap();
+            let head = String::from_utf8_lossy(&buf[..split]).to_string();
+            let mut lines = head.lines();
+            let request_line = lines.next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let path = parts.next().unwrap_or("").to_string();
+            let headers: Vec<(String, String)> = lines
+                .filter_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    Some((k.trim().to_string(), v.trim().to_string()))
+                })
+                .collect();
+            let body_bytes = &buf[split + 4..];
+            let body: serde_json::Value =
+                serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
+
+            // Reply with the canned response.
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+
+            let _ = tx.send(CapturedRequest {
+                method,
+                path,
+                headers,
+                body,
+            });
+        });
+
+        (base_url, rx)
+    }
+
+    fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    // -------------------------------------------------------------------------
+    // (a) Self-hosted OpenAI-compatible server via the default GenericProvider.
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn openai_compatible_self_hosted_server_round_trip() {
+        // A canned OpenAI `/chat/completions` response, exactly what a vLLM /
+        // llama.cpp / LM Studio / TGI OpenAI endpoint returns.
+        const RESPONSE: &str = r#"{
+            "id": "cmpl-local-1",
+            "model": "my-local-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello from my server!"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 4, "total_tokens": 15}
+        }"#;
+        let (base_url, captured) = mock_server(RESPONSE).await;
+
+        // This is the END-TO-END "connect to my own server" path: custom() + the
+        // default GenericProvider. base_url is everything before /chat/completions.
+        let generator = GeneratorInfo::custom("my-server", &base_url, "my-local-model")
+            .with_api_key("local-secret")
+            .with_header("X-Tenant", "acme")
+            .with_token_price(TokenPrice::new(0.0, 0.0)); // free local model
+
+        let root = ChatNode::root("You are a helpful assistant.");
+        let answer = root
+            .chat("Say hello.", &generator)
+            .await
+            .expect("round-trip against the self-hosted server");
+
+        // The lib parsed the server's response into a node.
+        assert_eq!(answer.message.text(), Some("Hello from my server!"));
+        assert_eq!(
+            answer.get_metadata("model"),
+            Some(serde_json::json!("my-local-model"))
+        );
+        assert_eq!(
+            answer.get_metadata("finish_reason"),
+            Some(serde_json::json!("stop"))
+        );
+
+        // And it sent the OpenAI wire the server expects.
+        let req = captured.await.unwrap();
+        assert_eq!(req.method, "POST");
+        assert_eq!(
+            req.path, "/chat/completions",
+            "GenericProvider appends the OpenAI path"
+        );
+        assert_eq!(
+            req.header("Authorization"),
+            Some("Bearer local-secret"),
+            "with_api_key -> Authorization: Bearer on the OpenAI wire"
+        );
+        assert_eq!(
+            req.header("X-Tenant"),
+            Some("acme"),
+            "custom header forwarded"
+        );
+        assert_eq!(req.body["model"], "my-local-model");
+        assert_eq!(req.body["stream"], false);
+        // The default (modern) token-limit key.
+        assert_eq!(req.body["messages"][0]["role"], "system");
+        assert_eq!(req.body["messages"][1]["content"], "Say hello.");
+    }
+
+    #[tokio::test]
+    async fn legacy_self_hosted_server_uses_max_tokens_key() {
+        // An older OpenAI-compatible server that only accepts `max_tokens` (not
+        // `max_completion_tokens`). Swap in GenericProvider { legacy_token_limit }.
+        const RESPONSE: &str = r#"{
+            "id": "x", "model": "old-model",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1}
+        }"#;
+        let (base_url, captured) = mock_server(RESPONSE).await;
+
+        let generator = GeneratorInfo::custom("old-server", &base_url, "old-model").with_provider(
+            Arc::new(GenericProvider {
+                legacy_token_limit: true,
+            }),
+        );
+
+        let params = NodeCompletionParameters::new()
+            .with_params(CompletionParameters::new().with_max_tokens(64));
+        let root = ChatNode::root("sys");
+        root.add_user("hi")
+            .complete(&generator, Some(&params))
+            .await
+            .expect("legacy server round-trip");
+
+        let req = captured.await.unwrap();
+        // The whole point: the legacy key, and NOT the modern one.
+        assert_eq!(req.body["max_tokens"], 64);
+        assert!(
+            req.body.get("max_completion_tokens").is_none(),
+            "legacy server must not receive max_completion_tokens"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // (b) Self-hosted server with a NON-OpenAI wire: a hand-written impl Provider.
+    //
+    //     The "EchoAI" enterprise wire (made up, but representative):
+    //       - endpoint:  <base>/api/generate            (not /chat/completions)
+    //       - auth:      X-Echo-Key: <key>               (not Authorization: Bearer)
+    //       - request:   {"model","prompt","settings":{"max_output_tokens"}}
+    //                    (a single flattened prompt string, not a messages array)
+    //       - response:  {"output":{"text"}, "stop":"...",
+    //                     "meta":{"id","tokens_in","tokens_out"}}
+    //                    (an `output`/`meta` envelope, not `choices[]`/`usage`)
+    //
+    //     This is the "enterprise API with a weird shape" case: you implement the
+    //     trait once and everything else (nodes, retry, cost, tracking) just works.
+    // -------------------------------------------------------------------------
+
+    #[derive(Debug, Clone)]
+    struct EchoAiProvider;
+
+    impl Provider for EchoAiProvider {
+        fn endpoint_url(&self, base_url: &str) -> String {
+            format!("{}/api/generate", base_url.trim_end_matches('/'))
+        }
+
+        fn auth_headers(&self, auth: &Auth) -> minillmlib::Result<Vec<(String, String)>> {
+            // EchoAI authenticates with its own header name, not Authorization.
+            Ok(match auth.secret() {
+                Some(secret) => {
+                    vec![("X-Echo-Key".to_string(), secret.expose_secret().to_string())]
+                }
+                None => Vec::new(),
+            })
+        }
+
+        fn build_request(
+            &self,
+            model: &str,
+            messages: &[Message],
+            params: &CompletionParameters,
+            _stream: bool,
+            _include_usage: bool,
+        ) -> minillmlib::Result<serde_json::Value> {
+            // EchoAI takes a single flattened prompt, not a messages array. Flatten
+            // the conversation into "ROLE: text" lines. EchoAI's wire is text-only,
+            // so a multimodal message FAILS LOUDLY rather than silently dropping the
+            // attachment (the reference way to handle an unsupported modality).
+            let mut prompt_lines = Vec::with_capacity(messages.len());
+            for m in messages {
+                if let MessageContent::Parts(parts) = &m.content {
+                    if parts.iter().any(|p| p.as_text().is_none()) {
+                        return Err(minillmlib::MiniLLMError::InvalidParameter(
+                            "EchoAI is text-only and does not support multimodal content"
+                                .to_string(),
+                        ));
+                    }
+                }
+                // all_text() joins every text part (content is all-text past the
+                // guard above), so a multi-text message keeps all of its text.
+                prompt_lines.push(format!("{}: {}", m.role.as_str(), m.content.all_text()));
+            }
+            let prompt = prompt_lines.join("\n");
+
+            Ok(serde_json::json!({
+                "model": model,
+                "prompt": prompt,
+                "settings": {
+                    "max_output_tokens": params.max_tokens.unwrap_or(256),
+                },
+            }))
+        }
+
+        fn parse_response(&self, raw: serde_json::Value) -> minillmlib::Result<CompletionResponse> {
+            // Surface EchoAI's error envelope loudly (never a silent empty success).
+            if let Some(err) = raw.get("error").and_then(|e| e.as_str()) {
+                return Err(minillmlib::MiniLLMError::Api {
+                    status: 502,
+                    message: err.to_string(),
+                });
+            }
+            let text = raw["output"]["text"]
+                .as_str()
+                .ok_or_else(|| minillmlib::MiniLLMError::MalformedResponse(raw.to_string()))?
+                .to_string();
+
+            Ok(CompletionResponse {
+                id: raw["meta"]["id"].as_str().unwrap_or("").to_string(),
+                model: raw["meta"]["model"].as_str().unwrap_or("").to_string(),
+                content: text,
+                finish_reason: raw["stop"].as_str().map(String::from),
+                usage: self.parse_usage(&raw),
+                tool_calls: None,
+                raw_response: Some(raw),
+            })
+        }
+
+        fn parse_usage(&self, raw: &serde_json::Value) -> Option<Usage> {
+            let meta = raw.get("meta")?;
+            Some(Usage {
+                uncached_input_tokens: meta["tokens_in"].as_u64().unwrap_or(0) as u32,
+                completion_tokens: meta["tokens_out"].as_u64().unwrap_or(0) as u32,
+                ..Default::default()
+            })
+        }
+
+        fn parse_chunk(&self, _data: &str) -> Option<minillmlib::Result<StreamChunk>> {
+            // EchoAI is non-streaming in this example; nothing to parse.
+            None
+        }
+
+        fn emits_stream_usage(&self, _requested: bool) -> bool {
+            // EchoAI never sends a trailing usage chunk, so the streaming reader must
+            // NOT wait for one (it would wedge the stream until the idle timeout).
+            // Same property as the shipped GenericProvider.
+            false
+        }
+
+        fn cost_of(&self, usage: Usage, price: Option<&TokenPrice>) -> CostOutcome {
+            // Token-only provider: price the tokens, or report Unpriced.
+            match price {
+                Some(p) => CostOutcome::resolved(p.cost_of(&usage), usage),
+                None => CostOutcome::unpriced(usage),
+            }
+        }
+
+        fn resolve_post_stream<'a>(
+            &'a self,
+            _ctx: PostStreamCtx<'a>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CostOutcome> + Send + 'a>> {
+            // No out-of-band cost endpoint.
+            Box::pin(async { CostOutcome::unknown() })
+        }
+    }
+
+    #[tokio::test]
+    async fn non_openai_wire_custom_provider_round_trip() {
+        // EchoAI's native response envelope (output/meta, not choices/usage).
+        const RESPONSE: &str = r#"{
+            "output": {"text": "Echo: hi there"},
+            "stop": "end",
+            "meta": {"id": "echo-42", "model": "echo-1", "tokens_in": 7, "tokens_out": 3}
+        }"#;
+        let (base_url, captured) = mock_server(RESPONSE).await;
+
+        // Connect to MY non-OpenAI server: same library API, just a different
+        // provider. Cost is priced via TokenPrice ($1/Mtok in, $5/Mtok out).
+        let generator = GeneratorInfo::custom("echoai", &base_url, "echo-1")
+            .with_provider(Arc::new(EchoAiProvider))
+            .with_api_key("echo-secret")
+            .with_token_price(TokenPrice::new(1.0, 5.0));
+
+        let root = ChatNode::root("You are EchoAI.");
+
+        // Enforced cost tracking through a CompletionContext so we also prove the
+        // cost path works against a custom non-OpenAI wire.
+        let captured_costs: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = captured_costs.clone();
+        let callback: AsyncCostCallback = Arc::new(move |cost: CostInfo, _meta: CompletionMeta| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                sink.lock().unwrap().push(cost);
+            })
+        });
+        let ctx = CompletionContext::new(
+            generator,
+            serde_json::json!({}),
+            callback,
+            "https://app",
+            "App",
+        );
+
+        // Pass an explicit max_tokens so we prove the normalized param maps into
+        // EchoAI's own `settings.max_output_tokens` key (not just the default).
+        let params = NodeCompletionParameters::new()
+            .with_params(CompletionParameters::new().with_max_tokens(128));
+        let user = root.add_user("hi");
+        let answer = user
+            .complete_tracked(&ctx, Some(&params))
+            .await
+            .expect("round-trip against the non-OpenAI self-hosted server");
+
+        // Parsed EchoAI's envelope into a node.
+        assert_eq!(answer.message.text(), Some("Echo: hi there"));
+        assert_eq!(
+            answer.get_metadata("model"),
+            Some(serde_json::json!("echo-1"))
+        );
+        assert_eq!(
+            answer.get_metadata("finish_reason"),
+            Some(serde_json::json!("end"))
+        );
+
+        // Sent EchoAI's wire: its endpoint, its auth header, its request shape.
+        let req = captured.await.unwrap();
+        assert_eq!(
+            req.path, "/api/generate",
+            "EchoAI endpoint, not /chat/completions"
+        );
+        assert_eq!(
+            req.header("X-Echo-Key"),
+            Some("echo-secret"),
+            "EchoAI auth header, not Authorization: Bearer"
+        );
+        assert_eq!(req.body["model"], "echo-1");
+        // The per-request max_tokens (128) flows through the normalized params into
+        // EchoAI's own `settings.max_output_tokens` key.
+        assert_eq!(req.body["settings"]["max_output_tokens"], 128);
+        // The flattened prompt carries the whole conversation.
+        let prompt = req.body["prompt"].as_str().unwrap();
+        assert!(prompt.contains("system: You are EchoAI."), "got: {prompt}");
+        assert!(prompt.contains("user: hi"), "got: {prompt}");
+
+        // Cost was tracked from EchoAI's token counts and the configured price:
+        // 7 in x $1/Mtok + 3 out x $5/Mtok = (7 + 15) / 1e6 = $0.000022.
+        let costs = captured_costs.lock().unwrap();
+        assert_eq!(costs.len(), 1, "tracked exactly one completion");
+        assert_eq!(costs[0].prompt_tokens, 7);
+        assert_eq!(costs[0].completion_tokens, 3);
+        assert!(
+            (costs[0].cost - 0.000_022).abs() < 1e-12,
+            "got {}",
+            costs[0].cost
+        );
+    }
+
+    #[tokio::test]
+    async fn echoai_text_only_wire_fails_loudly_on_multimodal() {
+        // EchoAI's flat-prompt wire can't carry an image, so a multimodal message
+        // must ERROR, never silently flatten to text-only (which would drop the
+        // attachment). This locks the reference example's fail-loud behavior; no
+        // server is needed because build_request rejects before any request is sent.
+        let generator = GeneratorInfo::custom("echoai", "http://127.0.0.1:9", "echo-1")
+            .with_provider(Arc::new(EchoAiProvider))
+            .with_api_key("echo-secret");
+
+        let root = ChatNode::root("You are EchoAI.");
+        let img = ImageData::from_url("https://example.com/x.png");
+        let mut msg = Message::user("look at this");
+        msg.content = MessageContent::with_images("look at this", &[img]);
+        let user = root.add_child(ChatNode::new(msg)).unwrap();
+
+        let result = user.complete(&generator, None).await;
+        assert!(
+            matches!(result, Err(minillmlib::MiniLLMError::InvalidParameter(_))),
+            "multimodal must fail loudly on a text-only wire, got {result:?}"
+        );
+    }
 }

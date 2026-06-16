@@ -37,27 +37,18 @@ use parser::JsonParser;
 /// assert_eq!(fixed, r#"{"name": "John", "age": 30}"#);
 /// ```
 pub fn repair_json(json_str: &str, options: &RepairOptions) -> Result<String, JsonRepairError> {
-    // First, try standard JSON parsing - if it works, no repair needed
-    if !options.skip_json_loads {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-            // Convert to our JsonValue for consistent formatting
-            let our_value = JsonValue::from(value);
-            return Ok(our_value.to_json_string_with_options(options.ensure_ascii));
-        }
-    }
+    // Both the standard-parse and repair paths converge through `loads`, so the
+    // empty-string special case below applies uniformly regardless of which path
+    // produced the value.
+    let value = loads(json_str, options)?;
 
-    // Parse with our repair parser
-    let mut parser = JsonParser::new(json_str, options);
-    let value = parser.parse()?;
-
-    // Handle empty string specially - return empty string, not quoted empty
+    // Handle empty string specially - return empty string, not quoted empty.
     if let JsonValue::String(s) = &value {
         if s.is_empty() {
             return Ok(String::new());
         }
     }
 
-    // Convert to JSON string with ensure_ascii option
     Ok(value.to_json_string_with_options(options.ensure_ascii))
 }
 

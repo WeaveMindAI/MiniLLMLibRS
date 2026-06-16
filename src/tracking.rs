@@ -32,38 +32,24 @@ pub struct CompletionContext {
     pub generator: GeneratorInfo,
     pub meta: CompletionMeta,
     callback: AsyncCostCallback,
-    /// App URL sent as HTTP-Referer to OpenRouter for app attribution/rankings
-    pub app_url: String,
-    /// App display name sent as X-Title to OpenRouter for app attribution/rankings
-    pub app_title: String,
 }
 
 impl CompletionContext {
     pub fn new(
-        mut generator: GeneratorInfo,
+        generator: GeneratorInfo,
         meta: CompletionMeta,
         callback: AsyncCostCallback,
         app_url: impl Into<String>,
         app_title: impl Into<String>,
     ) -> Self {
-        let app_url = app_url.into();
-        let app_title = app_title.into();
-
-        // Override any existing HTTP-Referer / X-Title headers on the generator
-        // so OpenRouter attributes usage to the calling application, not the library.
-        generator.custom_headers.retain(|(name, _)| {
-            !name.eq_ignore_ascii_case("HTTP-Referer") && !name.eq_ignore_ascii_case("X-Title")
-        });
-        generator = generator
-            .with_header("HTTP-Referer", &app_url)
-            .with_header("X-Title", &app_title);
-
+        // Set the calling app's attribution identity on the generator; its
+        // provider turns that into whatever headers it uses (e.g. OpenRouter's
+        // HTTP-Referer/X-Title). The context no longer hardcodes provider headers.
+        let generator = generator.with_app_attribution(app_url, app_title);
         Self {
             generator,
             meta,
             callback,
-            app_url,
-            app_title,
         }
     }
 
@@ -83,27 +69,38 @@ impl CompletionContext {
         fut.await;
     }
 
-    /// Query OpenRouter's /api/v1/generation endpoint to get cost for a
-    /// generation that may have been cancelled mid-stream.
-    /// Returns CostInfo if the generation is found, None otherwise.
-    pub(crate) async fn query_generation_cost(&self, generation_id: &str) -> Option<CostInfo> {
-        query_generation_cost_static(&self.generator, generation_id).await
+    /// Derive the cost for a completed response (typed usage, or backoff
+    /// generation-cost query when absent). The single decision shared with the
+    /// streaming path; reports `Unknown` rather than a fake $0 when unresolvable.
+    pub(crate) async fn cost_for_response(
+        &self,
+        response: &crate::provider::CompletionResponse,
+    ) -> CostInfo {
+        cost_for_response(&self.generator, response).await
     }
 }
 
-/// A streaming completion wrapper that reports cost when finished or dropped.
+/// A streaming completion wrapper that reports cost when finished or cancelled.
 ///
-/// If the stream completes normally, cost is extracted from the final usage chunk.
-/// If the stream is cancelled (dropped before completion), the Drop impl spawns
-/// a background task to query OpenRouter's /generation endpoint for the actual cost.
+/// Normal completion: cost comes from the final usage chunk (via the generator's
+/// provider accounting). Cancellation: call [`cancel`](TrackedStream::cancel) to
+/// settle cost reliably (it awaits the resolution); a bare drop falls back to a
+/// best-effort detached task that resolves cost out-of-band (e.g. OpenRouter's
+/// `/generation` query) and may be lost on runtime shutdown (see the `Drop` impl).
 pub struct TrackedStream {
     inner: crate::provider::StreamingCompletion,
     /// Cloned context data needed for cost reporting after the stream ends
     callback: AsyncCostCallback,
     meta: CompletionMeta,
     generator: GeneratorInfo,
-    /// Set to true once cost has been reported (prevents double-reporting on drop)
+    /// Cost has been reported (`report_cost`/`cancel`): suppresses the Drop
+    /// fallback and makes `report_cost` idempotent.
     cost_reported: bool,
+    /// The caller explicitly rejected this completion (`reject`): Drop books
+    /// nothing. The ONLY way to legitimately drop a `TrackedStream` without
+    /// booking cost; otherwise a dropped, un-reported stream books (so a
+    /// forgotten `report_cost` can't silently lose an accepted generation's cost).
+    rejected: bool,
 }
 
 impl TrackedStream {
@@ -117,6 +114,7 @@ impl TrackedStream {
             meta: ctx.meta.clone(),
             generator: ctx.generator.clone(),
             cost_reported: false,
+            rejected: false,
         }
     }
 
@@ -127,55 +125,71 @@ impl TrackedStream {
         self.inner.next_chunk().await
     }
 
-    /// Collect all chunks, report cost, and return the final CompletionResponse.
-    pub async fn collect_and_report(
-        &mut self,
-    ) -> crate::error::Result<crate::provider::CompletionResponse> {
-        // Drain the stream
+    /// Drain the stream and return the typed response. Does NOT report cost, so
+    /// the caller can post-process (and reject empty/invalid) the content before
+    /// any cost is booked, mirroring the non-streaming order. Call
+    /// [`report_cost`](Self::report_cost) afterwards.
+    pub async fn collect(&mut self) -> crate::error::Result<crate::provider::CompletionResponse> {
         while let Some(result) = self.inner.next_chunk().await {
             result?;
         }
+        Ok(self.inner.to_response())
+    }
 
-        let response = crate::provider::CompletionResponse {
-            id: self.inner_id().to_string(),
-            model: self.inner_model().to_string(),
-            content: self.inner.accumulated().to_string(),
-            finish_reason: None, // Already consumed
-            usage: self.inner.usage().cloned(),
-            tool_calls: None,
-            raw_response: None,
-        };
-
-        // Report cost from usage if available
-        let cost_info = if let Some(usage) = &response.usage {
-            CostInfo {
-                cost: usage.total_cost(),
-                prompt_tokens: usage.prompt_tokens,
-                completion_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                cached_tokens: usage.cached_tokens,
-                reasoning_tokens: usage.reasoning_tokens,
-                model: response.model.clone(),
-                response_id: response.id.clone(),
-            }
-        } else if !response.id.is_empty() {
-            // No usage in stream — query generation endpoint
-            tracing::info!(
-                "No usage in stream for {}, querying generation endpoint",
-                response.id
-            );
-            query_generation_cost_static(&self.generator, &response.id)
-                .await
-                .unwrap_or_default()
-        } else {
-            CostInfo::default()
-        };
-
-        let fut = (self.callback)(cost_info, self.meta.clone());
-        fut.await;
+    /// Report cost for an already-collected response: from typed usage when
+    /// present, otherwise via the shared backoff generation-cost resolver. Marks
+    /// the stream reported so Drop does not re-report. Idempotent: a second call
+    /// is a no-op (the callback is the money sink; reporting twice would double-book).
+    pub async fn report_cost(&mut self, response: &crate::provider::CompletionResponse) {
+        if self.cost_reported {
+            tracing::warn!("report_cost called more than once; ignoring the repeat");
+            return;
+        }
+        let cost_info = cost_for_response(&self.generator, response).await;
+        (self.callback)(cost_info, self.meta.clone()).await;
         self.cost_reported = true;
+    }
 
-        Ok(response)
+    /// Settle the cost of a cancelled (un-collected) stream and report it,
+    /// **awaiting** the resolution (which may include a backoff out-of-band query)
+    /// on the caller's runtime.
+    ///
+    /// This is the explicit, reliable cancellation path: prefer it over just
+    /// dropping the stream. A bare drop falls back to a detached background task
+    /// (see the `Drop` impl), which is best-effort and can be lost if the runtime
+    /// shuts down mid-settle; `cancel` guarantees the report completes before it
+    /// returns. Reports `Unknown`/`Unpriced` rather than a fake $0 when the cost
+    /// can't be determined.
+    pub async fn cancel(mut self) {
+        // Honor any usage chunk that ALREADY arrived (don't throw away an exact,
+        // free, in-hand cost for a slower out-of-band guess). Non-blocking: drains
+        // only what is already buffered, never awaits the network.
+        self.inner.drain_buffered();
+
+        // A failed stream is not an accepted generation, so book nothing, loudly.
+        if self.inner.errored() {
+            tracing::warn!(
+                "TrackedStream for {} cancelled after a transport error; no cost booked.",
+                self.inner.id()
+            );
+            self.cost_reported = true; // suppress the Drop fallback
+            return;
+        }
+
+        let response = self.inner.to_response();
+        let cost_info = cost_for_response(&self.generator, &response).await;
+        (self.callback)(cost_info, self.meta.clone()).await;
+        self.cost_reported = true; // suppress the Drop fallback
+    }
+
+    /// Explicitly reject this completion: book NO cost and suppress the Drop
+    /// fallback. The deliberate "this completion was unacceptable, don't pay for
+    /// it" path (mirrors the non-streaming `crash_on_empty`/`crash_on_refusal`
+    /// behavior). This is the ONLY way to drop a `TrackedStream` without booking
+    /// cost: a plain drop of an un-reported stream books, so forgetting to report
+    /// can't silently lose an accepted generation's cost.
+    pub fn reject(mut self) {
+        self.rejected = true;
     }
 
     /// Check if the stream has finished
@@ -187,138 +201,136 @@ impl TrackedStream {
     pub fn accumulated(&self) -> &str {
         self.inner.accumulated()
     }
-
-    fn inner_id(&self) -> &str {
-        self.inner.id()
-    }
-
-    fn inner_model(&self) -> &str {
-        self.inner.model()
-    }
 }
 
 impl Drop for TrackedStream {
     fn drop(&mut self) {
-        if self.cost_reported {
+        // Already reported (report_cost/cancel) or explicitly rejected (reject):
+        // nothing to book. These are the only two ways to drop without booking.
+        if self.cost_reported || self.rejected {
             return;
         }
 
-        // Stream was dropped before collect_and_report() — likely cancelled.
-        // Check if we have usage from partial consumption.
-        let cost_info_from_usage = self.inner.usage().map(|usage| CostInfo {
-            cost: usage.total_cost(),
-            prompt_tokens: usage.prompt_tokens,
-            completion_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
-            cached_tokens: usage.cached_tokens,
-            reasoning_tokens: usage.reasoning_tokens,
-            model: self.inner_model().to_string(),
-            response_id: self.inner_id().to_string(),
-        });
+        // Drain any chunk still BUFFERED in the channel (non-blocking) before
+        // deciding. A terminal error (transport failure OR an in-band provider
+        // `error` frame) can be sitting unread in the channel if the consumer
+        // dropped without draining; without this it would be invisible here and we
+        // would book a phantom cost for a failed generation. This makes drop
+        // symmetric with `cancel`/`next_chunk`, which already observe it.
+        self.inner.drain_buffered();
 
+        // A stream that ended in a TRANSPORT ERROR (timeout / SSE failure) or an
+        // in-band provider error is not an accepted generation: booking it would
+        // charge a phantom cost for a request that failed. Skip the booking and say
+        // so loudly, symmetric with the "don't silently lose an accepted cost" rule.
+        if self.inner.errored() {
+            tracing::warn!(
+                "TrackedStream for {} ended in a transport error; no cost booked (failed generation).",
+                self.inner.id()
+            );
+            return;
+        }
+
+        // Any other drop (whether the stream was fully drained because the consumer
+        // forgot to report, or cancelled mid-flight) is an accepted/used generation
+        // whose cost has NOT been reported. We must book it, not silently lose it.
+        // Drop can't await the (possibly multi-second, backoff) settle, so this is
+        // a best-effort detached task that can be cancelled if the runtime shuts
+        // down first; that risk is logged LOUDLY. Callers wanting a guarantee use
+        // `cancel().await` (cancellation) or `report_cost().await` (normal end).
+        let response = self.inner.to_response();
         let callback = self.callback.clone();
         let meta = self.meta.clone();
         let generator = self.generator.clone();
-        let response_id = self.inner_id().to_string();
 
-        // Spawn a background task to report cost.
-        // Guard against no tokio runtime (e.g., during shutdown).
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            tracing::warn!(
-                "TrackedStream dropped outside tokio runtime — cannot report cost for {}",
-                response_id
+            tracing::error!(
+                "TrackedStream for {} dropped un-reported outside a tokio runtime: cost CANNOT be settled and is LOST. Use cancel().await or report_cost().await.",
+                response.id
             );
             return;
         };
 
+        // Not loud: this fires on the normal drop-without-explicit-settle path,
+        // most of which complete fine. The LOUD signal is reserved for an actual
+        // loss (the LostGuard below), so it can't cry wolf.
+        tracing::debug!(
+            "TrackedStream for {} dropped without report_cost()/cancel()/reject(); settling cost on a detached task",
+            response.id
+        );
         handle.spawn(async move {
-            let cost_info = if let Some(info) = cost_info_from_usage {
-                info
-            } else if !response_id.is_empty() {
-                // Query OpenRouter for the actual cost of this cancelled generation.
-                // Retry with backoff — OpenRouter may not have finalized yet.
-                tracing::info!(
-                    "Stream cancelled for {}, querying generation cost",
-                    response_id
-                );
-                let mut result = None;
-                for delay_secs in [1, 2, 4] {
-                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-                    if let Some(info) = query_generation_cost_static(&generator, &response_id).await
-                    {
-                        result = Some(info);
-                        break;
-                    }
-                    tracing::debug!(
-                        "Generation {} not found yet, retrying in {}s",
-                        response_id,
-                        delay_secs * 2
-                    );
-                }
-                result.unwrap_or_default()
-            } else {
-                CostInfo::default()
-            };
-
-            let fut = (callback)(cost_info, meta);
-            fut.await;
+            // If this task is cancelled before booking (e.g. the runtime shuts down
+            // during the backoff/HTTP in resolve_post_stream), the guard's Drop
+            // fires the LOUD loss log. On success we disarm it after the callback.
+            let mut guard = LostCostGuard::new(response.id.clone());
+            let cost_info = cost_for_response(&generator, &response).await;
+            (callback)(cost_info, meta).await;
+            guard.settled = true;
         });
     }
 }
 
-/// Standalone function to query generation cost (used by both CompletionContext and TrackedStream Drop)
-async fn query_generation_cost_static(
-    generator: &GeneratorInfo,
-    generation_id: &str,
-) -> Option<CostInfo> {
-    use secrecy::ExposeSecret;
+/// Guards the detached cost-settle task: if it is dropped before `settled` is set
+/// (i.e. the task was cancelled before the cost callback completed), it logs the
+/// loss LOUDLY, so a runtime-shutdown-induced lost cost report is never silent.
+struct LostCostGuard {
+    response_id: String,
+    settled: bool,
+}
 
-    let api_key = generator.api_key.as_ref()?;
-    let encoded_id =
-        url::form_urlencoded::byte_serialize(generation_id.as_bytes()).collect::<String>();
-    let url = format!("https://openrouter.ai/api/v1/generation?id={}", encoded_id);
-
-    let client = reqwest::Client::new();
-    let response = client
-        .get(&url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", api_key.expose_secret()),
-        )
-        .send()
-        .await
-        .ok()?;
-
-    if !response.status().is_success() {
-        tracing::warn!(
-            "Failed to query generation cost for {}: {}",
-            generation_id,
-            response.status()
-        );
-        return None;
+impl LostCostGuard {
+    fn new(response_id: String) -> Self {
+        Self {
+            response_id,
+            settled: false,
+        }
     }
+}
 
-    let json: serde_json::Value = response.json().await.ok()?;
-    let data = json.get("data")?;
+impl Drop for LostCostGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            tracing::error!(
+                "Cost settle task for {} was cancelled before booking: cost is LOST (likely runtime shutdown). Use cancel().await or report_cost().await for a guarantee.",
+                self.response_id
+            );
+        }
+    }
+}
 
-    let or_cost = data["total_cost"].as_f64().unwrap_or(0.0);
-    let upstream_cost = data["upstream_inference_cost"].as_f64().unwrap_or(0.0);
-    let total_cost = or_cost + upstream_cost;
-    let prompt_tokens = data["tokens_prompt"].as_u64().unwrap_or(0) as u32;
-    let completion_tokens = data["tokens_completion"].as_u64().unwrap_or(0) as u32;
-    let model = data["model"].as_str().unwrap_or("").to_string();
-    let gen_id = data["id"].as_str().unwrap_or(generation_id).to_string();
+/// Derive the cost for a completed response. The single owner of the
+/// "response -> CostInfo" decision, used by every enforced-tracking path. All
+/// provider-specific knowledge (cost aggregation, out-of-band resolution) lives
+/// behind `generator.provider`; this function only routes:
+/// - usage present  -> `accounting.cost_of(usage, price)` (native cost, or
+///   token×price, or `Unpriced`),
+/// - usage absent    -> `accounting.resolve_post_stream(...)` (the provider's
+///   own out-of-band query, or `Unknown` if it has none).
+pub(crate) async fn cost_for_response(
+    generator: &GeneratorInfo,
+    response: &crate::provider::CompletionResponse,
+) -> CostInfo {
+    let price = generator.token_price.as_ref();
+    let outcome = match &response.usage {
+        Some(usage) => generator.provider.cost_of(usage.clone(), price),
+        None => {
+            let ctx = crate::provider::PostStreamCtx {
+                client: reqwest_client(),
+                generation_id: &response.id,
+                auth: &generator.auth,
+                price,
+            };
+            generator.provider.resolve_post_stream(ctx).await
+        }
+    };
+    outcome.into_cost_info(response.model.clone(), response.id.clone())
+}
 
-    Some(CostInfo {
-        cost: total_cost,
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: prompt_tokens + completion_tokens,
-        cached_tokens: data["native_tokens_cached"].as_u64().map(|v| v as u32),
-        reasoning_tokens: data["native_tokens_reasoning"].as_u64().map(|v| v as u32),
-        model,
-        response_id: gen_id,
-    })
+/// A shared reqwest client for out-of-band cost queries (avoids building one per
+/// resolution).
+fn reqwest_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
 }
 
 impl std::fmt::Debug for CompletionContext {
@@ -329,5 +341,357 @@ impl std::fmt::Debug for CompletionContext {
             .field("meta", &self.meta)
             .field("is_byok", &self.is_byok())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::MiniLLMError;
+    use crate::provider::{CostResolution, StreamChunk, StreamingCompletion, Usage};
+    use std::sync::Mutex;
+
+    /// A dumb capturing callback: appends every (cost, meta) it receives to a log.
+    type CaptureLog = Arc<Mutex<Vec<(CostInfo, serde_json::Value)>>>;
+
+    fn capturing_context(meta: serde_json::Value) -> (CompletionContext, CaptureLog) {
+        let log: CaptureLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let callback: AsyncCostCallback = Arc::new(move |cost, meta| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                sink.lock().unwrap().push((cost, meta));
+            })
+        });
+        // OpenRouter accounting so the streaming tests exercise native USD cost.
+        let generator = GeneratorInfo::new("Test", "https://example.test/v1", "test-model")
+            .with_provider(std::sync::Arc::new(crate::provider::OpenRouterProvider));
+        let ctx = CompletionContext::new(generator, meta, callback, "https://app", "App");
+        (ctx, log)
+    }
+
+    #[tokio::test]
+    async fn report_cost_passes_cost_and_meta_through() {
+        let (ctx, log) = capturing_context(serde_json::json!({"userId": "u1"}));
+        let cost = CostInfo {
+            cost: 0.001,
+            model: "test-model".into(),
+            response_id: "gen-1".into(),
+            ..Default::default()
+        };
+        ctx.report_cost(cost).await;
+
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert!((captured[0].0.cost - 0.001).abs() < 1e-9);
+        assert_eq!(captured[0].1["userId"], "u1");
+    }
+
+    #[test]
+    fn is_byok_reads_metadata() {
+        let (byok, _) = capturing_context(serde_json::json!({"isByok": true}));
+        assert!(byok.is_byok());
+        let (not_byok, _) = capturing_context(serde_json::json!({}));
+        assert!(!not_byok.is_byok());
+    }
+
+    #[tokio::test]
+    async fn collect_then_report_uses_typed_usage_and_sums_byok() {
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        let (stream, tx) = StreamingCompletion::from_channel("test-model", "gen-1", true);
+        let mut tracked = TrackedStream::new(stream, &ctx);
+
+        // Feed content then a trailing usage chunk (OpenRouter BYOK shape).
+        tx.send(Ok(StreamChunk::content("hi"))).await.unwrap();
+        tx.send(Ok(StreamChunk {
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                cost: Some(0.001),
+                upstream_inference_cost: Some(0.009),
+                uncached_input_tokens: 5,
+                completion_tokens: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        // collect() must NOT report cost; report_cost() does.
+        let resp = tracked.collect().await.unwrap();
+        assert_eq!(resp.content, "hi");
+        assert!(log.lock().unwrap().is_empty(), "collect must not book cost");
+
+        tracked.report_cost(&resp).await;
+
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let cost = &captured[0].0;
+        // BYOK total = OpenRouter fee + upstream inference cost.
+        assert!((cost.cost - 0.010).abs() < 1e-9, "cost was {}", cost.cost);
+        assert_eq!(cost.total_tokens, 7);
+        assert_eq!(cost.resolution, CostResolution::Resolved);
+    }
+
+    #[tokio::test]
+    async fn report_cost_marks_unknown_when_no_usage_and_no_id() {
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        // Empty id => the generation-cost query is skipped (it can't query
+        // without an id), so cost must be reported as Unknown, never a fake $0.
+        let (stream, tx) = StreamingCompletion::from_channel("test-model", "", true);
+        let mut tracked = TrackedStream::new(stream, &ctx);
+
+        tx.send(Ok(StreamChunk::content("hi"))).await.unwrap();
+        drop(tx); // close with no usage chunk
+
+        let resp = tracked.collect().await.unwrap();
+        tracked.report_cost(&resp).await;
+
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0.resolution, CostResolution::Unknown);
+        assert_eq!(captured[0].0.cost, 0.0);
+    }
+
+    /// Feed a content chunk + a usage chunk and drain the channel; returns the
+    /// tracked stream fully collected (finished).
+    async fn drained_stream(ctx: &CompletionContext) -> TrackedStream {
+        let (stream, tx) = StreamingCompletion::from_channel("test-model", "gen-1", true);
+        let mut tracked = TrackedStream::new(stream, ctx);
+        tx.send(Ok(StreamChunk::content("hi"))).await.unwrap();
+        tx.send(Ok(StreamChunk {
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                cost: Some(0.5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+        let _ = tracked.collect().await.unwrap();
+        tracked
+    }
+
+    #[tokio::test]
+    async fn explicit_reject_books_nothing() {
+        // The deliberate "unacceptable completion, don't pay" path.
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        drained_stream(&ctx).await.reject();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "an explicitly rejected stream must not book cost"
+        );
+    }
+
+    #[tokio::test]
+    async fn drained_then_dropped_without_report_still_books_cost() {
+        // Forgetting to report on an accepted (fully-drained) stream must NOT
+        // silently lose the cost: Drop books it (only reject() opts out).
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        {
+            let _tracked = drained_stream(&ctx).await; // dropped here, un-reported
+        }
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1, "a forgotten report must still book cost");
+        assert!((captured[0].0.cost - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn genuine_cancellation_books_cost() {
+        // A stream dropped mid-flight (never collected, not finished) is a genuine
+        // cancellation → Drop books cost. Empty id here → Unknown resolution.
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        let (stream, _tx) = StreamingCompletion::from_channel("test-model", "", true);
+        let tracked = TrackedStream::new(stream, &ctx);
+        assert!(!tracked.is_finished(), "precondition: not collected");
+        drop(tracked); // genuine cancel
+
+        // Let the spawned cancel-report task run.
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1, "genuine cancel must book cost");
+        assert_eq!(captured[0].0.resolution, CostResolution::Unknown);
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_settles_cost_synchronously_and_suppresses_drop() {
+        // cancel().await reports cost inline (no detached task to lose), and the
+        // subsequent drop must NOT double-report.
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        let (mut stream_holder, tx) =
+            StreamingCompletion::from_channel("test-model", "gen-1", true);
+        // Feed a usage chunk so cancel resolves to a concrete cost synchronously.
+        tx.send(Ok(StreamChunk::content("partial"))).await.unwrap();
+        tx.send(Ok(StreamChunk {
+            usage: Some(Usage {
+                cost: Some(0.02),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        // Pull the usage chunk into inner state without fully collecting.
+        let _ = stream_holder.next_chunk().await;
+        let _ = stream_holder.next_chunk().await;
+
+        let tracked = TrackedStream::new(stream_holder, &ctx);
+        tracked.cancel().await; // reports inline, marks reported
+
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1, "cancel reports exactly once");
+        assert_eq!(captured[0].0.resolution, CostResolution::Resolved);
+        assert!((captured[0].0.cost - 0.02).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn report_cost_then_drop_books_exactly_once() {
+        // The happy path: collect → report_cost → drop must book exactly one cost.
+        // A regression that forgot to set cost_reported in report_cost would let
+        // Drop re-book and double-charge.
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        {
+            let mut tracked = drained_stream(&ctx).await;
+            let resp = tracked.inner.to_response();
+            tracked.report_cost(&resp).await;
+        } // dropped here; must NOT re-book.
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "report_cost then drop must book exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn errored_stream_books_nothing_on_drop() {
+        // A stream that ends in a transport error is a FAILED generation, not an
+        // accepted one: Drop must NOT book a phantom cost for it.
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        let (stream, tx) = StreamingCompletion::from_channel("test-model", "gen-1", true);
+        let mut tracked = TrackedStream::new(stream, &ctx);
+        tx.send(Ok(StreamChunk::content("partial"))).await.unwrap();
+        tx.send(Err(MiniLLMError::Timeout)).await.unwrap();
+        // Drive the stream; the error surfaces and marks it errored.
+        let err = tracked.collect().await;
+        assert!(err.is_err(), "stream surfaces the transport error");
+        drop(tracked);
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a failed stream must not book cost"
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_error_left_undrained_then_dropped_books_nothing() {
+        // The dangerous shape: a terminal error (transport OR an in-band provider
+        // `error` frame) is sitting BUFFERED in the channel, and the consumer drops
+        // the TrackedStream WITHOUT draining it (no next_chunk/collect/cancel). Drop
+        // must drain the buffered error, see `errored`, and book NOTHING, otherwise
+        // it charges a phantom cost for a failed generation.
+        //
+        // The id is EMPTY on purpose: without the Drop drain, the un-errored path
+        // would book an Unknown cost IMMEDIATELY (no out-of-band HTTP for an empty
+        // id), so the assertion below deterministically distinguishes "drained →
+        // booked nothing" from "not drained → booked a phantom" without racing a
+        // slow detached query (a non-empty id would book only after a ~7s backoff,
+        // making this assertion pass for the wrong reason).
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        let (stream, tx) = StreamingCompletion::from_channel("test-model", "", true);
+        let tracked = TrackedStream::new(stream, &ctx);
+        tx.send(Ok(StreamChunk::content("partial"))).await.unwrap();
+        tx.send(Err(MiniLLMError::Stream("in-band provider error".into())))
+            .await
+            .unwrap();
+        // NO next_chunk / collect / cancel: drop straight away with the error buffered.
+        drop(tracked);
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a buffered terminal error must make Drop book nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_split_usage_books_correct_tokens_end_to_end() {
+        // The Anthropic split-usage merge (input in message_start, output in
+        // message_delta) must reach the booked CostInfo with the right token
+        // counts, not just the stream state machine. Priced so cost is Resolved.
+        let log: CaptureLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let callback: AsyncCostCallback = Arc::new(move |cost, meta| {
+            let sink = sink.clone();
+            Box::pin(async move {
+                sink.lock().unwrap().push((cost, meta));
+            })
+        });
+        // Anthropic provider + a token price so cost resolves from token counts.
+        let generator = GeneratorInfo::new("Test", "https://example.test", "claude-haiku-4-5")
+            .with_provider(std::sync::Arc::new(crate::provider::AnthropicProvider))
+            .with_token_price(crate::provider::TokenPrice::new(1.0, 5.0));
+        let ctx = CompletionContext::new(generator, serde_json::json!({}), callback, "u", "a");
+
+        let (stream, tx) = StreamingCompletion::from_channel("claude-haiku-4-5", "msg_1", true);
+        let mut tracked = TrackedStream::new(stream, &ctx);
+        // message_start: input usage only.
+        tx.send(Ok(StreamChunk {
+            id: Some("msg_1".into()),
+            usage: Some(Usage {
+                uncached_input_tokens: 1_000_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        tx.send(Ok(StreamChunk::content("hi"))).await.unwrap();
+        // message_delta: stop + output usage (input absent here).
+        tx.send(Ok(StreamChunk {
+            finish_reason: Some("end_turn".into()),
+            usage: Some(Usage {
+                completion_tokens: 1_000_000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let resp = tracked.collect().await.unwrap();
+        tracked.report_cost(&resp).await;
+
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let cost = &captured[0].0;
+        assert_eq!(
+            cost.prompt_tokens, 1_000_000,
+            "input merged from message_start"
+        );
+        assert_eq!(
+            cost.completion_tokens, 1_000_000,
+            "output from message_delta"
+        );
+        assert_eq!(cost.resolution, CostResolution::Resolved);
+        // 1M×$1 in + 1M×$5 out = $6.
+        assert!((cost.cost - 6.0).abs() < 1e-9, "got {}", cost.cost);
     }
 }

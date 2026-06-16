@@ -2,6 +2,9 @@
 /target
 Cargo.lock
 
+# mdBook build output (the guide is built in CI and deployed to GitHub Pages)
+/book
+
 # Environment
 .env
 .env.*
@@ -22,3 +25,4 @@ data/*.mp3
 data/*.wav
 data/*.png
 data/test.mp4
+.claude/

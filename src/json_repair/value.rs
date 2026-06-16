@@ -38,11 +38,20 @@ impl JsonValue {
             JsonValue::Bool(b) => if *b { "true" } else { "false" }.to_string(),
             JsonValue::Integer(n) => n.to_string(),
             JsonValue::Float(f) => {
-                // Handle special float formatting
+                // Keep a trailing ".0" for small integer-valued floats (so 1e10
+                // serializes as 10000000000.0, not 10000000000). For everything
+                // else, defer to serde_json's number formatter, which emits valid
+                // JSON (scientific notation for large magnitudes), where `f.to_string()`
+                // would expand a value like 1e308 to a 309-digit token that serde
+                // rejects on re-parse. A non-finite float (shouldn't reach here,
+                // parse_number guards finiteness) falls back to "null".
                 if f.fract() == 0.0 && f.abs() < 1e15 {
                     format!("{:.1}", f)
                 } else {
-                    f.to_string()
+                    match serde_json::Number::from_f64(*f) {
+                        Some(n) => n.to_string(),
+                        None => "null".to_string(),
+                    }
                 }
             }
             JsonValue::String(s) => format!("\"{}\"", escape_json_string(s, ensure_ascii)),
@@ -71,16 +80,6 @@ impl JsonValue {
 
     /// Check if this value is empty (empty string, array, or object)
     pub fn is_empty(&self) -> bool {
-        match self {
-            JsonValue::String(s) => s.is_empty(),
-            JsonValue::Array(arr) => arr.is_empty(),
-            JsonValue::Object(obj) => obj.is_empty(),
-            _ => false,
-        }
-    }
-
-    /// Check if this value is strictly empty (empty container, not null/false/0)
-    pub fn is_strictly_empty(&self) -> bool {
         match self {
             JsonValue::String(s) => s.is_empty(),
             JsonValue::Array(arr) => arr.is_empty(),

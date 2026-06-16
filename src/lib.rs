@@ -9,6 +9,16 @@
 //!   supporting branching dialogues and conversation history
 //! - **Streaming Support**: First-class support for streaming completions via SSE
 //! - **Multimodal**: Support for images and audio in messages
+//! - **Multiple wires**: One [`Provider`] trait owns the full dialect (endpoint,
+//!   auth, request body, response/stream envelope). Ships OpenAI/OpenRouter,
+//!   native Anthropic (`/v1/messages`, `content[]`), and a generic compatible
+//!   provider; a custom enterprise API is a small `impl Provider`.
+//! - **Subscription auth**: a Claude Pro/Max OAuth token works via
+//!   [`Auth::BearerToken`] (see [`GeneratorInfo::claude_subscription`]); cost is a
+//!   token-count ESTIMATE through [`TokenPrice`].
+//! - **Cost Tracking**: Per-provider usage & cost accounting behind the [`Provider`]
+//!   trait; enforced tracking via [`CompletionContext`], with honest
+//!   [`CostResolution`] (`Resolved`/`Unpriced`/`Unknown`, never a fake $0)
 //! - **JSON Repair**: Robust handling of malformed JSON from LLM outputs
 //! - **Async/Parallel**: Built on Tokio for high-performance async operations
 //!
@@ -44,7 +54,7 @@ pub mod utils;
 // Re-export main types for convenience
 pub use chat_node::{
     format_conversation, pretty_messages, ChatNode, ConversationBuilder, PrettyPrintConfig,
-    ThreadData, ThreadMessage,
+    ThreadData,
 };
 pub use error::{MiniLLMError, Result};
 pub use generator::{
@@ -53,15 +63,18 @@ pub use generator::{
 };
 pub use json_repair::{loads, repair_json, JsonValue, RepairOptions};
 pub use message::{
-    AudioData, ImageData, Media, MediaData, Message, MessageContent, Role, VideoData,
+    AudioData, AudioInput, ContentPart, ImageData, ImageUrl, Media, MediaData, Message,
+    MessageContent, Role, VideoData, VideoUrl,
 };
 pub use provider::{
-    CompletionResponse, CostCallback, CostInfo, CostTrackingType, LLMClient, StreamingCompletion,
+    resolve_claude_subscription_auth, AnthropicProvider, AppIdentity, Auth, CompletionResponse,
+    CostCallback, CostInfo, CostOutcome, CostResolution, GenericProvider, LLMClient,
+    OpenAiProvider, OpenRouterProvider, PostStreamCtx, Provider, StreamChunk, StreamingCompletion,
+    TokenPrice, Usage,
 };
 pub use tracking::{AsyncCostCallback, CompletionContext, CompletionMeta, TrackedStream};
 pub use utils::{
-    configure_logging, extract_json, extract_json_value, pretty_json, to_dict,
-    validate_json_response, LogLevel,
+    configure_logging, extract_json, extract_json_value, pretty_json, to_dict, LogLevel,
 };
 
 /// Initialize the library with default settings

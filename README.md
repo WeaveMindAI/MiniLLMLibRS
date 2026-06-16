@@ -43,7 +43,7 @@ async fn main() -> minillmlib::Result<()> {
     minillmlib::init();
 
     // Create a generator for OpenRouter
-    let generator = GeneratorInfo::openrouter("google/gemini-2.0-flash-lite-001");
+    let generator = GeneratorInfo::openrouter("google/gemini-2.5-flash-lite");
 
     // Start a conversation
     let root = ChatNode::root("You are a helpful assistant.");
@@ -118,7 +118,7 @@ let response2 = response1.chat("What's my name?", &generator).await?;
 ```rust
 use minillmlib::{ChatNode, GeneratorInfo, ImageData, MessageContent, Message, Role};
 
-let generator = GeneratorInfo::openrouter("google/gemini-2.0-flash-lite-001");
+let generator = GeneratorInfo::openrouter("google/gemini-2.5-flash-lite");
 let image = ImageData::from_file("./image.jpg")?;
 
 let content = MessageContent::with_images("Describe this image.", &[image]);
@@ -178,16 +178,46 @@ let params = NodeCompletionParameters::new()
 
 ### OpenRouter Provider Settings
 
+OpenRouter routing is provider-specific, so it's attached via
+`with_openrouter_routing` (which carries it under the request's `provider` key);
+non-OpenRouter providers simply ignore it.
+
 ```rust
 use minillmlib::{CompletionParameters, ProviderSettings};
 
-let provider = ProviderSettings::new()
+let routing = ProviderSettings::new()
     .sort_by_throughput()                              // or .sort_by_price()
     .deny_data_collection()
     .with_ignore(vec!["SambaNova".to_string()]);       // Exclude providers
 
 let params = CompletionParameters::new()
-    .with_provider(provider);
+    .with_openrouter_routing(routing);
+```
+
+### Prompt Caching (provider-agnostic)
+
+Mark what to cache on the tree; the provider decides the wire (Anthropic emits
+`cache_control`, OpenAI auto-caches). Switch the provider and the same code works.
+
+```rust
+let root = ChatNode::root(big_system_prompt);
+root.cache_breakpoint();                 // cache just the system prompt
+// ...or NodeCompletionParameters::new().with_cache(true) to cache the whole prefix
+
+// Warm the cache before an agent run (cheap to call repeatedly):
+let warm_cost = some_node.ensure_cached(&generator, None).await?;
+
+// Clear marks:
+root.clear_cache_breakpoint();           // one node
+root.clear_all_cache_breakpoints();      // whole tree
+```
+
+Cache tokens are priced with distinct read/write rates (cache reads are ~0.1×
+input; cache writes a ~1.25× premium):
+
+```rust
+let price = TokenPrice::new(1.0, 5.0)        // $/Mtok input, output
+    .with_cache_rates(0.1, 1.25);            // $/Mtok cache-read, cache-write
 ```
 
 ### Custom/Extra Parameters
@@ -288,14 +318,14 @@ let count = root.node_count();
 use minillmlib::{ChatNode, GeneratorInfo, NodeCompletionParameters, CostInfo};
 use std::sync::{Arc, Mutex};
 
-let generator = GeneratorInfo::openrouter("google/gemini-2.0-flash-lite-001");
+let generator = GeneratorInfo::openrouter("google/gemini-2.5-flash-lite");
 
 // Track costs across multiple requests
 let total_cost = Arc::new(Mutex::new(0.0));
 let cost_tracker = total_cost.clone();
 
 let params = NodeCompletionParameters::new()
-    .with_openrouter_cost_tracking()
+    .with_cost_tracking(true)
     .with_cost_callback(move |info: CostInfo| {
         *cost_tracker.lock().unwrap() += info.cost;
         println!("Request cost: {} credits", info.cost);
@@ -324,26 +354,66 @@ println!("Total spent: {} credits", *total_cost.lock().unwrap());
 | `MessageContent` | Text or multimodal content |
 | `ThreadData` | Serializable conversation thread with format kwargs |
 | `CostInfo` | Cost and token usage information from completions |
-| `CostTrackingType` | Cost tracking mode (`None`, `OpenRouter`) |
+| `CostResolution` | Whether a reported cost is `Resolved`, `Unpriced`, or `Unknown` |
 
 ### GeneratorInfo Methods
 
 ```rust
 // Pre-configured providers
-GeneratorInfo::openrouter(model)    // OpenRouter API
-GeneratorInfo::openai(model)        // OpenAI API
-GeneratorInfo::anthropic(model)     // Anthropic API
-GeneratorInfo::custom(name, url, model)  // Custom endpoint
+GeneratorInfo::openrouter(model)         // OpenRouter (OpenAI wire, native USD cost)
+GeneratorInfo::openai(model)             // OpenAI (token-only; price via with_token_price)
+GeneratorInfo::anthropic(model)          // Native Anthropic /v1/messages, x-api-key auth
+GeneratorInfo::claude_subscription(model)// Anthropic wire, Claude Pro/Max OAuth token
+GeneratorInfo::custom(name, url, model)  // Custom OpenAI-compatible endpoint
 
-// Builder methods
-.with_api_key(key)
+// Auth builder methods
+.with_api_key(key)                       // provider chooses header (Bearer / x-api-key)
 .with_api_key_from_env("ENV_VAR")
+.with_bearer_token(token)                // OAuth / subscription bearer token
+.with_bearer_token_from_env("ENV_VAR")
+
+// Other builder methods
+.with_token_price(TokenPrice::new(in_per_mtok, out_per_mtok)) // cost estimate for token-only providers
+.with_provider(Arc::new(MyProvider))     // swap the wire dialect
 .with_header(name, value)
 .with_vision()
 .with_audio()
 .with_max_context(length)
 .with_default_params(params)
 ```
+
+### Claude Subscription (use your Pro/Max plan)
+
+A Claude **Pro/Max subscription** OAuth token authenticates against the native
+Anthropic API the same way an API key does, but draws on your **subscription's
+rolling quota** (the 5-hour / 7-day window) instead of pay-as-you-go API billing.
+
+`claude_subscription` resolves the token in this order:
+
+1. the `ANTHROPIC_AUTH_TOKEN` env var, if set (explicit override, e.g. from
+   `claude setup-token`; you keep it fresh);
+2. otherwise the live Claude Code credential at `~/.claude/.credentials.json`
+   (`claudeAiOauth.accessToken`), which Claude Code keeps refreshed, so if you're
+   logged into Claude Code with your subscription, it just works.
+
+```rust
+use minillmlib::{ChatNode, GeneratorInfo, TokenPrice};
+
+// Anthropic returns token counts but no dollar cost, so set a price for a
+// resolved cost ESTIMATE (otherwise tracking reports `Unpriced`).
+let generator = GeneratorInfo::claude_subscription("claude-haiku-4-5")
+    .with_token_price(TokenPrice::new(1.0, 5.0)); // $/Mtok in, $/Mtok out
+
+let root = ChatNode::root("You are helpful.");
+let response = root.chat("Hello!", &generator).await?;
+```
+
+> **Subscription vs Console.** A subscription token (from Claude Code) bills your
+> Pro/Max plan. A Console/API OAuth token (e.g. from the `ant` CLI) bills your
+> **API account**, not the subscription; for Console use an API key via
+> `GeneratorInfo::anthropic(model)`. Verify which bucket you're hitting by the
+> response's rate-limit headers: subscription returns `anthropic-ratelimit-unified-5h-*`;
+> the API tier returns `anthropic-ratelimit-input-tokens-limit`.
 
 ### CompletionParameters
 
@@ -355,8 +425,9 @@ GeneratorInfo::custom(name, url, model)  // Custom endpoint
 | `top_k` | `Option<u32>` | `None` | Top-k sampling |
 | `stop` | `Option<Vec<String>>` | `None` | Stop sequences |
 | `seed` | `Option<u64>` | `None` | Random seed |
-| `provider` | `Option<ProviderSettings>` | `None` | OpenRouter provider routing |
-| `extra` | `Option<HashMap>` | `None` | Custom parameters |
+| `response_format` | `Option<ResponseFormat>` | `None` | Force JSON output |
+| `reasoning` | `Option<ReasoningConfig>` | `None` | Extended-thinking effort/budget |
+| `extra` | `Option<HashMap>` | `None` | Provider-specific keys (incl. OpenRouter routing) |
 
 ### NodeCompletionParameters
 
@@ -371,7 +442,8 @@ GeneratorInfo::custom(name, url, model)  // Custom endpoint
 | `max_back_off` | `f64` | `15.0` | Max backoff (seconds) |
 | `crash_on_refusal` | `bool` | `false` | Error if no JSON |
 | `crash_on_empty_response` | `bool` | `false` | Error if empty |
-| `cost_tracking` | `CostTrackingType` | `None` | Enable cost tracking |
+| `track_cost` | `bool` | `false` | Request and report usage/cost |
+| `token_price` | `Option<TokenPrice>` | `None` | Per-request price override (token-only providers) |
 | `cost_callback` | `Option<CostCallback>` | `None` | Callback for cost info |
 
 ### ProviderSettings (OpenRouter)
@@ -399,18 +471,23 @@ echo '{"key": "value",}' | minillmlib-cli
 ## Running Tests
 
 ```bash
-# Run all tests (unit + integration)
+# Default: all offline tests (unit + offline integration). No API calls, free.
 cargo test
 
-# Run only unit tests (fast, no API calls)
+# Unit tests only (fast)
 cargo test --lib
 
-# Run integration tests (requires API key)
-cargo test --test integration_tests
+# Live integration tests (REAL, billed API calls): opt in with the `live` feature.
+# Reads OPENROUTER_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN from the env
+# (or a .env); each live test skips gracefully if its key is absent.
+cargo test --features live
 
 # Run with output
 cargo test -- --nocapture
 ```
+
+Without `--features live`, every network test skips, so `cargo test` is free,
+offline, and deterministic even when real keys are present in your environment.
 
 ## License
 

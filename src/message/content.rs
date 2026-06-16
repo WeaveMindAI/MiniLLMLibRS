@@ -32,11 +32,16 @@ pub struct ImageUrl {
     pub detail: Option<String>,
 }
 
-/// Audio input structure for API
+/// Audio input structure for API.
+///
+/// `data` carries either base64-encoded audio or, for URL-backed audio, the URL
+/// verbatim. `format` is omitted for URL-backed audio (no `"url"` sentinel leaks
+/// to the wire); the provider infers it from the URL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioInput {
     pub data: String,
-    pub format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
 }
 
 /// Video URL structure for API
@@ -63,12 +68,21 @@ impl ContentPart {
         }
     }
 
-    /// Create an audio content part from AudioData
+    /// Create an audio content part from AudioData.
+    ///
+    /// For URL-backed audio the URL is sent verbatim in `data` with `format`
+    /// omitted (the `"url"` sentinel never reaches the wire); for inline audio
+    /// the base64 data and real format are sent.
     pub fn audio(audio: &AudioData) -> Self {
+        let format = if audio.is_url() {
+            None
+        } else {
+            Some(audio.format.clone())
+        };
         Self::Audio {
             input_audio: AudioInput {
                 data: audio.base64_data.clone(),
-                format: audio.format.clone(),
+                format,
             },
         }
     }
@@ -164,18 +178,19 @@ impl MessageContent {
         }
     }
 
-    /// Get the text content (first text part if multimodal)
+    /// Get the FIRST text part (borrowed). For a single-text message this is the
+    /// whole text; for a multimodal message with several text parts it returns
+    /// only the first, so use [`all_text`](Self::all_text) when you need every
+    /// text part (e.g. for display). Named `get_text` for the common single-text
+    /// case; it does not promise "all" the text.
     pub fn get_text(&self) -> Option<&str> {
         match self {
             Self::Text(text) => Some(text),
-            Self::Parts(parts) => {
-                // Return first text part
-                parts.iter().find_map(|p| p.as_text())
-            }
+            Self::Parts(parts) => parts.iter().find_map(|p| p.as_text()),
         }
     }
 
-    /// Get all text content concatenated
+    /// Get all text content concatenated (every text part, newline-joined).
     pub fn all_text(&self) -> String {
         match self {
             Self::Text(text) => text.clone(),
@@ -233,5 +248,36 @@ impl From<&str> for MessageContent {
 impl Default for MessageContent {
     fn default() -> Self {
         Self::Text(String::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::AudioData;
+
+    #[test]
+    fn audio_content_part_emits_base64_with_format() {
+        let audio = AudioData::from_bytes(&[0u8; 4], "mp3");
+        let part = ContentPart::audio(&audio);
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["type"], "input_audio");
+        assert_eq!(json["input_audio"]["format"], "mp3");
+        assert!(json["input_audio"]["data"].as_str().is_some());
+    }
+
+    #[test]
+    fn audio_content_part_url_does_not_leak_sentinel() {
+        // Regression: URL-backed audio must NOT emit format:"url"; the URL goes
+        // in `data` and `format` is omitted for the provider to infer.
+        let audio = AudioData::from_url("https://example.com/clip.mp3");
+        let part = ContentPart::audio(&audio);
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["input_audio"]["data"], "https://example.com/clip.mp3");
+        assert!(
+            json["input_audio"].get("format").is_none(),
+            "format must be omitted for URL audio, got {:?}",
+            json["input_audio"].get("format")
+        );
     }
 }

@@ -2,75 +2,61 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Parameters for LLM completion requests
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Normalized, provider-agnostic completion parameters.
+///
+/// This is NOT a wire shape; it is normalized *intent*. Each provider's
+/// [`build_request`](crate::Provider::build_request) translates these fields into
+/// its own request body (OpenAI's flat keys, Anthropic's `/v1/messages` shape,
+/// etc.), so the same parameters drive any provider identically. Provider-specific
+/// knobs that have no normalized meaning (e.g. OpenRouter routing) go through
+/// [`extra`](Self::extra), the documented escape hatch: they are honestly just
+/// extra wire keys, not pretend-universal fields.
+#[derive(Debug, Clone)]
 pub struct CompletionParameters {
-    /// Maximum tokens to generate
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Maximum tokens to generate. The provider emits it under its own key
+    /// (`max_completion_tokens`, `max_tokens`, Anthropic's required `max_tokens`).
     pub max_tokens: Option<u32>,
 
     /// Temperature for sampling (0.0 = deterministic, 2.0 = very random)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
 
     /// Top-p (nucleus) sampling
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
     /// Top-k sampling
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub top_k: Option<u32>,
 
     /// Frequency penalty (-2.0 to 2.0)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub frequency_penalty: Option<f32>,
 
     /// Presence penalty (-2.0 to 2.0)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f32>,
 
     /// Repetition penalty (1.0 = no penalty)
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub repetition_penalty: Option<f32>,
 
-    /// Stop sequences
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Stop sequences (OpenAI `stop`, Anthropic `stop_sequences`).
     pub stop: Option<Vec<String>>,
 
     /// Seed for reproducibility
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub seed: Option<u64>,
 
-    /// Whether to stream the response
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
-
-    /// Response format (e.g., "json_object")
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Normalized response-format intent (e.g. force JSON output). The provider
+    /// maps it to its wire (OpenAI `response_format`, Anthropic structured output).
     pub response_format: Option<ResponseFormat>,
 
-    /// Tool/function definitions
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Tool/function definitions (currently OpenAI-shaped JSON, passed through).
     pub tools: Option<Vec<serde_json::Value>>,
 
-    /// Tool choice strategy
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Tool choice strategy.
     pub tool_choice: Option<serde_json::Value>,
 
-    /// OpenRouter provider settings (order, sort, ignore, data_collection, etc.)
-    ///
-    /// See: <https://openrouter.ai/docs/provider-routing>
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<ProviderSettings>,
-
     /// Reasoning configuration (for models that support extended thinking).
-    /// When set, enables reasoning tokens with the specified effort/budget.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
 
-    /// Extra parameters to pass directly to the API
-    /// These are merged into the request body as-is
-    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    /// Provider-specific extra keys, merged into the request body as-is. This is
+    /// the honest home for anything without a normalized meaning, e.g. OpenRouter
+    /// routing via [`with_openrouter_routing`](Self::with_openrouter_routing).
     pub extra: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
@@ -126,6 +112,12 @@ impl ProviderSettings {
     /// Create new provider settings
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Serialize to the JSON value OpenRouter expects under the request's
+    /// `"provider"` key (used by [`CompletionParameters::with_openrouter_routing`]).
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
     }
 
     /// Set ordered list of providers to try
@@ -189,11 +181,9 @@ impl Default for CompletionParameters {
             repetition_penalty: None,
             stop: None,
             seed: None,
-            stream: None,
             response_format: None,
             tools: None,
             tool_choice: None,
-            provider: None,
             reasoning: None,
             extra: None,
         }
@@ -221,12 +211,6 @@ impl CompletionParameters {
     /// Set top_p
     pub fn with_top_p(mut self, top_p: f32) -> Self {
         self.top_p = Some(top_p);
-        self
-    }
-
-    /// Enable streaming
-    pub fn with_streaming(mut self, stream: bool) -> Self {
-        self.stream = Some(stream);
         self
     }
 
@@ -278,7 +262,6 @@ impl CompletionParameters {
             repetition_penalty: other.repetition_penalty.or(self.repetition_penalty),
             stop: other.stop.clone().or_else(|| self.stop.clone()),
             seed: other.seed.or(self.seed),
-            stream: other.stream.or(self.stream),
             response_format: other
                 .response_format
                 .clone()
@@ -288,16 +271,19 @@ impl CompletionParameters {
                 .tool_choice
                 .clone()
                 .or_else(|| self.tool_choice.clone()),
-            provider: other.provider.clone().or_else(|| self.provider.clone()),
             reasoning: other.reasoning.clone().or_else(|| self.reasoning.clone()),
             extra: merged_extra,
         }
     }
 
-    /// Set OpenRouter provider settings
-    pub fn with_provider(mut self, provider: ProviderSettings) -> Self {
-        self.provider = Some(provider);
-        self
+    /// Set OpenRouter provider-routing settings (order/sort/ignore/data_collection).
+    ///
+    /// OpenRouter-specific: it goes through [`extra`](Self::extra) under the
+    /// `"provider"` key (the honest home for a provider-specific knob), so it
+    /// reaches OpenRouter's wire and is simply ignored by providers that don't
+    /// understand it, rather than masquerading as a universal parameter.
+    pub fn with_openrouter_routing(self, routing: ProviderSettings) -> Self {
+        self.with_extra("provider", routing.to_value())
     }
 
     /// Add extra parameters to pass directly to the API
@@ -319,35 +305,59 @@ impl CompletionParameters {
     }
 }
 
-/// Response format specification
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+/// Normalized response-format intent. The provider maps it to its wire.
+///
+/// Only the constraint the library can actually request is represented: forcing a
+/// JSON object. "Plain text" is the absence of a constraint (`response_format:
+/// None`), not a variant: a `Text` variant would be unreachable decoration until
+/// a builder produced it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseFormat {
-    #[serde(rename = "text")]
-    Text,
-    #[serde(rename = "json_object")]
+    /// Force the model to emit a JSON object.
     JsonObject,
 }
 
-use crate::provider::{CostCallback, CostTrackingType};
+impl ResponseFormat {
+    /// The OpenAI `response_format` value (`{"type": "json_object"}`).
+    pub fn to_openai_value(&self) -> serde_json::Value {
+        match self {
+            ResponseFormat::JsonObject => serde_json::json!({"type": "json_object"}),
+        }
+    }
+}
+
+use crate::provider::{CostCallback, TokenPrice};
 
 /// Per-request completion parameters (used when calling complete on a node)
 #[derive(Clone)]
 pub struct NodeCompletionParameters {
-    /// Override the generator for this request
-    pub generator: Option<super::GeneratorInfo>,
-
     /// Override completion parameters
     pub params: Option<CompletionParameters>,
 
     /// System prompt to prepend
     pub system_prompt: Option<String>,
 
-    /// Whether to use streaming
-    pub stream: Option<bool>,
+    /// Completion-level format kwargs: applied at format time as the base layer
+    /// for `{placeholder}` substitution. Per-node override kwargs (set via
+    /// `ChatNode::set_format_kwarg`) layer on top and win on key collision.
+    pub format_kwargs: std::collections::HashMap<String, String>,
+
+    /// Whether the assistant response is appended as a real child of the node.
+    /// When false, the returned node is a "phantom": it knows its parent (so
+    /// `thread()` works) but the parent does not list it, leaving the tree
+    /// untouched. Default: true.
+    pub add_child: bool,
 
     /// Whether to parse/repair JSON response
     pub parse_json: bool,
+
+    /// Auto-cache the stable prompt prefix for this request: marks the whole
+    /// prompt (everything up to the turn being generated) as a cache breakpoint,
+    /// so the provider caches it (Anthropic) or it's a no-op (OpenAI auto-caches).
+    /// A convenience over marking individual nodes; explicit
+    /// [`ChatNode::cache_breakpoint`](crate::ChatNode::cache_breakpoint) marks are
+    /// always honored in addition. Default: false.
+    pub use_cache: bool,
 
     /// Force text to be prepended to the assistant's response
     /// e.g., force_prepend="Score: " makes the LLM start with "Score: "
@@ -372,12 +382,21 @@ pub struct NodeCompletionParameters {
     /// Raise error if model returns empty output
     pub crash_on_empty_response: bool,
 
-    /// Custom request timeout in seconds
+    /// Custom request timeout in seconds. For non-streaming completions this is
+    /// the total-response deadline; for streaming completions it is the idle
+    /// timeout (max silence between chunks), so a long but live generation is not
+    /// killed while a dead/silent connection still fails loudly.
     pub timeout_secs: Option<u64>,
 
     // Cost tracking
-    /// Type of cost tracking to use (default: None)
-    pub cost_tracking: CostTrackingType,
+    /// Whether to request and report usage/cost for this completion. The *how*
+    /// (usage opt-in flag, parsing, aggregation, out-of-band resolution) is owned
+    /// by the generator's provider accounting; this only says whether to track.
+    pub track_cost: bool,
+
+    /// Per-request override of the generator's `token_price` (for providers that
+    /// price by token). When `None`, the generator's price is used.
+    pub token_price: Option<TokenPrice>,
 
     /// Callback function called with cost info after each completion
     pub cost_callback: Option<CostCallback>,
@@ -386,11 +405,12 @@ pub struct NodeCompletionParameters {
 impl Default for NodeCompletionParameters {
     fn default() -> Self {
         Self {
-            generator: None,
             params: None,
             system_prompt: None,
-            stream: None,
+            format_kwargs: std::collections::HashMap::new(),
+            add_child: true,
             parse_json: false,
+            use_cache: false,
             force_prepend: None,
             retry: 4,
             exp_back_off: false,
@@ -399,7 +419,8 @@ impl Default for NodeCompletionParameters {
             crash_on_refusal: false,
             crash_on_empty_response: false,
             timeout_secs: None,
-            cost_tracking: CostTrackingType::None,
+            track_cost: false,
+            token_price: None,
             cost_callback: None,
         }
     }
@@ -408,14 +429,14 @@ impl Default for NodeCompletionParameters {
 impl std::fmt::Debug for NodeCompletionParameters {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeCompletionParameters")
-            .field("generator", &self.generator)
             .field("params", &self.params)
             .field("system_prompt", &self.system_prompt)
-            .field("stream", &self.stream)
+            .field("format_kwargs", &self.format_kwargs)
+            .field("add_child", &self.add_child)
             .field("parse_json", &self.parse_json)
             .field("force_prepend", &self.force_prepend)
             .field("retry", &self.retry)
-            .field("cost_tracking", &self.cost_tracking)
+            .field("track_cost", &self.track_cost)
             .field("cost_callback", &self.cost_callback.is_some())
             .finish()
     }
@@ -424,11 +445,6 @@ impl std::fmt::Debug for NodeCompletionParameters {
 impl NodeCompletionParameters {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_generator(mut self, generator: super::GeneratorInfo) -> Self {
-        self.generator = Some(generator);
-        self
     }
 
     pub fn with_params(mut self, params: CompletionParameters) -> Self {
@@ -441,8 +457,22 @@ impl NodeCompletionParameters {
         self
     }
 
-    pub fn with_streaming(mut self, stream: bool) -> Self {
-        self.stream = Some(stream);
+    /// Set the completion-level format kwargs (replaces any already set).
+    pub fn with_format_kwargs(mut self, kwargs: std::collections::HashMap<String, String>) -> Self {
+        self.format_kwargs = kwargs;
+        self
+    }
+
+    /// Add a single completion-level format kwarg.
+    pub fn with_format_kwarg(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.format_kwargs.insert(key.into(), value.into());
+        self
+    }
+
+    /// Set whether the assistant response is appended as a real child (true) or
+    /// returned as a phantom node leaving the tree untouched (false).
+    pub fn with_add_child(mut self, add_child: bool) -> Self {
+        self.add_child = add_child;
         self
     }
 
@@ -452,9 +482,17 @@ impl NodeCompletionParameters {
         self
     }
 
-    /// Alias for with_parse_json(true) - for backwards compatibility
+    /// Readable alias for `with_parse_json(true)`.
     pub fn expecting_json(mut self) -> Self {
         self.parse_json = true;
+        self
+    }
+
+    /// Auto-cache the stable prompt prefix for this request. The provider decides
+    /// the wire (Anthropic marks it; OpenAI auto-caches anyway). Explicit per-node
+    /// [`cache_breakpoint`](crate::ChatNode::cache_breakpoint) marks still apply.
+    pub fn with_cache(mut self, use_cache: bool) -> Self {
+        self.use_cache = use_cache;
         self
     }
 
@@ -505,15 +543,17 @@ impl NodeCompletionParameters {
         self
     }
 
-    /// Enable cost tracking with OpenRouter's usage accounting
-    pub fn with_openrouter_cost_tracking(mut self) -> Self {
-        self.cost_tracking = CostTrackingType::OpenRouter;
+    /// Enable usage/cost tracking. The provider's accounting (on the generator)
+    /// decides how usage is requested, parsed, aggregated, and resolved.
+    pub fn with_cost_tracking(mut self, track: bool) -> Self {
+        self.track_cost = track;
         self
     }
 
-    /// Set the cost tracking type
-    pub fn with_cost_tracking(mut self, tracking_type: CostTrackingType) -> Self {
-        self.cost_tracking = tracking_type;
+    /// Override the generator's per-token price for this request (for providers
+    /// that price by token).
+    pub fn with_token_price(mut self, price: TokenPrice) -> Self {
+        self.token_price = Some(price);
         self
     }
 
@@ -528,7 +568,7 @@ impl NodeCompletionParameters {
     /// let cost_tracker = total_cost.clone();
     ///
     /// let params = NodeCompletionParameters::default()
-    ///     .with_openrouter_cost_tracking()
+    ///     .with_cost_tracking(true)
     ///     .with_cost_callback(move |info| {
     ///         let mut cost = cost_tracker.lock().unwrap();
     ///         *cost += info.cost;

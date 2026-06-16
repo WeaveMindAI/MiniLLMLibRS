@@ -1,14 +1,24 @@
 //! HTTP client for LLM API requests
 
-use super::response::{parse_completion_response, CompletionResponse};
+use super::response::{preview_str, CompletionResponse};
 use super::streaming::StreamingCompletion;
 use crate::error::{MiniLLMError, Result};
 use crate::generator::{CompletionParameters, GeneratorInfo};
-use crate::message::{messages_to_payload, Message};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use crate::message::Message;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest_eventsource::EventSource;
-use secrecy::ExposeSecret;
 use std::time::Duration;
+
+/// Map a transport error from `send()` into a typed error, surfacing timeouts
+/// as the distinct `Timeout` variant (consumers and retry logic discriminate on
+/// it) rather than collapsing every transport failure into `Http`.
+fn map_send_error(e: reqwest::Error) -> MiniLLMError {
+    if e.is_timeout() {
+        MiniLLMError::Timeout
+    } else {
+        MiniLLMError::Http(e)
+    }
+}
 
 /// HTTP client for making LLM API requests
 #[derive(Clone)]
@@ -23,7 +33,11 @@ impl Default for LLMClient {
 }
 
 impl LLMClient {
-    /// Create a new LLM client with default settings
+    /// Create a new LLM client with default settings.
+    ///
+    /// The 600s timeout is a connection-pool-wide backstop; individual requests
+    /// override it via the per-request timeout argument, so a single pooled
+    /// client serves both default and custom-timeout requests.
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
@@ -33,39 +47,35 @@ impl LLMClient {
         Self { client }
     }
 
-    /// Create a client with custom timeout
-    pub fn with_timeout(timeout: Duration) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("Failed to create HTTP client");
-
-        Self { client }
-    }
-
-    /// Build headers for a request
+    /// Build headers for a request.
+    ///
+    /// The provider owns BOTH the auth headers (OpenAI `Authorization: Bearer`,
+    /// Anthropic `x-api-key`/bearer + version) and the app-attribution headers
+    /// (e.g. OpenRouter's `HTTP-Referer`/`X-Title`); the generator supplies the
+    /// `Auth` strategy and the app identity. Custom headers are applied last and
+    /// win on a key collision.
     fn build_headers(&self, generator: &GeneratorInfo) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
 
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        // Add API key if present
-        if let Some(api_key) = &generator.api_key {
-            let auth_value = format!("Bearer {}", api_key.expose_secret());
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&auth_value)
-                    .map_err(|e| MiniLLMError::Other(format!("Invalid API key format: {}", e)))?,
-            );
-        }
-
-        // Add custom headers
-        for (name, value) in &generator.custom_headers {
+        let auth = generator.provider.auth_headers(&generator.auth)?;
+        let attribution = generator
+            .provider
+            .attribution_headers(generator.app_attribution.as_ref());
+        for (name, value) in auth
+            .iter()
+            .chain(attribution.iter())
+            .chain(generator.custom_headers.iter())
+        {
             let header_name = HeaderName::try_from(name.as_str()).map_err(|e| {
-                MiniLLMError::Other(format!("Invalid header name '{}': {}", name, e))
+                MiniLLMError::InvalidParameter(format!("Invalid header name '{}': {}", name, e))
             })?;
             let header_value = HeaderValue::from_str(value).map_err(|e| {
-                MiniLLMError::Other(format!("Invalid header value for '{}': {}", name, e))
+                MiniLLMError::InvalidParameter(format!(
+                    "Invalid header value for '{}': {}",
+                    name, e
+                ))
             })?;
             headers.insert(header_name, header_value);
         }
@@ -73,7 +83,8 @@ impl LLMClient {
         Ok(headers)
     }
 
-    /// Build request body with optional usage tracking
+    /// Build the request body via the generator's provider (the provider owns the
+    /// wire shape: OpenAI `/chat/completions` vs Anthropic `/v1/messages`).
     pub(crate) fn build_body_with_usage(
         &self,
         generator: &GeneratorInfo,
@@ -81,71 +92,10 @@ impl LLMClient {
         params: &CompletionParameters,
         stream: bool,
         include_usage: bool,
-    ) -> serde_json::Value {
-        let mut body = serde_json::json!({
-            "model": generator.model,
-            "messages": messages_to_payload(messages),
-            "stream": stream,
-        });
-
-        // Add OpenRouter usage tracking if requested
-        if include_usage {
-            body["usage"] = serde_json::json!({ "include": true });
-        }
-
-        // Add completion parameters
-        // Send both: max_completion_tokens (OpenRouter's preferred name) and
-        // max_tokens (for non-OpenRouter OpenAI-compatible providers)
-        if let Some(max_tokens) = params.max_tokens {
-            body["max_completion_tokens"] = serde_json::json!(max_tokens);
-            body["max_tokens"] = serde_json::json!(max_tokens);
-        }
-        if let Some(temperature) = params.temperature {
-            body["temperature"] = serde_json::json!(temperature);
-        }
-        if let Some(top_p) = params.top_p {
-            body["top_p"] = serde_json::json!(top_p);
-        }
-        if let Some(top_k) = params.top_k {
-            body["top_k"] = serde_json::json!(top_k);
-        }
-        if let Some(frequency_penalty) = params.frequency_penalty {
-            body["frequency_penalty"] = serde_json::json!(frequency_penalty);
-        }
-        if let Some(presence_penalty) = params.presence_penalty {
-            body["presence_penalty"] = serde_json::json!(presence_penalty);
-        }
-        if let Some(repetition_penalty) = params.repetition_penalty {
-            body["repetition_penalty"] = serde_json::json!(repetition_penalty);
-        }
-        if let Some(stop) = &params.stop {
-            body["stop"] = serde_json::json!(stop);
-        }
-        if let Some(seed) = params.seed {
-            body["seed"] = serde_json::json!(seed);
-        }
-        if let Some(response_format) = &params.response_format {
-            body["response_format"] = serde_json::json!(response_format);
-        }
-        if let Some(tools) = &params.tools {
-            body["tools"] = serde_json::json!(tools);
-        }
-        if let Some(tool_choice) = &params.tool_choice {
-            body["tool_choice"] = tool_choice.clone();
-        }
-        if let Some(provider) = &params.provider {
-            body["provider"] = serde_json::to_value(provider).unwrap_or_default();
-        }
-        if let Some(reasoning) = &params.reasoning {
-            body["reasoning"] = serde_json::to_value(reasoning).unwrap_or_default();
-        }
-        if let Some(extra) = &params.extra {
-            for (key, value) in extra {
-                body[key] = value.clone();
-            }
-        }
-
-        body
+    ) -> Result<serde_json::Value> {
+        generator
+            .provider
+            .build_request(&generator.model, messages, params, stream, include_usage)
     }
 
     /// Make a non-streaming completion request
@@ -155,31 +105,34 @@ impl LLMClient {
         messages: &[Message],
         params: &CompletionParameters,
     ) -> Result<CompletionResponse> {
-        self.complete_with_usage_tracking(generator, messages, params, false)
+        self.complete_with_usage_tracking(generator, messages, params, false, None)
             .await
     }
 
-    /// Make a non-streaming completion request with usage tracking option
+    /// Make a non-streaming completion request with usage tracking option.
+    ///
+    /// `timeout` overrides the pooled client's default timeout for this single
+    /// request, so callers needing a custom timeout reuse the shared connection
+    /// pool instead of building a throwaway client.
     pub async fn complete_with_usage_tracking(
         &self,
         generator: &GeneratorInfo,
         messages: &[Message],
         params: &CompletionParameters,
         include_usage: bool,
+        timeout: Option<Duration>,
     ) -> Result<CompletionResponse> {
         let url = generator.completions_url();
         let headers = self.build_headers(generator)?;
-        let body = self.build_body_with_usage(generator, messages, params, false, include_usage);
+        let body = self.build_body_with_usage(generator, messages, params, false, include_usage)?;
 
         tracing::debug!(url = %url, model = %generator.model, include_usage = %include_usage, "Making completion request");
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await?;
+        let mut request = self.client.post(&url).headers(headers).json(&body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        let response = request.send().await.map_err(map_send_error)?;
 
         let status = response.status();
         if !status.is_success() {
@@ -191,31 +144,22 @@ impl LLMClient {
             });
         }
 
-        let response_bytes = response.bytes().await.map_err(|e| {
-            tracing::error!("Failed to read LLM response body: {}", e);
-            MiniLLMError::Other(format!(
-                "Failed to read response body (possible timeout or connection drop): {}",
-                e
-            ))
-        })?;
+        // A read failure here is a transport error → MiniLLMError::Http via map_send_error.
+        let response_bytes = response.bytes().await.map_err(map_send_error)?;
 
         let raw: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|e| {
-            let preview = String::from_utf8_lossy(&response_bytes[..response_bytes.len().min(500)]);
+            let preview = preview_str(&String::from_utf8_lossy(&response_bytes));
             tracing::error!(
-                "Failed to parse LLM response as JSON: {}. Body preview: {}",
+                "Failed to parse LLM response as JSON: {}. Body: {}",
                 e,
                 preview
             );
-            MiniLLMError::Other(format!(
-                "Failed to parse LLM response as JSON: {}. Body starts with: {}",
-                e,
-                &preview[..preview.len().min(200)]
-            ))
+            MiniLLMError::MalformedResponse(format!("non-JSON body: {}", preview))
         })?;
 
         tracing::debug!("Received completion response");
 
-        parse_completion_response(raw)
+        generator.provider.parse_response(raw)
     }
 
     /// Make a streaming completion request
@@ -225,58 +169,53 @@ impl LLMClient {
         messages: &[Message],
         params: &CompletionParameters,
     ) -> Result<StreamingCompletion> {
-        self.complete_streaming_with_usage(generator, messages, params, false)
+        self.complete_streaming_with_usage(generator, messages, params, false, None)
             .await
     }
 
-    /// Make a streaming completion request with usage tracking option
+    /// Make a streaming completion request with usage tracking option.
+    ///
+    /// `timeout` is an **idle** timeout (max silence between SSE events), not a
+    /// total-duration cap: a long but live generation must not be killed, but a
+    /// dead connection that goes silent should fail loudly. It is enforced
+    /// per-event inside the stream, not via the request builder.
     pub async fn complete_streaming_with_usage(
         &self,
         generator: &GeneratorInfo,
         messages: &[Message],
         params: &CompletionParameters,
         include_usage: bool,
+        idle_timeout: Option<Duration>,
     ) -> Result<StreamingCompletion> {
         let url = generator.completions_url();
         let headers = self.build_headers(generator)?;
-        let body = self.build_body_with_usage(generator, messages, params, true, include_usage);
+        let body = self.build_body_with_usage(generator, messages, params, true, include_usage)?;
 
         tracing::debug!(url = %url, model = %generator.model, include_usage = %include_usage, "Starting streaming completion");
 
-        // Build the request builder (EventSource needs RequestBuilder, not Request)
+        // Note: deliberately NOT `.timeout()` on the request builder, which caps
+        // total duration, which wrongly kills long legitimate streams. The idle
+        // timeout is applied per-event by the stream task instead.
         let request_builder = self.client.post(&url).headers(headers).json(&body);
 
-        // Create EventSource from request builder
         let es = EventSource::new(request_builder)
             .map_err(|e| MiniLLMError::Stream(format!("Failed to create event source: {}", e)))?;
 
-        // Generate a unique ID for this stream
-        let id = uuid::Uuid::new_v4().to_string();
+        // Wait for a trailing usage chunk only if the PROVIDER will actually send
+        // one (not merely because the caller asked to track cost): a provider with
+        // no usage opt-in would otherwise wedge the stream until the idle timeout.
+        let expect_usage = generator.provider.emits_stream_usage(include_usage);
 
+        // The real generation id arrives on the SSE chunks (the provider's
+        // `gen-...`); the stream starts with an empty id and adopts the first one
+        // it sees, so out-of-band cost resolution targets the real generation.
         Ok(StreamingCompletion::from_event_source(
             es,
             generator.model.clone(),
-            id,
+            expect_usage,
+            idle_timeout,
+            generator.provider.clone(),
         ))
-    }
-
-    /// Make a completion request with optional streaming
-    pub async fn complete_with_options(
-        &self,
-        generator: &GeneratorInfo,
-        messages: &[Message],
-        params: &CompletionParameters,
-        stream: bool,
-    ) -> Result<CompletionResponse> {
-        if stream {
-            self.complete_streaming(generator, messages, params)
-                .await?
-                .collect()
-                .await
-        } else {
-            self.complete_with_usage_tracking(generator, messages, params, false)
-                .await
-        }
     }
 }
 
@@ -309,23 +248,90 @@ mod tests {
         let params = CompletionParameters::new()
             .with_temperature(0.5)
             .with_max_tokens(1024);
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
 
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["stream"], false);
         assert_eq!(body["temperature"], 0.5);
-        assert_eq!(body["max_tokens"], 1024);
+        // Default generator uses the modern max_completion_tokens key, not max_tokens.
+        assert_eq!(body["max_completion_tokens"], 1024);
+        assert!(body.get("max_tokens").is_none());
         assert!(body.get("usage").is_none());
     }
 
     #[test]
-    fn test_body_includes_usage_when_requested() {
+    fn test_body_legacy_token_field() {
+        use crate::provider::GenericProvider;
+        use std::sync::Arc;
         let client = LLMClient::new();
-        let gen = test_generator();
+        let gen = test_generator().with_provider(Arc::new(GenericProvider {
+            legacy_token_limit: true,
+        }));
+        let params = CompletionParameters::new().with_max_tokens(1024);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
+
+        // Legacy generator uses max_tokens and never emits max_completion_tokens.
+        assert_eq!(body["max_tokens"], 1024);
+        assert!(body.get("max_completion_tokens").is_none());
+    }
+
+    #[test]
+    fn test_body_includes_usage_when_requested() {
+        use crate::provider::OpenRouterProvider;
+        use std::sync::Arc;
+        let client = LLMClient::new();
+        // The usage opt-in is provider-specific; OpenRouter uses usage:{include:true}.
+        let gen = test_generator().with_provider(Arc::new(OpenRouterProvider));
         let params = CompletionParameters::new();
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, true);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, true)
+            .unwrap();
 
         assert_eq!(body["usage"]["include"], true);
+    }
+
+    #[test]
+    fn test_openai_streaming_usage_opt_in() {
+        use crate::provider::OpenAiProvider;
+        use std::sync::Arc;
+        let client = LLMClient::new();
+        let gen = test_generator().with_provider(Arc::new(OpenAiProvider));
+        let params = CompletionParameters::new();
+        // OpenAI opts into streaming usage via stream_options, only when streaming.
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, true, true)
+            .unwrap();
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        // Non-streaming: no opt-in needed (usage always present).
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, true)
+            .unwrap();
+        assert!(body.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn test_extra_param_collision_fails_loudly() {
+        let client = LLMClient::new();
+        let gen = test_generator();
+        // An `extra` key colliding with a typed param must error, not silently clobber.
+        let params = CompletionParameters::new().with_extra("temperature", serde_json::json!(2.0));
+        assert!(client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .is_err());
+        // ...and one colliding with a request-owned key.
+        let params = CompletionParameters::new().with_extra("model", serde_json::json!("x"));
+        assert!(client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .is_err());
+        // A genuinely-extra key is fine.
+        let params = CompletionParameters::new().with_extra("logit_bias", serde_json::json!({}));
+        assert!(client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .is_ok());
     }
 
     #[test]
@@ -342,17 +348,17 @@ mod tests {
             repetition_penalty: Some(1.2),
             stop: Some(vec!["END".to_string()]),
             seed: Some(42),
-            stream: None,
             response_format: None,
             tools: None,
             tool_choice: None,
-            provider: None,
             reasoning: None,
             extra: None,
         };
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
 
-        assert_eq!(body["max_tokens"], 512);
+        assert_eq!(body["max_completion_tokens"], 512);
         let temp = body["temperature"].as_f64().unwrap();
         assert!((temp - 0.9).abs() < 1e-6, "temperature: {}", temp);
         let top_p = body["top_p"].as_f64().unwrap();
@@ -376,8 +382,10 @@ mod tests {
         let client = LLMClient::new();
         let gen = test_generator();
         let params = CompletionParameters::new()
-            .with_provider(ProviderSettings::new().deny_data_collection());
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+            .with_openrouter_routing(ProviderSettings::new().deny_data_collection());
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
 
         assert_eq!(body["provider"]["data_collection"], "deny");
     }
@@ -386,13 +394,15 @@ mod tests {
     fn test_body_includes_provider_order_and_sort() {
         let client = LLMClient::new();
         let gen = test_generator();
-        let params = CompletionParameters::new().with_provider(
+        let params = CompletionParameters::new().with_openrouter_routing(
             ProviderSettings::new()
                 .with_order(vec!["Anthropic".to_string(), "OpenAI".to_string()])
                 .sort_by_latency()
                 .with_fallbacks(false),
         );
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
 
         assert_eq!(body["provider"]["order"][0], "Anthropic");
         assert_eq!(body["provider"]["order"][1], "OpenAI");
@@ -407,7 +417,9 @@ mod tests {
         let params = CompletionParameters::new()
             .with_extra("custom_field", serde_json::json!("custom_value"))
             .with_extra("custom_number", serde_json::json!(42));
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
 
         assert_eq!(body["custom_field"], "custom_value");
         assert_eq!(body["custom_number"], 42);
@@ -429,7 +441,9 @@ mod tests {
             tool_choice: Some(serde_json::json!("auto")),
             ..CompletionParameters::new()
         };
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
 
         assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(body["tool_choice"], "auto");
@@ -440,7 +454,9 @@ mod tests {
         let client = LLMClient::new();
         let gen = test_generator();
         let params = CompletionParameters::new().with_json_response();
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
 
         assert_eq!(body["response_format"]["type"], "json_object");
     }
@@ -459,18 +475,19 @@ mod tests {
             repetition_penalty: None,
             stop: None,
             seed: None,
-            stream: None,
             response_format: None,
             tools: None,
             tool_choice: None,
-            provider: None,
             reasoning: None,
             extra: None,
         };
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
 
         // Only model, messages, stream should be present
         assert!(body.get("max_tokens").is_none());
+        assert!(body.get("max_completion_tokens").is_none());
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
         assert!(body.get("top_k").is_none());
@@ -491,12 +508,14 @@ mod tests {
         let gen = test_generator();
         let params = CompletionParameters::new();
 
-        let body_no_stream =
-            client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body_no_stream = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
         assert_eq!(body_no_stream["stream"], false);
 
-        let body_stream =
-            client.build_body_with_usage(&gen, &test_messages(), &params, true, false);
+        let body_stream = client
+            .build_body_with_usage(&gen, &test_messages(), &params, true, false)
+            .unwrap();
         assert_eq!(body_stream["stream"], true);
     }
 
@@ -505,7 +524,9 @@ mod tests {
         let client = LLMClient::new();
         let gen = test_generator();
         let params = CompletionParameters::new();
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
+        let body = client
+            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
+            .unwrap();
 
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
@@ -515,18 +536,8 @@ mod tests {
         assert_eq!(messages[1]["content"], "Hello");
     }
 
-    #[test]
-    fn test_custom_timeout_creates_working_client() {
-        let client = LLMClient::with_timeout(Duration::from_secs(5));
-        let gen = test_generator();
-        let params = CompletionParameters::new();
-        // Verify the client can still build bodies (it's functional)
-        let body = client.build_body_with_usage(&gen, &test_messages(), &params, false, false);
-        assert_eq!(body["model"], "test-model");
-    }
-
     #[tokio::test]
-    async fn test_timeout_is_respected() {
+    async fn test_per_request_timeout_is_respected() {
         // Start a TCP listener that accepts but never responds
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -540,23 +551,102 @@ mod tests {
             }
         });
 
-        let client = LLMClient::with_timeout(Duration::from_secs(1));
-        let gen = GeneratorInfo::new("Test", &format!("http://{}", addr), "test-model")
+        // The pooled client has a 600s default; the per-request timeout overrides it.
+        let client = LLMClient::new();
+        let gen = GeneratorInfo::new("Test", format!("http://{}", addr), "test-model")
             .with_api_key("fake-key");
         let messages = vec![Message::user("Hello")];
         let params = CompletionParameters::new();
 
         let start = std::time::Instant::now();
-        let result = client.complete(&gen, &messages, &params).await;
+        let result = client
+            .complete_with_usage_tracking(
+                &gen,
+                &messages,
+                &params,
+                false,
+                Some(Duration::from_secs(1)),
+            )
+            .await;
         let elapsed = start.elapsed();
 
         // Should fail (timeout or connection error)
         assert!(result.is_err(), "Expected timeout error, got success");
-        // Should complete in roughly 1-3 seconds, not 120
+        // Should complete in roughly 1-3 seconds, not 600
         assert!(
             elapsed.as_secs() < 5,
             "Timeout took too long: {:?} (expected ~1s)",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn test_streaming_idle_timeout_fires_on_silence() {
+        // A server that accepts but never sends an SSE event must trip the idle
+        // timeout (max silence between chunks), not hang to the pool timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (_socket, _) = listener.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+
+        let client = LLMClient::new();
+        let gen = GeneratorInfo::new("Test", format!("http://{}", addr), "test-model")
+            .with_api_key("fake-key");
+        let messages = vec![Message::user("Hello")];
+        let params = CompletionParameters::new();
+
+        let mut stream = client
+            .complete_streaming_with_usage(
+                &gen,
+                &messages,
+                &params,
+                false,
+                Some(Duration::from_secs(1)),
+            )
+            .await
+            .expect("event source should be created");
+
+        let start = std::time::Instant::now();
+        // First chunk should be a loud error (timeout/connect), arriving fast.
+        let first = stream.next_chunk().await;
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(first, Some(Err(_))),
+            "expected a loud error on idle silence, got {:?}",
+            first.map(|r| r.map(|c| c.delta))
+        );
+        assert!(
+            elapsed.as_secs() < 5,
+            "idle timeout took too long: {:?} (expected ~1s)",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn attribution_headers_are_provider_specific() {
+        use crate::provider::{OpenAiProvider, OpenRouterProvider};
+        use std::sync::Arc;
+        let client = LLMClient::new();
+
+        // OpenRouter turns app attribution into HTTP-Referer / X-Title.
+        let gen = test_generator()
+            .with_provider(Arc::new(OpenRouterProvider))
+            .with_app_attribution("https://app.example", "MyApp");
+        let headers = client.build_headers(&gen).unwrap();
+        assert_eq!(headers.get("HTTP-Referer").unwrap(), "https://app.example");
+        assert_eq!(headers.get("X-Title").unwrap(), "MyApp");
+
+        // A non-OpenRouter provider injects NO attribution headers, even with an
+        // app identity set (attribution is provider-specific wire).
+        let gen = test_generator()
+            .with_provider(Arc::new(OpenAiProvider))
+            .with_app_attribution("https://app.example", "MyApp");
+        let headers = client.build_headers(&gen).unwrap();
+        assert!(headers.get("HTTP-Referer").is_none());
+        assert!(headers.get("X-Title").is_none());
     }
 }

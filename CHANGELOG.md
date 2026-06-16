@@ -5,6 +5,85 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-16
+
+A breaking release that generalizes the provider layer so one library API drives
+every provider identically, adds native Anthropic + Claude subscription support,
+provider-agnostic prompt caching, and honest per-provider cost accounting.
+
+### Added
+
+- **Provider trait owns the full wire dialect.** A `Provider` now owns the
+  endpoint, auth headers, request body, response envelope, streaming chunks, usage
+  parsing, and cost accounting. The rest of the crate deals only in normalized
+  types, so switching providers is a one-line change.
+  - Ships `OpenAiProvider`, `OpenRouterProvider`, `GenericProvider` (OpenAI-compatible
+    default for self-hosted servers, with a `legacy_token_limit` switch), and
+    `AnthropicProvider` (native `/v1/messages`, `content[]` envelope).
+  - A custom/enterprise API is a small hand-written `impl Provider`.
+- **`Auth` strategy on `GeneratorInfo`** (`ApiKey` / `BearerToken` / `None`), mapped
+  to concrete headers by the provider. New builders: `with_api_key`,
+  `with_api_key_from_env`, `with_bearer_token`, `with_bearer_token_from_env`,
+  `with_auth`, `with_provider`, `with_token_price`, `with_app_attribution`.
+- **Native Anthropic provider**: `GeneratorInfo::anthropic(model)` over
+  `/v1/messages` with `x-api-key` auth.
+- **Claude subscription**: `GeneratorInfo::claude_subscription(model)` uses a Pro/Max
+  OAuth token (env `ANTHROPIC_AUTH_TOKEN`, else the live Claude Code credential) so
+  usage draws on the subscription quota; cost is a token-count estimate via
+  `TokenPrice`. New `resolve_claude_subscription_auth()`.
+- **Provider-agnostic prompt caching.** Mark breakpoints on the tree
+  (`ChatNode::cache_breakpoint`, `clear_cache_breakpoint`, `clear_all_cache_breakpoints`),
+  or auto-mark the prefix per request (`NodeCompletionParameters::with_cache`).
+  Anthropic enforces `cache_control` (4-breakpoint cap); OpenAI/OpenRouter auto-cache.
+  `ChatNode::ensure_cached` warms the cache and returns its cost.
+- **Honest cost accounting.** `Usage` split into disjoint `uncached_input_tokens` /
+  `cache_read_tokens` / `cache_write_tokens` buckets; `TokenPrice` with distinct
+  cache read/write rates (`with_cache_rates`); `CostResolution`
+  (`Resolved` / `Unpriced` / `Unknown`) so a cost is never silently reported as a
+  fake `$0`. In-band streaming provider errors now surface loudly instead of
+  booking a phantom cost.
+- **Live integration tests** behind a `live` Cargo feature (off by default, so
+  `cargo test` is free and offline). Mock-server contract tests for the custom /
+  self-hosted provider path (OpenAI-compatible and a non-OpenAI wire).
+- **Documentation site**: an mdBook guide (`docs/src/`) deployed to GitHub Pages,
+  alongside the auto-generated API reference on docs.rs.
+
+### Changed
+
+- **BREAKING:** `ChatNode` is now a cheap, cloneable handle into a shared arena
+  (was `Arc<ChatNode>` with `Weak` parents). Methods take `&self`; holding any
+  handle keeps its tree alive.
+- **BREAKING:** `GeneratorInfo` replaces `api_key` / `organization_id` with the
+  `auth: Auth` field and a `provider`.
+- **BREAKING:** `CompletionParameters` is normalized intent, not a wire shape (no
+  longer (de)serialized directly); the `provider` and `stream` fields are gone
+  (OpenRouter routing now goes through `with_openrouter_routing`).
+- **BREAKING:** `NodeCompletionParameters` replaces `cost_tracking: CostTrackingType`
+  with `track_cost: bool` (+ `token_price`); `with_openrouter_cost_tracking()` is
+  removed in favor of `with_cost_tracking(true)`.
+- **BREAKING:** `CostInfo` replaces `cached_tokens` with `cache_read_tokens` /
+  `cache_write_tokens` and adds `resolution`.
+- **BREAKING:** `MediaData` uses an explicit `is_url` flag instead of a magic
+  `format == "url"` sentinel; `from_file` fails loudly when the format can't be
+  determined.
+- Streaming uses an idle timeout (max silence between chunks) rather than a total
+  deadline, so a long live generation isn't killed but a dead connection fails fast.
+
+### Removed
+
+- **BREAKING:** `CostTrackingType` enum, `LLMClient::with_timeout`,
+  `validate_json_response`, `configure_logging_with_filter`, and the
+  `MissingConfig` / `Url` / `NodeNotFound` / `Other` error variants.
+
+### Fixed
+
+- OpenAI/OpenRouter cache-write tokens are read from the correct field
+  (`prompt_tokens_details.cache_write_tokens`) and treated as additive (not
+  subtracted from `prompt_tokens`), fixing cost underestimation on cache-heavy
+  requests.
+- JSON repair: depth guard against stack overflow on pathological input, correct
+  duplicate-key collapsing, float-overflow handling, smart-quote delimiters.
+
 ## [0.3.0] - 2026-02-12
 
 ### Added
@@ -17,9 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `next_chunk()`, `collect_and_report()`, `accumulated()`, `is_finished()`
   - Drop impl spawns background cost query for cancelled streams
 - **Tracked completion methods on ChatNode**:
-  - `complete_tracked()` — non-streaming with enforced cost reporting
-  - `complete_streaming_tracked()` — returns a `TrackedStream`
-  - `complete_streaming_collect_tracked()` — streaming collect with cost reporting
+  - `complete_tracked()`: non-streaming with enforced cost reporting
+  - `complete_streaming_tracked()`: returns a `TrackedStream`
+  - `complete_streaming_collect_tracked()`: streaming collect with cost reporting
 - **OpenRouter generation cost fallback**: When usage data is missing (cancelled streams, some providers), queries OpenRouter's `/api/v1/generation` endpoint with retry backoff
 
 ### Changed

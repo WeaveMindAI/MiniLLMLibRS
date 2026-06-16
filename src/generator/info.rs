@@ -1,6 +1,11 @@
 //! Generator information - configuration for LLM providers
 
+use crate::provider::{
+    AnthropicProvider, AppIdentity, Auth, GenericProvider, OpenAiProvider, OpenRouterProvider,
+    Provider, TokenPrice,
+};
 use secrecy::SecretString;
+use std::sync::Arc;
 
 /// Configuration for an LLM provider/generator
 #[derive(Debug, Clone)]
@@ -14,11 +19,9 @@ pub struct GeneratorInfo {
     /// Model identifier (e.g., "anthropic/claude-3.5-sonnet")
     pub model: String,
 
-    /// API key (stored securely)
-    pub api_key: Option<SecretString>,
-
-    /// Optional organization ID
-    pub organization_id: Option<String>,
+    /// How this generator authenticates. The provider maps it to concrete headers
+    /// (OpenAI-wire `Authorization: Bearer`, Anthropic `x-api-key` or bearer).
+    pub auth: Auth,
 
     /// Custom headers to include in requests
     pub custom_headers: Vec<(String, String)>,
@@ -35,12 +38,27 @@ pub struct GeneratorInfo {
     /// Maximum context length (tokens)
     pub max_context_length: Option<usize>,
 
+    /// Provider implementation: the wire dialect (token-limit key, usage opt-in,
+    /// usage parsing, cost aggregation, out-of-band resolution, attribution
+    /// headers). Swap this to target a different provider.
+    pub provider: Arc<dyn Provider>,
+
+    /// Per-token price for this model, used to derive cost when the provider
+    /// returns token counts but no dollar amount (OpenAI, Anthropic, ...). When
+    /// `None` and the provider has no native cost, cost is reported `Unpriced`.
+    pub token_price: Option<TokenPrice>,
+
+    /// Calling-app identity for providers that attribute usage to an app (e.g.
+    /// OpenRouter rankings). The provider decides which headers express it.
+    pub app_attribution: Option<AppIdentity>,
+
     /// Default completion parameters for this generator
     pub default_params: super::CompletionParameters,
 }
 
 impl GeneratorInfo {
-    /// Create a new GeneratorInfo with minimal configuration
+    /// Create a new GeneratorInfo with minimal configuration (generic
+    /// OpenAI-compatible accounting; set `with_provider` for a specific provider).
     pub fn new(
         name: impl Into<String>,
         base_url: impl Into<String>,
@@ -50,28 +68,79 @@ impl GeneratorInfo {
             name: name.into(),
             base_url: base_url.into(),
             model: model.into(),
-            api_key: None,
-            organization_id: None,
+            auth: Auth::None,
             custom_headers: Vec::new(),
             supports_streaming: true,
             supports_vision: false,
             supports_audio: false,
             max_context_length: None,
+            provider: Arc::new(GenericProvider::default()),
+            token_price: None,
+            app_attribution: None,
             default_params: super::CompletionParameters::default(),
         }
     }
 
-    /// Set the API key
-    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
-        self.api_key = Some(SecretString::from(key.into()));
+    /// Set the calling-app identity for provider usage attribution.
+    pub fn with_app_attribution(
+        mut self,
+        url: impl Into<String>,
+        title: impl Into<String>,
+    ) -> Self {
+        self.app_attribution = Some(AppIdentity {
+            url: url.into(),
+            title: title.into(),
+        });
         self
     }
 
-    /// Set API key from environment variable
+    /// Set the provider implementation (wire dialect: token-limit key, usage
+    /// opt-in, usage parsing, cost aggregation, out-of-band resolution,
+    /// attribution headers).
+    pub fn with_provider(mut self, provider: Arc<dyn Provider>) -> Self {
+        self.provider = provider;
+        self
+    }
+
+    /// Set the per-token price (USD per million tokens) used to derive cost for
+    /// providers that return token counts but no dollar amount.
+    pub fn with_token_price(mut self, price: TokenPrice) -> Self {
+        self.token_price = Some(price);
+        self
+    }
+
+    /// Set the API key (provider-issued; the provider chooses the header).
+    pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
+        self.auth = Auth::ApiKey(SecretString::from(key.into()));
+        self
+    }
+
+    /// Set the API key from an environment variable (no-op if unset).
     pub fn with_api_key_from_env(mut self, env_var: &str) -> Self {
         if let Ok(key) = std::env::var(env_var) {
-            self.api_key = Some(SecretString::from(key));
+            self.auth = Auth::ApiKey(SecretString::from(key));
         }
+        self
+    }
+
+    /// Set an OAuth/bearer token (e.g. a Claude subscription token). Always sent
+    /// as `Authorization: Bearer <token>`.
+    pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
+        self.auth = Auth::BearerToken(SecretString::from(token.into()));
+        self
+    }
+
+    /// Set a bearer token from an environment variable (no-op if unset).
+    pub fn with_bearer_token_from_env(mut self, env_var: &str) -> Self {
+        if let Ok(token) = std::env::var(env_var) {
+            self.auth = Auth::BearerToken(SecretString::from(token));
+        }
+        self
+    }
+
+    /// Set the auth strategy directly.
+    pub fn with_auth(mut self, auth: Auth) -> Self {
+        self.auth = auth;
         self
     }
 
@@ -105,33 +174,70 @@ impl GeneratorInfo {
         self
     }
 
-    /// Get the full completions endpoint URL
+    /// Get the full completions endpoint URL (the provider owns the path suffix:
+    /// OpenAI-wire `/chat/completions`, Anthropic `/v1/messages`).
     pub fn completions_url(&self) -> String {
-        let base = self.base_url.trim_end_matches('/');
-        format!("{}/chat/completions", base)
+        self.provider.endpoint_url(&self.base_url)
     }
 }
 
 // Pre-configured generators for common providers
 impl GeneratorInfo {
-    /// Create an OpenRouter generator
+    /// Create an OpenRouter generator (native USD cost, `/generation` fallback).
+    ///
+    /// Attribution defaults to the library's identity; override it with
+    /// [`with_app_attribution`](Self::with_app_attribution) (or a
+    /// `CompletionContext`) to attribute usage to your app. The OpenRouter
+    /// provider turns the attribution into `HTTP-Referer`/`X-Title` headers.
     pub fn openrouter(model: impl Into<String>) -> Self {
         Self::new("OpenRouter", "https://openrouter.ai/api/v1", model)
+            .with_provider(Arc::new(OpenRouterProvider))
             .with_api_key_from_env("OPENROUTER_API_KEY")
-            .with_header("HTTP-Referer", "https://github.com/minillmlib")
-            .with_header("X-Title", "MiniLLMLib")
+            .with_app_attribution("https://github.com/minillmlib", "MiniLLMLib")
     }
 
-    /// Create an OpenAI generator
+    /// Create an OpenAI generator.
+    ///
+    /// OpenAI returns token counts but no dollar cost, so set a
+    /// [`with_token_price`](Self::with_token_price) to get a resolved cost;
+    /// otherwise cost tracking reports `Unpriced`.
     pub fn openai(model: impl Into<String>) -> Self {
         Self::new("OpenAI", "https://api.openai.com/v1", model)
+            .with_provider(Arc::new(OpenAiProvider))
             .with_api_key_from_env("OPENAI_API_KEY")
     }
 
-    /// Create an Anthropic generator (via OpenRouter format)
+    /// Create a native Anthropic generator (`/v1/messages`, `content[]` envelope,
+    /// `x-api-key` auth from `ANTHROPIC_API_KEY`).
+    ///
+    /// Anthropic returns token counts but no dollar cost, so set a
+    /// [`with_token_price`](Self::with_token_price) for a resolved cost; otherwise
+    /// cost tracking reports `Unpriced`.
     pub fn anthropic(model: impl Into<String>) -> Self {
-        Self::new("Anthropic", "https://api.anthropic.com/v1", model)
+        Self::new("Anthropic", "https://api.anthropic.com", model)
+            .with_provider(Arc::new(AnthropicProvider))
             .with_api_key_from_env("ANTHROPIC_API_KEY")
+    }
+
+    /// Create a Claude **subscription** generator: native Anthropic wire,
+    /// authenticated with a Claude Pro/Max OAuth bearer token so usage draws on
+    /// the **subscription's** rolling quota rather than pay-as-you-go API billing.
+    ///
+    /// The token is resolved by [`crate::resolve_claude_subscription_auth`]: the
+    /// `ANTHROPIC_AUTH_TOKEN` env var supersedes, otherwise the live Claude Code
+    /// credential at `~/.claude/.credentials.json` (which Claude Code keeps
+    /// refreshed) is used. NOTE: a Console/API OAuth token (e.g. from the `ant`
+    /// CLI) bills the API account, NOT the subscription; use an API key via
+    /// [`anthropic`](Self::anthropic) for Console, and this preset only for the
+    /// actual Pro/Max subscription token.
+    ///
+    /// Cost is an ESTIMATE: Anthropic returns only token counts, so set a
+    /// [`with_token_price`](Self::with_token_price) reflecting the model's
+    /// published price for a `Resolved` USD estimate; otherwise `Unpriced`.
+    pub fn claude_subscription(model: impl Into<String>) -> Self {
+        Self::new("Claude (subscription)", "https://api.anthropic.com", model)
+            .with_provider(Arc::new(AnthropicProvider))
+            .with_auth(crate::provider::resolve_claude_subscription_auth())
     }
 
     /// Create a custom URL-based generator

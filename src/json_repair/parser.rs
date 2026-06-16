@@ -31,8 +31,9 @@ impl Default for RepairOptions {
     }
 }
 
-/// String delimiters that can start a string
-pub const STRING_DELIMITERS: &[char] = &['"', '\'', '"', '"'];
+/// String delimiters that can start a string: straight double/single quotes
+/// plus the left/right smart double-quotes (U+201C/U+201D) that LLMs often emit.
+pub const STRING_DELIMITERS: &[char] = &['"', '\'', '\u{201C}', '\u{201D}'];
 
 /// Characters that can appear in a number
 pub const NUMBER_CHARS: &[char] = &[
@@ -45,7 +46,18 @@ pub struct JsonParser<'a> {
     pub index: usize,
     pub context: Context,
     pub options: &'a RepairOptions,
+    /// Current nesting depth, guarded against runaway recursion on malformed
+    /// input (see `MAX_DEPTH`). Incremented on entry to each recursive parse
+    /// method and decremented on exit.
+    depth: usize,
 }
+
+/// Maximum structural nesting depth. Untrusted LLM output (e.g. unterminated
+/// smart-quoted objects) can otherwise drive `parse_object`/`parse_array`/
+/// `parse_json` into unbounded mutual recursion and overflow the stack, which
+/// aborts the process. Past this depth we fail loudly with a ParseError instead.
+/// Real JSON nests far shallower than this.
+const MAX_DEPTH: usize = 512;
 
 impl<'a> JsonParser<'a> {
     pub fn new(json_str: &str, options: &'a RepairOptions) -> Self {
@@ -54,7 +66,27 @@ impl<'a> JsonParser<'a> {
             index: 0,
             context: Context::new(),
             options,
+            depth: 0,
         }
+    }
+
+    /// Enter one level of recursion, failing loudly if nesting runs away on
+    /// malformed input. Must be paired with [`exit_depth`](Self::exit_depth) (the
+    /// recursive parse methods do this via a thin wrapper so the decrement always
+    /// runs, even when the inner parse returns an error).
+    fn enter_depth(&mut self) -> Result<(), JsonRepairError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(JsonRepairError::ParseError(format!(
+                "Maximum nesting depth {} exceeded (malformed input)",
+                MAX_DEPTH
+            )));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn exit_depth(&mut self) {
+        self.depth -= 1;
     }
 
     /// Main parse entry point
@@ -187,22 +219,36 @@ impl<'a> JsonParser<'a> {
         self.chars.len() - self.index
     }
 
+    /// Recursively compare two values for *structural* sameness: matching types,
+    /// matching object keys (and recursively-equal values), matching array
+    /// lengths (and recursively-equal elements). Atomic values match on type
+    /// alone, not value. Ported faithfully from the reference ObjectComparer; used
+    /// by the multiple-JSON dedup to decide whether two top-level values are the
+    /// same shape.
     fn is_same_object(a: &JsonValue, b: &JsonValue) -> bool {
         match (a, b) {
             (JsonValue::Object(obj_a), JsonValue::Object(obj_b)) => {
-                if obj_a.is_empty() || obj_b.is_empty() {
-                    return false;
-                }
-                obj_a
-                    .iter()
-                    .all(|(k, _)| obj_b.iter().any(|(k2, _)| k == k2))
+                obj_a.len() == obj_b.len()
+                    && obj_a.iter().all(|(k, va)| {
+                        obj_b
+                            .iter()
+                            .find(|(k2, _)| k2 == k)
+                            .is_some_and(|(_, vb)| Self::is_same_object(va, vb))
+                    })
             }
             (JsonValue::Array(arr_a), JsonValue::Array(arr_b)) => {
-                if arr_a.is_empty() || arr_b.is_empty() {
-                    return false;
-                }
                 arr_a.len() == arr_b.len()
+                    && arr_a
+                        .iter()
+                        .zip(arr_b.iter())
+                        .all(|(va, vb)| Self::is_same_object(va, vb))
             }
+            // Atomic values: same type matches (Python compares type, not value).
+            (JsonValue::Null, JsonValue::Null) => true,
+            (JsonValue::Bool(_), JsonValue::Bool(_)) => true,
+            (JsonValue::Integer(_), JsonValue::Integer(_)) => true,
+            (JsonValue::Float(_), JsonValue::Float(_)) => true,
+            (JsonValue::String(_), JsonValue::String(_)) => true,
             _ => false,
         }
     }
@@ -277,6 +323,10 @@ impl<'a> JsonParser<'a> {
     pub fn parse_number(&mut self) -> Result<JsonValue, JsonRepairError> {
         let mut number_str = String::new();
         let is_array = self.context.current() == Some(ContextValue::Array);
+        // Capture the char index we started at so a rollback to "this was a
+        // string" is exact even when underscores were consumed (they advance
+        // the index but are not pushed to number_str).
+        let start_index = self.index;
 
         while let Some(c) = self.get_char_at(0) {
             if NUMBER_CHARS.contains(&c) && !(is_array && c == ',') {
@@ -299,8 +349,8 @@ impl<'a> JsonParser<'a> {
             number_str.pop();
             self.index -= 1;
         } else if self.get_char_at(0).is_some_and(|c| c.is_alphabetic()) {
-            // This was a string instead
-            self.index -= number_str.len();
+            // This was a string instead, so rewind to where the token began.
+            self.index = start_index;
             return self.parse_string();
         }
 
@@ -310,8 +360,14 @@ impl<'a> JsonParser<'a> {
         }
 
         if number_str.contains('.') || number_str.contains('e') || number_str.contains('E') {
+            // `parse::<f64>()` returns Ok(inf) on overflow (e.g. "1e400"), and
+            // `inf` is not valid JSON. Only accept a finite float; otherwise fall
+            // through and preserve the token losslessly as a string (mirroring the
+            // i64-overflow path below), so repaired output is always valid JSON.
             if let Ok(f) = number_str.parse::<f64>() {
-                return Ok(JsonValue::Float(f));
+                if f.is_finite() {
+                    return Ok(JsonValue::Float(f));
+                }
             }
         } else if let Ok(i) = number_str.parse::<i64>() {
             return Ok(JsonValue::Integer(i));
@@ -321,6 +377,16 @@ impl<'a> JsonParser<'a> {
     }
 
     pub fn parse_array(&mut self) -> Result<JsonValue, JsonRepairError> {
+        // Depth-guarded wrapper: parse_array <-> parse_object can mutually recurse
+        // without advancing the cursor on malformed input; bail loudly instead of
+        // overflowing the stack.
+        self.enter_depth()?;
+        let result = self.parse_array_inner();
+        self.exit_depth();
+        result
+    }
+
+    fn parse_array_inner(&mut self) -> Result<JsonValue, JsonRepairError> {
         let mut arr: Vec<JsonValue> = Vec::new();
         self.context.set(ContextValue::Array);
 
@@ -351,21 +417,6 @@ impl<'a> JsonParser<'a> {
                 || self.get_char_at(0) == Some(']')
                 || self.get_char_at(0) == Some(',')
             {
-                // Special case: if parse_object returned an array (due to duplicate key handling),
-                // flatten it into our array instead of nesting it
-                if let JsonValue::Array(inner) = &value {
-                    // Check if this looks like our special duplicate-key result:
-                    // [Object, Object] or [Object, Array] where the first element is an object
-                    if inner.len() == 2 {
-                        if let JsonValue::Object(_) = &inner[0] {
-                            // Flatten: add each element separately
-                            for elem in inner.clone() {
-                                arr.push(elem);
-                            }
-                            continue;
-                        }
-                    }
-                }
                 arr.push(value);
             } else {
                 self.index += 1;
@@ -394,7 +445,18 @@ impl<'a> JsonParser<'a> {
     }
 
     pub fn parse_object(&mut self) -> Result<JsonValue, JsonRepairError> {
+        self.enter_depth()?;
+        let result = self.parse_object_inner();
+        self.exit_depth();
+        result
+    }
+
+    fn parse_object_inner(&mut self) -> Result<JsonValue, JsonRepairError> {
+        // `obj` preserves insertion order; `seen` maps key -> its index in `obj`
+        // for O(1) duplicate detection (a per-key linear scan here is O(n^2) and a
+        // DoS on a large object). Both are kept in sync via `insert_kv`.
         let mut obj: Vec<(String, JsonValue)> = Vec::new();
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         let start_index = self.index;
 
         while self.get_char_at(0).unwrap_or('}') != '}' {
@@ -476,22 +538,24 @@ impl<'a> JsonParser<'a> {
                 }
             }
 
-            // Check for duplicate keys
-            if self.context.contains(ContextValue::Array) && obj.iter().any(|(k, _)| k == &key) {
+            // Duplicate key inside an array: this is a run of objects written
+            // without a separating `{`, e.g. `[{"a":1,"a":2}]`. Roll back to the
+            // key and splice a `{` into the input so the enclosing array's loop
+            // picks the duplicate up as the next sibling object, then finish this
+            // object. This mirrors the reference's input-mutation approach and
+            // keeps `parse_object` honestly returning an object (not an Array that
+            // a different function has to recognize and flatten, which collided
+            // with genuine nested arrays of objects).
+            if self.context.contains(ContextValue::Array) && seen.contains_key(&key) {
                 if self.options.strict {
                     return Err(JsonRepairError::ParseError(
                         "Duplicate key found".to_string(),
                     ));
                 }
-                // Roll back and parse remaining as new object
                 self.index = rollback_index;
+                self.chars.insert(self.index, '{');
                 self.context.reset();
-                let remaining = self.parse_object()?;
-
-                // Return an array containing the current object and the remaining object/array
-                let mut result = vec![JsonValue::Object(obj)];
-                result.push(remaining);
-                return Ok(JsonValue::Array(result));
+                return Ok(JsonValue::Object(obj));
             }
 
             self.skip_whitespaces();
@@ -526,7 +590,7 @@ impl<'a> JsonParser<'a> {
             };
 
             self.context.reset();
-            obj.push((key, value));
+            Self::insert_kv(&mut obj, &mut seen, key, value);
 
             // Skip comma or quote
             if matches!(self.get_char_at(0), Some(',') | Some('\'') | Some('"')) {
@@ -568,12 +632,30 @@ impl<'a> JsonParser<'a> {
         if !self.options.strict {
             if let Ok(JsonValue::Object(additional)) = self.parse_object() {
                 for (k, v) in additional {
-                    obj.push((k, v));
+                    Self::insert_kv(&mut obj, &mut seen, k, v);
                 }
             }
         }
 
         Ok(JsonValue::Object(obj))
+    }
+
+    /// Insert a key/value into an order-preserving object, collapsing duplicate
+    /// keys last-wins in O(1) via the `seen` key->index map. JSON objects are
+    /// maps, so a repeated key overwrites rather than appending an invalid dup.
+    fn insert_kv(
+        obj: &mut Vec<(String, JsonValue)>,
+        seen: &mut std::collections::HashMap<String, usize>,
+        key: String,
+        value: JsonValue,
+    ) {
+        match seen.get(&key) {
+            Some(&idx) => obj[idx].1 = value,
+            None => {
+                seen.insert(key.clone(), obj.len());
+                obj.push((key, value));
+            }
+        }
     }
 
     pub fn parse_string(&mut self) -> Result<JsonValue, JsonRepairError> {
@@ -592,9 +674,12 @@ impl<'a> JsonParser<'a> {
             return Ok(JsonValue::String(String::new()));
         };
 
-        // Determine delimiter and missing_quotes flag
+        // Determine delimiter and missing_quotes flag. Smart double-quotes pair
+        // left-with-right (“…”); a plain double-quote pairs with itself.
         let (lstring_delimiter, rstring_delimiter, missing_quotes) = if first_char == '\'' {
             ('\'', '\'', false)
+        } else if first_char == '\u{201C}' {
+            ('\u{201C}', '\u{201D}', false)
         } else if STRING_DELIMITERS.contains(&first_char) && first_char != '\'' {
             ('"', '"', false)
         } else if first_char.is_alphanumeric() {
@@ -610,6 +695,10 @@ impl<'a> JsonParser<'a> {
         } else {
             return Ok(JsonValue::String(String::new()));
         };
+
+        // Set when we detect a valid `""...""` opening, so the main loop can
+        // recognise the matching closing doubled quote later.
+        let mut doubled_quotes = false;
 
         if !missing_quotes {
             self.index += 1;
@@ -650,6 +739,7 @@ impl<'a> JsonParser<'a> {
                 if self.get_char_at(i as isize).is_some() {
                     if self.get_char_at((i + 1) as isize) == Some(rstring_delimiter) {
                         // Valid doubled quotes pattern
+                        doubled_quotes = true;
                         self.index += 1;
                     } else {
                         // Check what follows
@@ -676,7 +766,6 @@ impl<'a> JsonParser<'a> {
         // Main string accumulation loop
         let mut string_acc = String::new();
         let mut unmatched_delimiter = false;
-        let doubled_quotes = false;
 
         while let Some(char) = self.get_char_at(0) {
             if char == rstring_delimiter {

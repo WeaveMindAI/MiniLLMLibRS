@@ -1182,3 +1182,149 @@ fn test_parse_object_with_return_objects() {
         ])
     );
 }
+
+// =============================================================================
+// Regression tests for Rust-port bugs found during review
+// =============================================================================
+
+#[test]
+fn smart_quotes_are_treated_as_delimiters() {
+    // STRING_DELIMITERS must include U+201C/U+201D, not duplicate plain quotes.
+    // The smart quotes should be stripped, not leak into the string content.
+    assert_eq!(
+        repair("{\u{201C}key\u{201D}: \u{201C}value\u{201D}}"),
+        r#"{"key": "value"}"#
+    );
+}
+
+#[test]
+fn distinct_objects_are_not_deduped() {
+    // The shallow is_same_object dropped the first object; the recursive deep
+    // compare keeps both distinct values.
+    assert_eq!(
+        load(r#"{"a": 1}{"a": "x"}"#),
+        JsonValue::Array(vec![
+            JsonValue::Object(vec![("a".to_string(), JsonValue::Integer(1))]),
+            JsonValue::Object(vec![("a".to_string(), JsonValue::String("x".to_string()))]),
+        ])
+    );
+}
+
+#[test]
+fn distinct_arrays_are_not_deduped() {
+    assert_eq!(
+        load(r#"[1, 2]["a", "b"]"#),
+        JsonValue::Array(vec![
+            JsonValue::Array(vec![JsonValue::Integer(1), JsonValue::Integer(2)]),
+            JsonValue::Array(vec![
+                JsonValue::String("a".to_string()),
+                JsonValue::String("b".to_string()),
+            ]),
+        ])
+    );
+}
+
+#[test]
+fn number_with_underscore_then_alpha_rolls_back_exactly() {
+    // The rollback to "this was a string" must rewind past consumed underscores;
+    // otherwise leading characters are lost.
+    assert_eq!(
+        load(r#"{"k": 1_2x}"#),
+        JsonValue::Object(vec![(
+            "k".to_string(),
+            JsonValue::String("1_2x".to_string())
+        )])
+    );
+}
+
+#[test]
+fn empty_string_input_returns_empty_not_quoted() {
+    // The empty-string special case applies on both the serde-success and repair
+    // paths now that they converge.
+    assert_eq!(repair(r#""""#), "");
+}
+
+#[test]
+fn malformed_smart_quote_object_does_not_overflow_stack() {
+    // Unterminated left-smart-quote object used to drive parse_object<->parse_array
+    // into unbounded mutual recursion and abort the process. Must now fail loudly.
+    let input = "{\u{201C}key\u{201C}: \u{201C}value\u{201C}";
+    let result = repair_json(input, &RepairOptions::default());
+    assert!(
+        result.is_err(),
+        "expected a loud ParseError, got {:?}",
+        result
+    );
+}
+
+#[test]
+fn deeply_nested_input_fails_loudly_not_via_overflow() {
+    // A pathological nesting depth must error, never overflow the stack.
+    let input = "[".repeat(100_000);
+    assert!(repair_json(&input, &RepairOptions::default()).is_err());
+}
+
+#[test]
+fn duplicate_keys_collapse_last_wins_in_any_object() {
+    // Top-level object (skip_json_loads so the repair parser runs).
+    assert_eq!(repair_skip(r#"{"a":1,"a":2,"a":3}"#), r#"{"a": 3}"#);
+    // Nested object value.
+    assert_eq!(
+        repair_skip(r#"{"outer": {"a":1,"a":2}}"#),
+        r#"{"outer": {"a": 2}}"#
+    );
+    // Distinct keys are untouched.
+    assert_eq!(repair_skip(r#"{"a":1,"b":2}"#), r#"{"a": 1, "b": 2}"#);
+}
+
+#[test]
+fn three_plus_duplicate_keys_in_array_flatten_not_nest() {
+    // 3+ duplicate keys in an in-array object must yield a flat array of objects,
+    // not a nested binary tree.
+    assert_eq!(
+        repair_skip(r#"[{"a":1,"a":2,"a":3}]"#),
+        r#"[{"a": 1}, {"a": 2}, {"a": 3}]"#
+    );
+}
+
+#[test]
+fn overflowing_float_is_preserved_as_string_not_invalid_inf() {
+    // f64-overflowing numbers must NOT serialize as `inf` (invalid JSON); they are
+    // kept losslessly as strings so repaired output always re-parses.
+    for input in [r#"{"k": 1e400}"#, r#"[1e400]"#, r#"{"k": -1e400}"#] {
+        let out = repair_skip(input);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+            "repaired output must be valid JSON: {} -> {}",
+            input,
+            out
+        );
+        assert!(!out.contains("inf"), "must not emit inf: {}", out);
+    }
+}
+
+#[test]
+fn large_finite_float_serializes_as_valid_json() {
+    // f64::MAX is finite, so it's kept as a Float; it must serialize via serde's
+    // number formatter (scientific notation), not a 309-digit token serde rejects.
+    let out = repair_skip(r#"{"k": 1.7976931348623157e308}"#);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+        "large finite float must round-trip as valid JSON: {}",
+        out
+    );
+}
+
+#[test]
+fn genuine_nested_array_of_objects_is_not_flattened() {
+    // A real list-of-lists-of-objects must keep its nesting (the dup-split no
+    // longer overloads Array as a flatten signal).
+    assert_eq!(
+        repair_skip(r#"[[{"a":1},{"b":2}],[{"c":3}]]"#),
+        r#"[[{"a": 1}, {"b": 2}], [{"c": 3}]]"#
+    );
+    assert_eq!(
+        repair_skip(r#"[[{"a":1},{"b":2}]]"#),
+        r#"[[{"a": 1}, {"b": 2}]]"#
+    );
+}

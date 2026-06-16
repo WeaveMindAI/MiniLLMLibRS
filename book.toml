@@ -1,0 +1,15 @@
+[book]
+title = "MiniLLMLib (Rust)"
+description = "A minimalist, async-first Rust library for multi-provider LLM interaction"
+authors = ["Quentin Feuillade--Montixi"]
+language = "en"
+src = "docs/src"
+
+[output.html]
+default-theme = "rust"
+git-repository-url = "https://github.com/qfeuilla/MiniLLMLibRS"
+edit-url-template = "https://github.com/qfeuilla/MiniLLMLibRS/edit/main/{path}"
+
+[output.html.fold]
+enable = true
+level = 1

@@ -1,6 +1,6 @@
 //! JSON utility functions
 
-use crate::error::{MiniLLMError, Result};
+use crate::error::Result;
 use crate::json_repair::{repair_json, RepairOptions};
 
 /// Extract and repair JSON from an LLM completion string
@@ -35,45 +35,6 @@ pub fn to_dict<T: serde::Serialize>(value: &T) -> Result<serde_json::Value> {
 pub fn pretty_json<T: serde::Serialize>(value: &T) -> Result<String> {
     let json = serde_json::to_string_pretty(value)?;
     Ok(json)
-}
-
-/// Validate and extract content from an API JSON response
-///
-/// This validates that the response has the expected structure:
-/// - `choices` array exists
-/// - First choice has `message.content`
-///
-/// Returns the content string or an error with details.
-pub fn validate_json_response(response: &serde_json::Value) -> Result<String> {
-    let choices = response.get("choices").ok_or_else(|| {
-        MiniLLMError::Other(format!("Missing 'choices' key in response: {}", response))
-    })?;
-
-    let choices_arr = choices
-        .as_array()
-        .ok_or_else(|| MiniLLMError::Other(format!("'choices' must be an array: {}", response)))?;
-
-    if choices_arr.is_empty() {
-        return Err(MiniLLMError::Other(format!(
-            "'choices' array is empty: {}",
-            response
-        )));
-    }
-
-    let first_choice = &choices_arr[0];
-
-    let message = first_choice.get("message").ok_or_else(|| {
-        MiniLLMError::Other(format!("Missing 'message' in first choice: {}", response))
-    })?;
-
-    let content = message.get("content").ok_or_else(|| {
-        MiniLLMError::Other(format!("Missing 'content' in message: {}", response))
-    })?;
-
-    content
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| MiniLLMError::Other(format!("'content' is not a string: {}", content)))
 }
 
 #[cfg(test)]

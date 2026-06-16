@@ -1,18 +1,23 @@
 //! Video data handling
 
 use super::media::MediaData;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Video data for multimodal messages
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoData {
-    /// Base64-encoded video data
+    /// Base64-encoded video data, OR the URL verbatim when [`is_url`](Self::is_url).
     pub base64_data: String,
 
-    /// Video format (e.g., "mp4", "webm", "mov")
+    /// Video format/codec (e.g., "mp4", "webm", "mov"). Empty for a URL reference.
     pub format: String,
+
+    /// Whether `base64_data` holds a remote URL rather than inline base64. Explicit
+    /// flag, NOT a magic `format == "url"` value, so no caller-supplied format
+    /// string can turn inline bytes into a counterfeit URL.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_url: bool,
 
     /// Duration in seconds (if known)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -36,31 +41,32 @@ impl MediaData for VideoData {
         &self.base64_data
     }
 
-    fn format_id(&self) -> &str {
-        &self.format
-    }
-
     fn mime_type(&self) -> String {
         match self.format.as_str() {
-            "mp4" => "video/mp4",
-            "webm" => "video/webm",
-            "mov" => "video/quicktime",
-            "avi" => "video/x-msvideo",
-            "mkv" => "video/x-matroska",
-            "flv" => "video/x-flv",
-            "wmv" => "video/x-ms-wmv",
-            "m4v" => "video/x-m4v",
-            "3gp" => "video/3gpp",
-            "ogv" => "video/ogg",
-            _ => "video/mp4",
+            "mp4" => "video/mp4".to_string(),
+            "webm" => "video/webm".to_string(),
+            "mov" => "video/quicktime".to_string(),
+            "avi" => "video/x-msvideo".to_string(),
+            "mkv" => "video/x-matroska".to_string(),
+            "flv" => "video/x-flv".to_string(),
+            "wmv" => "video/x-ms-wmv".to_string(),
+            "m4v" => "video/x-m4v".to_string(),
+            "3gp" => "video/3gpp".to_string(),
+            "ogv" => "video/ogg".to_string(),
+            // Unknown: derive from the format rather than mislabeling it as mp4.
+            other => format!("video/{}", other),
         }
-        .to_string()
+    }
+
+    fn is_url(&self) -> bool {
+        self.is_url
     }
 
     fn from_base64(base64_data: impl Into<String>, format: impl Into<String>) -> Self {
         Self {
             base64_data: base64_data.into(),
             format: format.into(),
+            is_url: false,
             duration_secs: None,
             width: None,
             height: None,
@@ -68,40 +74,25 @@ impl MediaData for VideoData {
         }
     }
 
-    fn guess_format(path: &Path) -> String {
+    fn guess_format(path: &Path) -> Option<String> {
+        // Real extension only; no extension → `None` so `from_file` fails loudly
+        // rather than fabricating a codec (e.g. "mp4") for arbitrary bytes.
         path.extension()
             .and_then(|e| e.to_str())
-            .unwrap_or("mp4")
-            .to_lowercase()
+            .map(|e| e.to_lowercase())
     }
 }
 
+// Shared inherent forwarders generated once for every media type.
+crate::impl_media_forwarders!(VideoData, format);
+
 impl VideoData {
-    /// Create VideoData from base64 string
-    pub fn from_base64(base64_data: impl Into<String>, format: impl Into<String>) -> Self {
-        <Self as MediaData>::from_base64(base64_data, format)
-    }
-
-    /// Create VideoData from raw bytes
-    pub fn from_bytes(bytes: &[u8], format: impl Into<String>) -> Self {
-        <Self as MediaData>::from_bytes(bytes, format)
-    }
-
-    /// Load VideoData from a file path
-    pub fn from_file(path: impl AsRef<Path>) -> crate::error::Result<Self> {
-        <Self as MediaData>::from_file(path)
-    }
-
-    /// Load VideoData from a file path (async)
-    pub async fn from_file_async(path: impl AsRef<Path> + Send) -> crate::error::Result<Self> {
-        <Self as MediaData>::from_file_async(path).await
-    }
-
     /// Create VideoData from a URL (the URL will be used directly)
     pub fn from_url(url: impl Into<String>) -> Self {
         Self {
             base64_data: url.into(),
-            format: "url".to_string(),
+            format: String::new(),
+            is_url: true,
             duration_secs: None,
             width: None,
             height: None,
@@ -126,24 +117,5 @@ impl VideoData {
     pub fn with_frame_rate(mut self, frame_rate: f32) -> Self {
         self.frame_rate = Some(frame_rate);
         self
-    }
-
-    /// Decode the base64 data to bytes
-    pub fn to_bytes(&self) -> crate::error::Result<Vec<u8>> {
-        Ok(BASE64.decode(&self.base64_data)?)
-    }
-
-    /// Get MIME type for this video format
-    pub fn mime_type(&self) -> String {
-        <Self as MediaData>::mime_type(self)
-    }
-
-    /// Convert to data URL format for API
-    pub fn to_data_url(&self) -> String {
-        if self.format == "url" {
-            self.base64_data.clone()
-        } else {
-            format!("data:{};base64,{}", self.mime_type(), self.base64_data)
-        }
     }
 }

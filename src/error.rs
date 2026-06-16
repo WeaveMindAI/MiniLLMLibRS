@@ -21,10 +21,6 @@ pub enum MiniLLMError {
     #[error("API error ({status}): {message}")]
     Api { status: u16, message: String },
 
-    /// Missing required configuration
-    #[error("Missing configuration: {0}")]
-    MissingConfig(String),
-
     /// Invalid parameter
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
@@ -41,21 +37,32 @@ pub enum MiniLLMError {
     #[error("Base64 error: {0}")]
     Base64(#[from] base64::DecodeError),
 
-    /// URL parsing error
-    #[error("URL error: {0}")]
-    Url(#[from] url::ParseError),
-
     /// Timeout error
     #[error("Request timed out")]
     Timeout,
 
-    /// Node not found in conversation tree
-    #[error("Node not found: {0}")]
-    NodeNotFound(String),
+    /// The model returned an empty response (when crash_on_empty_response is set)
+    #[error("Model returned an empty response")]
+    EmptyResponse,
 
-    /// Generic error with message
-    #[error("{0}")]
-    Other(String),
+    /// The model returned no usable JSON (when crash_on_refusal is set).
+    /// Carries the raw response content for diagnosis.
+    #[error("Model returned no usable JSON: {0}")]
+    NoJsonFound(String),
+
+    /// The API returned a 2xx body that is not a well-formed completion
+    /// (no choices/message and no error object). Carries a diagnostic preview.
+    #[error("Malformed completion response: {0}")]
+    MalformedResponse(String),
+
+    /// All retry attempts were exhausted without a successful completion.
+    /// Carries the last underlying error.
+    #[error("Max retries exceeded: {0}")]
+    MaxRetriesExceeded(Box<MiniLLMError>),
+
+    /// A thread had no messages to load.
+    #[error("Thread has no messages")]
+    EmptyThread,
 }
 
 /// Result type alias for MiniLLMLib operations

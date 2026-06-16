@@ -47,21 +47,3 @@ pub fn configure_logging(level: LogLevel) {
         .try_init()
         .ok(); // Ignore error if already initialized
 }
-
-/// Configure logging with a custom filter string
-///
-/// # Example
-/// ```no_run
-/// use minillmlib::utils::logging::configure_logging_with_filter;
-///
-/// configure_logging_with_filter("minillmlib=debug,reqwest=warn");
-/// ```
-pub fn configure_logging_with_filter(filter: &str) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter));
-
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_target(true).with_level(true))
-        .with(filter)
-        .try_init()
-        .ok();
-}
