@@ -7,6 +7,11 @@ A minimalist, async-first Rust library for LLM interactions with streaming suppo
 [![CI](https://github.com/WeaveMindAI/MiniLLMLibRS/actions/workflows/ci.yml/badge.svg)](https://github.com/WeaveMindAI/MiniLLMLibRS/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+## Documentation
+
+- **Guide** (tutorials, patterns, custom providers): <https://weavemindai.github.io/MiniLLMLibRS/>
+- **API reference** (every type and method): <https://docs.rs/minillmlib>
+
 ## Features
 
 - **Async-first**: Built on Tokio for high-performance async operations
