@@ -155,10 +155,9 @@ Notes:
 
 - **The fragments are JSON source text, not your payload.** For a tool whose
   input is one string field (like `code` above), the bytes arrive escaped and
-  wrapped in the object syntax (`{"code": "print(\"hi` ...). To feed a tool the
-  clean payload as it streams, put an incremental extractor between the
-  fragment and the tool's stdin: lock onto the field, un-escape the string
-  content as it grows.
+  wrapped in the object syntax (`{"code": "print(\"hi` ...). Put a
+  `PayloadExtractor` between the fragments and the tool to stream the DECODED
+  payload instead (see the next section).
 - **Parallel calls**: `delta.index` disambiguates concurrent calls; key your
   spawned tools by it. Forcing a single call with `ToolChoice::Tool(..)` (and
   `.with_parallel_tool_calls(false)`) sidesteps this.
@@ -173,6 +172,50 @@ buffered tool, forwarding all prose live), see
 ends the model's turn**; "the model continues after the tool" is always a new
 API request that your loop makes after `add_tool_result`, and the consumer of
 your stream never sees the seams.
+
+## Streaming the decoded payload (`PayloadExtractor`)
+
+For the "one big string argument" pattern (`{"content": "<entire code file>"}`),
+`PayloadExtractor` turns the raw argument fragments into the payload's DECODED
+text, live: `\n` becomes a real newline, `\"` a quote, `\uXXXX` the character.
+The consumer receives the text exactly as the model meant it (type code into an
+editor in real time, pipe into a process's stdin), with fragments split at any
+position, mid-escape included.
+
+```rust,no_run
+use minillmlib::PayloadExtractor;
+
+# fn run() -> minillmlib::Result<()> {
+let mut extractor = PayloadExtractor::strict("content");
+
+// Inside the streaming loop, for the matching call's fragments:
+# let fragment = r#"{"content": "line1\nline2"}"#;
+let decoded = extractor.feed(fragment)?;   // plain text, escapes undone
+print!("{decoded}");                        // → editor / tool stdin
+
+// When the provider signals the call's end (the fragments stop):
+let tail = extractor.finish()?;             // validates + flushes holdback
+print!("{tail}");
+# Ok(()) }
+```
+
+Two modes:
+
+- **`strict(field)`** (default choice): the arguments must be well-formed JSON;
+  a bad escape, unescaped control character, or unterminated string/object
+  fails loudly with the raw text in the error.
+- **`lenient(field)`**: for models sloppy at escaping. Because the payload is
+  the object's only (therefore last) field, its TRUE closing quote is the one
+  at the very end of the arguments, and the provider signals that end
+  explicitly, which makes leniency deterministic: an unescaped `"` that is not
+  at the true end is literal content, a raw newline is itself, `\` before a
+  non-escape character is a literal backslash, and a model that just stops
+  (forgot the closing `"` or `}`) still yields the full payload. Payload is
+  never silently dropped.
+
+Constraints: the payload field must be the object's last field (any other
+fields must precede it; they are skipped as normal JSON), and its value must be
+a string. `examples/agent_loop.rs` uses it for its streaming tool.
 
 ## Custom wire shapes
 

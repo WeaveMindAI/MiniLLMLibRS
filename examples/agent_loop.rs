@@ -15,7 +15,8 @@
 //! (makes real, billed API calls).
 
 use minillmlib::{
-    ChatNode, CompletionParameters, GeneratorInfo, NodeCompletionParameters, ToolDefinition,
+    ChatNode, CompletionParameters, GeneratorInfo, NodeCompletionParameters, PayloadExtractor,
+    ToolDefinition,
 };
 use std::collections::HashMap;
 use std::io::Write;
@@ -25,40 +26,50 @@ const MODEL: &str = "google/gemini-2.5-flash-lite";
 /// Hard cap on model turns so a tool-happy model can't loop forever.
 const MAX_TURNS: usize = 8;
 
-/// The streaming tool: starts on the first fragment, consumes argument bytes
-/// as the model generates them. A real one would pipe into a process's stdin
-/// (after an incremental JSON-string extractor); this one just shows the bytes
-/// arriving live.
-#[derive(Default)]
+/// The streaming tool: starts on the first fragment, consumes the payload as
+/// the model generates it. A `PayloadExtractor` turns the raw JSON fragments
+/// into the DECODED `content` string live (escapes undone), so what a real
+/// tool would receive on stdin is exactly the text the model meant. Lenient
+/// mode tolerates a model that is sloppy with escaping or forgets to close
+/// the JSON.
 struct DraftNotesSession {
     /// The call id from the first fragment, used to match this session back to
     /// the assembled `ToolCall` after the turn ends.
     call_id: String,
-    raw_json: String,
+    extractor: PayloadExtractor,
+    decoded_len: usize,
 }
 
 impl DraftNotesSession {
     fn start(call_id: &str) -> Self {
-        println!("\n[draft_notes {call_id}] started, receiving argument bytes live:");
+        println!("\n[draft_notes {call_id}] started, receiving decoded payload live:");
         Self {
             call_id: call_id.to_string(),
-            raw_json: String::new(),
+            extractor: PayloadExtractor::lenient("content"),
+            decoded_len: 0,
         }
     }
 
-    fn feed(&mut self, fragment: &str) {
-        // NOTE: fragments are raw JSON source ({"content": "escaped text...),
-        // shown verbatim here to make the streaming visible.
-        print!("{fragment}");
+    fn feed(&mut self, fragment: &str) -> minillmlib::Result<()> {
+        // Decoded payload text, live: \n is a real newline, \" a quote.
+        let text = self.extractor.feed(fragment)?;
+        print!("{text}");
         std::io::stdout().flush().ok();
-        self.raw_json.push_str(fragment);
+        self.decoded_len += text.len();
+        Ok(())
     }
 
-    fn finish(self) -> String {
+    fn finish(mut self) -> String {
+        match self.extractor.finish() {
+            Ok(tail) => {
+                self.decoded_len += tail.len();
+                print!("{tail}");
+            }
+            Err(e) => eprintln!("\n[draft_notes {}] malformed call: {e}", self.call_id),
+        }
         println!(
-            "\n[draft_notes {}] done ({} bytes streamed)",
-            self.call_id,
-            self.raw_json.len()
+            "\n[draft_notes {}] done ({} decoded bytes streamed)",
+            self.call_id, self.decoded_len
         );
         "notes saved".to_string()
     }
@@ -137,7 +148,7 @@ async fn main() -> minillmlib::Result<()> {
                 }
                 if let Some(frag) = &delta.arguments_fragment {
                     if let Some(session) = streaming.get_mut(&delta.index) {
-                        session.feed(frag);
+                        session.feed(frag)?;
                     }
                 }
             }

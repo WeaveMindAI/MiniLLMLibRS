@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-07-07
+
+### Added
+
+- **`PayloadExtractor`: live decoded extraction of a single-string tool
+  argument.** For the `{"content": "<big payload>"}` pattern, it turns the
+  streaming argument fragments into the payload's decoded text as the model
+  generates it (JSON escapes undone), fed fragments split at arbitrary
+  positions (mid-escape included). Strict mode fails loudly on malformed
+  input; opt-in lenient mode deterministically tolerates sloppy escaping
+  (an unescaped `"` not at the true end is literal, raw newlines are
+  themselves, `\` before a non-escape is a literal backslash, a stream that
+  just stops still yields the full payload). Used by
+  `examples/agent_loop.rs`; documented in the Tool Calling guide chapter.
+
 ## [0.4.2] - 2026-07-07
 
 ### Added

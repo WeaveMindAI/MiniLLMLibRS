@@ -16,6 +16,10 @@
 //! into [`ToolCall`] (complete calls) and [`ToolCallDelta`] (streaming
 //! fragments), which [`ToolCallAccumulator`] assembles.
 
+mod payload;
+
+pub use payload::PayloadExtractor;
+
 use crate::error::{MiniLLMError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
