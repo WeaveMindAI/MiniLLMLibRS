@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version ranges changed; the manifest floors stay loose for downstream
   compatibility. `reqwest` is held at 0.12 (its 0.13 line has no compatible
   `reqwest-eventsource` release yet).
+- **MSRV raised to 1.86** (was 1.83). The refreshed graph pulls `indexmap`
+  2.14 (edition 2024, needs 1.85) and the `icu_*` crates 2.2 (need 1.86), so
+  building on the latest transitive versions requires 1.86. Holding those
+  crates back to keep an older MSRV would reintroduce the stale-pin problem
+  the dep refresh was meant to remove.
 
 ## [0.4.5] - 2026-07-07
 
