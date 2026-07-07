@@ -214,8 +214,23 @@ Two modes:
   never silently dropped.
 
 Constraints: the payload field must be the object's last field (any other
-fields must precede it; they are skipped as normal JSON), and its value must be
-a string. `examples/agent_loop.rs` uses it for its streaming tool.
+fields must precede it), and its value must be a string.
+`examples/agent_loop.rs` uses it for its streaming tool.
+
+Leading fields are parsed as normal JSON and exposed via
+`leading_fields()`, each appearing as soon as its value completes on the
+wire, so for a `patch(path, content)` tool the `path` is available before the
+payload streams (open the edit session first, then type into it):
+
+```rust,no_run
+# use minillmlib::PayloadExtractor;
+# fn run() -> minillmlib::Result<()> {
+let mut extractor = PayloadExtractor::strict("content");
+extractor.feed(r#"{"path": "src/lib.rs", "content": "fn m"#)?;
+assert!(extractor.payload_started()); // leading fields now final
+assert_eq!(extractor.leading_fields()["path"], "src/lib.rs");
+# Ok(()) }
+```
 
 ## Custom wire shapes
 

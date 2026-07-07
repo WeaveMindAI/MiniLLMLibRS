@@ -20,10 +20,16 @@
 //!   is a literal backslash, and a stream that just stops (the model forgot to
 //!   close the string or the object) still yields the full payload.
 //!
-//! Non-goals: general streaming JSON repair, multi-string payloads (fields
-//! other than the payload string must PRECEDE it and are skipped as normal
-//! JSON), provider-specific code (this works on the normalized fragment
-//! stream from [`ToolCallDelta`](super::ToolCallDelta)).
+//! Fields other than the payload string must PRECEDE it; they are parsed as
+//! normal JSON and exposed via
+//! [`leading_fields`](PayloadExtractor::leading_fields) (e.g. a
+//! `patch(path, content)` tool: `path` is available before the `content`
+//! payload starts streaming, so a consumer can open the right edit session
+//! first).
+//!
+//! Non-goals: general streaming JSON repair, multi-string payloads, and
+//! provider-specific code (this works on the normalized fragment stream from
+//! [`ToolCallDelta`](super::ToolCallDelta)).
 
 use crate::error::{MiniLLMError, Result};
 
@@ -52,6 +58,12 @@ pub struct PayloadExtractor {
     esc: Esc,
     /// Everything fed so far, verbatim, for loud errors.
     raw: String,
+    /// The key currently being read/valued in the prelude.
+    current_key: String,
+    /// Raw text of the leading value currently being captured.
+    value_buf: String,
+    /// Leading (non-payload) fields, parsed as they complete on the wire.
+    leading: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -138,7 +150,29 @@ impl PayloadExtractor {
             state: State::Prelude(Prelude::BeforeBrace),
             esc: Esc::default(),
             raw: String::new(),
+            current_key: String::new(),
+            value_buf: String::new(),
+            leading: serde_json::Map::new(),
         }
+    }
+
+    /// The leading (non-payload) fields parsed so far, e.g. the `path` of a
+    /// `patch(path, content)` tool. Each field appears as soon as its value
+    /// completes on the wire; the set is FINAL once
+    /// [`payload_started`](Self::payload_started) is true (the payload is the
+    /// last field). Leading values must be well-formed JSON in both modes
+    /// (leniency covers only the payload string's body).
+    pub fn leading_fields(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.leading
+    }
+
+    /// Whether the payload string's body has started streaming. Once true,
+    /// [`leading_fields`](Self::leading_fields) is complete and stable.
+    pub fn payload_started(&self) -> bool {
+        matches!(
+            self.state,
+            State::Body | State::MaybeClosed { .. } | State::Closed { .. }
+        )
     }
 
     /// Feed one raw argument fragment; returns the decoded payload text that
@@ -258,6 +292,9 @@ impl PayloadExtractor {
     }
 
     fn step_prelude(&mut self, c: char) -> Result<()> {
+        // Set when a leading value's raw text completed with this char; the
+        // parse happens after the match (the state borrow must end first).
+        let mut value_completed = false;
         let State::Prelude(p) = &mut self.state else {
             unreachable!()
         };
@@ -298,6 +335,7 @@ impl PayloadExtractor {
                     *escaped = true;
                 } else if c == '"' {
                     let matched = *key == self.field;
+                    self.current_key = std::mem::take(key);
                     *p = Prelude::AfterKey { matched };
                 } else {
                     key.push(c);
@@ -322,24 +360,28 @@ impl PayloadExtractor {
                             self.field
                         )));
                     }
-                } else if c == '"' {
-                    *p = Prelude::SkipValue {
-                        depth: 0,
-                        in_string: true,
-                        escaped: false,
-                    };
-                } else if c == '{' || c == '[' {
-                    *p = Prelude::SkipValue {
-                        depth: 1,
-                        in_string: false,
-                        escaped: false,
-                    };
                 } else {
-                    // scalar (number/true/false/null)
-                    *p = Prelude::SkipValue {
-                        depth: 0,
-                        in_string: false,
-                        escaped: false,
+                    self.value_buf.clear();
+                    self.value_buf.push(c);
+                    *p = if c == '"' {
+                        Prelude::SkipValue {
+                            depth: 0,
+                            in_string: true,
+                            escaped: false,
+                        }
+                    } else if c == '{' || c == '[' {
+                        Prelude::SkipValue {
+                            depth: 1,
+                            in_string: false,
+                            escaped: false,
+                        }
+                    } else {
+                        // scalar (number/true/false/null)
+                        Prelude::SkipValue {
+                            depth: 0,
+                            in_string: false,
+                            escaped: false,
+                        }
                     };
                 }
             }
@@ -349,6 +391,7 @@ impl PayloadExtractor {
                 escaped,
             } => {
                 if *in_string {
+                    self.value_buf.push(c);
                     if *escaped {
                         *escaped = false;
                     } else if c == '\\' {
@@ -356,24 +399,29 @@ impl PayloadExtractor {
                     } else if c == '"' {
                         *in_string = false;
                         if *depth == 0 {
+                            value_completed = true;
                             *p = Prelude::AfterValue;
                         }
                     }
                 } else if *depth > 0 {
+                    self.value_buf.push(c);
                     match c {
                         '"' => *in_string = true,
                         '{' | '[' => *depth += 1,
                         '}' | ']' => {
                             *depth -= 1;
                             if *depth == 0 {
+                                value_completed = true;
                                 *p = Prelude::AfterValue;
                             }
                         }
                         _ => {}
                     }
                 } else {
-                    // scalar at depth 0: ends at `,`, `}`, or whitespace.
+                    // scalar at depth 0: ends at `,`, `}`, or whitespace
+                    // (the terminator is not part of the value's text).
                     if c == ',' {
+                        value_completed = true;
                         *p = Prelude::BeforeKey;
                     } else if c == '}' {
                         return Err(self.error(&format!(
@@ -381,7 +429,10 @@ impl PayloadExtractor {
                             self.field
                         )));
                     } else if c.is_whitespace() {
+                        value_completed = true;
                         *p = Prelude::AfterValue;
+                    } else {
+                        self.value_buf.push(c);
                     }
                 }
             }
@@ -399,7 +450,28 @@ impl PayloadExtractor {
                 }
             }
         }
+        if value_completed {
+            self.complete_leading_value()?;
+        }
         Ok(())
+    }
+
+    /// A leading value's raw text is complete: parse it as normal JSON and
+    /// expose it under its key. A leading field that is not valid JSON is a
+    /// malformed call in both modes (leniency covers only the payload body).
+    fn complete_leading_value(&mut self) -> Result<()> {
+        match serde_json::from_str(self.value_buf.trim()) {
+            Ok(value) => {
+                let key = std::mem::take(&mut self.current_key);
+                self.value_buf.clear();
+                self.leading.insert(key, value);
+                Ok(())
+            }
+            Err(e) => Err(self.error(&format!(
+                "leading field '{}' is not valid JSON ({}): {}",
+                self.current_key, e, self.value_buf
+            ))),
+        }
     }
 
     fn step_body(&mut self, c: char, out: &mut String) -> Result<()> {
@@ -779,6 +851,79 @@ mod tests {
         // field is a malformed call either way.
         assert!(lenient(r#"{"other": "x"}"#).is_err());
         assert!(lenient(r#"not json at all"#).is_err());
+    }
+
+    // ---- leading fields ----------------------------------------------------
+
+    #[test]
+    fn leading_fields_are_exposed_parsed() {
+        let raw = r#"{"path": "src/main.rs", "line": 42, "create": true,
+                      "meta": {"a": [1, 2]}, "content": "payload"}"#;
+        let mut ex = PayloadExtractor::strict("content");
+        let mut out = ex.feed(raw).unwrap();
+        assert_eq!(ex.leading_fields()["path"], "src/main.rs");
+        assert_eq!(ex.leading_fields()["line"], 42);
+        assert_eq!(ex.leading_fields()["create"], true);
+        assert_eq!(ex.leading_fields()["meta"]["a"][1], 2);
+        out.push_str(&ex.finish().unwrap());
+        assert_eq!(out, "payload");
+    }
+
+    #[test]
+    fn leading_fields_available_before_the_payload_streams() {
+        // The whole point: a patch(path, content) consumer can open the edit
+        // session for `path` before any payload byte arrives.
+        let mut ex = PayloadExtractor::lenient("content");
+        ex.feed(r#"{"path": "src/lib.rs", "content": ""#).unwrap();
+        assert!(ex.payload_started(), "payload body has started");
+        assert_eq!(ex.leading_fields()["path"], "src/lib.rs");
+        // ...and fields appear even earlier, as each value completes.
+        let mut ex = PayloadExtractor::lenient("content");
+        ex.feed(r#"{"path": "a.rs","#).unwrap();
+        assert!(!ex.payload_started());
+        assert_eq!(ex.leading_fields()["path"], "a.rs");
+    }
+
+    #[test]
+    fn leading_fields_are_split_invariant() {
+        let raw = r#"{"path": "s\"rc", "n": -1.5e3, "content": "x"}"#;
+        for i in 0..=raw.len() {
+            if !raw.is_char_boundary(i) {
+                continue;
+            }
+            let mut ex = PayloadExtractor::strict("content");
+            ex.feed(&raw[..i]).unwrap();
+            ex.feed(&raw[i..]).unwrap();
+            assert_eq!(ex.leading_fields()["path"], "s\"rc", "split at {i}");
+            assert_eq!(ex.leading_fields()["n"], -1500.0, "split at {i}");
+            ex.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_leading_field_fails_loudly_in_both_modes() {
+        // Leniency covers only the payload body; a broken leading value is a
+        // malformed call either way.
+        for lenient in [false, true] {
+            let mut ex = if lenient {
+                PayloadExtractor::lenient("content")
+            } else {
+                PayloadExtractor::strict("content")
+            };
+            let err = ex.feed(r#"{"line": 4x2, "content": "y"}"#);
+            assert!(
+                err.is_err(),
+                "lenient={lenient} must reject a broken leading value"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_leading_key_last_wins() {
+        let mut ex = PayloadExtractor::strict("content");
+        ex.feed(r#"{"path": "a", "path": "b", "content": "x"}"#)
+            .unwrap();
+        assert_eq!(ex.leading_fields()["path"], "b");
     }
 
     // ---- realistic streaming shape ----------------------------------------
