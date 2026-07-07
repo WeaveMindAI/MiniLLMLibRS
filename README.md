@@ -241,8 +241,9 @@ let params = CompletionParameters::new()
 
 ### Prompt Caching (provider-agnostic)
 
-Mark what to cache on the tree; the provider decides the wire (Anthropic emits
-`cache_control`, OpenAI auto-caches). Switch the provider and the same code works.
+Mark what to cache on the tree; the provider decides the wire (Anthropic and
+OpenRouter-fronted Claude models emit `cache_control` breakpoints, OpenAI
+auto-caches). Switch the provider and the same code works.
 
 ```rust
 let root = ChatNode::root(big_system_prompt);

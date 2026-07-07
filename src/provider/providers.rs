@@ -17,6 +17,59 @@ use secrecy::ExposeSecret;
 // Shared OpenAI-wire helpers (back the default Provider methods)
 // =============================================================================
 
+/// Indices of the messages that KEEP their cache breakpoint under the
+/// provider's [`Provider::max_cache_breakpoints`] cap: of all marked
+/// messages, the LAST `max` (the most-recent prefixes are the largest
+/// reusable spans). Warns when marks are dropped.
+pub(crate) fn kept_cache_breakpoints(
+    messages: &[Message],
+    max: usize,
+) -> std::collections::HashSet<usize> {
+    let marked: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.cache_breakpoint)
+        .map(|(i, _)| i)
+        .collect();
+    if marked.len() > max {
+        tracing::warn!(
+            "this provider allows at most {} cache breakpoints per request; {} were marked, keeping the last {}",
+            max,
+            marked.len(),
+            max
+        );
+    }
+    marked.iter().rev().take(max).copied().collect()
+}
+
+/// Attach a `cache_control` marker to an OpenAI-wire message's content: a
+/// plain string becomes the one-block array form (a string can't carry the
+/// marker); an existing parts array gets the marker on its last text part.
+/// A message with no markable text (an assistant turn that is pure
+/// `tool_calls`) keeps no marker; the OpenAI wire has nowhere to put one, and
+/// a dropped breakpoint only shortens the cached prefix to the previous mark.
+fn mark_openai_message(msg: &mut serde_json::Value) {
+    let marker = serde_json::json!({ "type": "ephemeral" });
+    match &mut msg["content"] {
+        serde_json::Value::String(s) if !s.is_empty() => {
+            let text = s.clone();
+            msg["content"] =
+                serde_json::json!([{ "type": "text", "text": text, "cache_control": marker }]);
+        }
+        serde_json::Value::Array(parts) => {
+            match parts.iter_mut().rev().find(|p| p["type"] == "text") {
+                Some(part) => part["cache_control"] = marker,
+                None => tracing::warn!(
+                    "cache breakpoint on a message with no text part; marker dropped"
+                ),
+            }
+        }
+        _ => tracing::warn!(
+            "cache breakpoint on a message with no markable text content; marker dropped"
+        ),
+    }
+}
+
 /// OpenAI-wire auth headers: a key or token both become `Authorization: Bearer`.
 pub(crate) fn openai_auth_headers(auth: &Auth) -> Result<Vec<(String, String)>> {
     match auth {
@@ -46,7 +99,7 @@ pub(crate) fn openai_build_request<P: Provider + ?Sized>(
 ) -> Result<serde_json::Value> {
     let mut body = serde_json::json!({
         "model": model,
-        "messages": messages_to_payload(messages),
+        "messages": provider.openai_messages_value(model, messages),
         "stream": stream,
     });
     let obj = body.as_object_mut().expect("json object");
@@ -219,6 +272,30 @@ impl OpenRouterProvider {
 impl Provider for OpenRouterProvider {
     fn openai_request_usage(&self, body: &mut serde_json::Value, _stream: bool) {
         body["usage"] = serde_json::json!({ "include": true });
+    }
+
+    /// OpenRouter fronts Anthropic endpoints, whose wire caps the markers.
+    fn max_cache_breakpoints(&self) -> usize {
+        4
+    }
+
+    /// OpenRouter passes Anthropic-style `cache_control` markers through to
+    /// Claude endpoints (and routes only to endpoints that support them), so a
+    /// [`Message::cache_breakpoint`] becomes a marker on the message's content,
+    /// capped at the last [`Provider::max_cache_breakpoints`]. Emission is
+    /// gated to Claude models: the other providers OpenRouter fronts either
+    /// auto-cache (OpenAI, Gemini, DeepSeek) or would lose routing candidates
+    /// to the supporting-endpoints-only filter.
+    fn openai_messages_value(&self, model: &str, messages: &[Message]) -> Vec<serde_json::Value> {
+        let mut payload = messages_to_payload(messages);
+        let lower = model.to_ascii_lowercase();
+        if !lower.contains("claude") && !lower.contains("anthropic") {
+            return payload;
+        }
+        for i in kept_cache_breakpoints(messages, self.max_cache_breakpoints()) {
+            mark_openai_message(&mut payload[i]);
+        }
+        payload
     }
 
     /// OpenRouter attributes usage to an app via `HTTP-Referer` (the app URL) and
@@ -523,6 +600,11 @@ impl Provider for AnthropicProvider {
         format!("{}/v1/messages", base_url.trim_end_matches('/'))
     }
 
+    /// Anthropic allows at most 4 `cache_control` breakpoints per request.
+    fn max_cache_breakpoints(&self) -> usize {
+        4
+    }
+
     /// `x-api-key` for an API key; `Authorization: Bearer` for a subscription
     /// token. `anthropic-version` is always sent; the `oauth-2025-04-20` beta is
     /// added on the bearer path (harmless, and future-proofs the OAuth route).
@@ -581,26 +663,9 @@ impl Provider for AnthropicProvider {
             }
         }
 
-        // Enforce Anthropic's 4-breakpoint cap: of all marked messages, only the
-        // last 4 actually get a marker (most-recent prefix = the largest reusable
-        // span). Compute the set of message indices that keep their breakpoint.
-        const MAX_BREAKPOINTS: usize = 4;
-        let marked: Vec<usize> = messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| m.cache_breakpoint)
-            .map(|(i, _)| i)
-            .collect();
-        if marked.len() > MAX_BREAKPOINTS {
-            tracing::warn!(
-                "Anthropic allows at most {} cache breakpoints; {} were marked, keeping the last {}",
-                MAX_BREAKPOINTS,
-                marked.len(),
-                MAX_BREAKPOINTS
-            );
-        }
-        let kept: std::collections::HashSet<usize> =
-            marked.iter().rev().take(MAX_BREAKPOINTS).copied().collect();
+        // Enforce the wire's breakpoint cap: of all marked messages, only
+        // the last `max_cache_breakpoints` actually get a marker.
+        let kept = kept_cache_breakpoints(messages, self.max_cache_breakpoints());
 
         // System turns are hoisted. Track whether any hoisted system message is a
         // (kept) breakpoint so the system block carries the marker.
@@ -1306,6 +1371,86 @@ mod tests {
         for b in &blocks[1..5] {
             assert_eq!(b["cache_control"]["type"], "ephemeral");
         }
+    }
+
+    // ---- OpenRouter cache breakpoints -----------------------------------------
+
+    #[test]
+    fn openrouter_claude_marked_messages_carry_cache_control() {
+        let p = OpenRouterProvider;
+        let messages = vec![
+            cached_msg(Message::system("big system")),
+            Message::user("hi"),
+            cached_msg(Message::user("monitor")),
+        ];
+        let body = p
+            .build_request(
+                "anthropic/claude-sonnet-4.5",
+                &messages,
+                &CompletionParameters::new(),
+                false,
+                true,
+            )
+            .unwrap();
+        let msgs = body["messages"].as_array().unwrap();
+        // Marked messages switch to the block-array form carrying the marker;
+        // an unmarked one stays a plain string.
+        assert_eq!(msgs[0]["content"][0]["text"], "big system");
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(msgs[1]["content"], "hi");
+        assert_eq!(msgs[2]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn openrouter_non_claude_model_emits_no_markers() {
+        let p = OpenRouterProvider;
+        let messages = vec![cached_msg(Message::user("x"))];
+        let payload = p.openai_messages_value("openai/gpt-5", &messages);
+        assert_eq!(payload[0]["content"], "x");
+    }
+
+    #[test]
+    fn openrouter_caps_markers_at_four_keeping_the_last() {
+        let p = OpenRouterProvider;
+        let messages: Vec<Message> = (0..5)
+            .map(|i| cached_msg(Message::user(format!("m{i}"))))
+            .collect();
+        let payload = p.openai_messages_value("anthropic/claude-opus-4", &messages);
+        assert_eq!(payload[0]["content"], "m0", "oldest mark dropped");
+        for msg in &payload[1..5] {
+            assert_eq!(msg["content"][0]["cache_control"]["type"], "ephemeral");
+        }
+    }
+
+    #[test]
+    fn openrouter_marked_tool_result_carries_cache_control() {
+        let p = OpenRouterProvider;
+        let messages = vec![cached_msg(Message::tool("c1", "result"))];
+        let payload = p.openai_messages_value("anthropic/claude-opus-4", &messages);
+        assert_eq!(payload[0]["tool_call_id"], "c1");
+        assert_eq!(
+            payload[0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn openrouter_marked_pure_tool_call_assistant_drops_marker() {
+        let p = OpenRouterProvider;
+        let call = crate::tools::ToolCall {
+            id: "c1".to_string(),
+            name: "f".to_string(),
+            arguments: "{}".to_string(),
+        };
+        let assistant = Message {
+            tool_calls: Some(vec![call]),
+            ..Message::assistant("")
+        };
+        let payload = p.openai_messages_value("anthropic/claude-opus-4", &[cached_msg(assistant)]);
+        // No markable text content: the marker is dropped (prefix falls back
+        // to the previous breakpoint), the tool_calls stay intact.
+        assert_eq!(payload[0]["content"], "");
+        assert!(payload[0]["tool_calls"].is_array());
     }
 
     #[test]

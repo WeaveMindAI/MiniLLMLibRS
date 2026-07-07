@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] - 2026-07-07
+
+### Added
+
+- **Prompt caching now works through OpenRouter for Claude models.** A
+  `Message::cache_breakpoint` was only translated on the native Anthropic wire;
+  OpenRouter (an OpenAI-dialect wire) silently dropped every mark, so the
+  documented "switch the provider and the same code works" caching story did not
+  actually hold there. The `OpenRouterProvider` now renders breakpoints as
+  Anthropic-style `cache_control` blocks that OpenRouter passes through, gated to
+  Claude models (other backends OpenRouter fronts either auto-cache or would lose
+  routing candidates to the supporting-endpoints-only filter). Consumer code is
+  unchanged: the same `cache_breakpoint()` / `with_cache(true)` marks now take
+  effect on Anthropic, OpenRouter-Claude, and OpenAI alike.
+- **`Provider::max_cache_breakpoints`**: the per-request breakpoint cap is now a
+  provider property (default unlimited; Anthropic and OpenRouter override it to
+  4) instead of a hardcoded constant, so the "keep the last N marks" logic is
+  driven by each wire's own limit.
+
+### Changed
+
+- **`Provider::openai_messages_value`**: a new dialect hook (alongside
+  `openai_tools_value`, `openai_request_usage`, ...) letting an OpenAI-envelope
+  provider customize how the `messages` array is serialized. Defaults to the
+  plain payload; OpenRouter overrides it to emit `cache_control`. Providers with
+  their own request builder (Anthropic) are unaffected.
+
 ## [0.4.4] - 2026-07-07
 
 ### Added

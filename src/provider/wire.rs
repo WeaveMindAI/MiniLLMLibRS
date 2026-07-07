@@ -221,6 +221,25 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// consulted by the default [`build_request`](Self::build_request).
     fn openai_request_usage(&self, _body: &mut serde_json::Value, _stream: bool) {}
 
+    /// How many cache breakpoints this provider's wire accepts per request.
+    /// Consulted by the wires that emit `cache_control` markers (Anthropic's
+    /// native wire and OpenRouter's passthrough, both capped at Anthropic's 4);
+    /// when more messages are marked, the LAST ones win (the most-recent
+    /// prefixes are the largest reusable spans). The default is unlimited for
+    /// wires without a marker concept.
+    fn max_cache_breakpoints(&self) -> usize {
+        usize::MAX
+    }
+
+    /// (OpenAI-default helper) the wire value for the `messages` array. Only
+    /// consulted by the default [`build_request`](Self::build_request); override
+    /// it for an OpenAI-envelope wire that carries extra per-message fields
+    /// (OpenRouter's Anthropic `cache_control` passthrough).
+    fn openai_messages_value(&self, model: &str, messages: &[Message]) -> Vec<serde_json::Value> {
+        let _ = model;
+        crate::message::messages_to_payload(messages)
+    }
+
     /// (OpenAI-default helper) the wire value for the `tools` array. Only
     /// consulted by the default [`build_request`](Self::build_request); override
     /// it for an OpenAI-envelope server whose tool shape deviates.
