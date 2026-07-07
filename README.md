@@ -178,9 +178,15 @@ if let Some(calls) = node.tool_calls() {
 }
 ```
 
+Streamed tool arguments can be consumed DECODED, live, per field:
+`ArgumentStream` gives every argument a `FieldHandle` where the consumer picks
+`wait().await` (complete parsed value) or `delta().await` (the field's text as
+the model generates it, escapes undone), with an opt-in lenient mode for
+sloppy models. See the guide's Tool Calling chapter.
+
 For a complete multi-turn agent loop (streaming prose live, one streaming tool
-fed argument bytes as the model generates them, one buffered tool), run
-`cargo run --example agent_loop` ([examples/agent_loop.rs](examples/agent_loop.rs)).
+consuming its decoded payload as the model generates it, one buffered tool),
+run `cargo run --example agent_loop` ([examples/agent_loop.rs](examples/agent_loop.rs)).
 
 ### JSON Response with Repair
 

@@ -131,7 +131,7 @@ while let Some(chunk) = stream.next_chunk().await {
             if let Some(frag) = &delta.arguments_fragment {
                 if tool_started {
                     // CAVEAT: this is escaped JSON source, e.g.
-                    // {"code": "print(\"hi\")... — see the note below.
+                    // {"code": "print(\"hi\")... (see the note below).
                     print!("{frag}");
                 }
             }
@@ -155,9 +155,9 @@ Notes:
 
 - **The fragments are JSON source text, not your payload.** For a tool whose
   input is one string field (like `code` above), the bytes arrive escaped and
-  wrapped in the object syntax (`{"code": "print(\"hi` ...). Put a
-  `PayloadExtractor` between the fragments and the tool to stream the DECODED
-  payload instead (see the next section).
+  wrapped in the object syntax (`{"code": "print(\"hi` ...). Put an
+  `ArgumentStream` between the fragments and the tool to stream the DECODED
+  content instead (see the next section).
 - **Parallel calls**: `delta.index` disambiguates concurrent calls; key your
   spawned tools by it. Forcing a single call with `ToolChoice::Tool(..)` (and
   `.with_parallel_tool_calls(false)`) sidesteps this.
@@ -173,49 +173,81 @@ ends the model's turn**; "the model continues after the tool" is always a new
 API request that your loop makes after `add_tool_result`, and the consumer of
 your stream never sees the seams.
 
-## Streaming the decoded payload (`PayloadExtractor`)
+## Streaming decoded arguments (`ArgumentStream`)
 
-For the "one big string argument" pattern (`{"content": "<entire code file>"}`),
-`PayloadExtractor` turns the raw argument fragments into the payload's DECODED
-text, live: `\n` becomes a real newline, `\"` a quote, `\uXXXX` the character.
-The consumer receives the text exactly as the model meant it (type code into an
-editor in real time, pipe into a process's stdin), with fragments split at any
-position, mid-escape included.
+`ArgumentStream` decodes a call's raw argument fragments field by field, live.
+Every field is the same kind of object: take a `FieldHandle` for it and choose
+PER FIELD how to consume it:
+
+- `handle.wait().await`: the complete parsed value, once the field ends.
+- `handle.delta().await`: the field's DECODED text chunk by chunk as the model
+  generates it (`\n` a real newline, `\"` a quote, `\uXXXX` the character):
+  type code into an editor in real time, pipe into a process's stdin.
+
+Fields nobody took a handle for are parsed into `args.fields()` as they
+complete, so a fully non-streaming consumer still gets everything extracted at
+the end. Fragments may split at any position (mid-escape included); the output
+never changes.
 
 ```rust,no_run
-use minillmlib::PayloadExtractor;
+use minillmlib::ArgumentStream;
 
-# fn run() -> minillmlib::Result<()> {
-let mut extractor = PayloadExtractor::strict("content");
+# async fn run() -> minillmlib::Result<()> {
+let mut args = ArgumentStream::lenient();
+let path = args.field("path");            // consume as a whole value
+let mut content = args.field("content");  // consume as a live stream
 
-// Inside the streaming loop, for the matching call's fragments:
-# let fragment = r#"{"content": "line1\nline2"}"#;
-let decoded = extractor.feed(fragment)?;   // plain text, escapes undone
-print!("{decoded}");                        // → editor / tool stdin
+// The tool runs concurrently with the wire:
+let tool = tokio::spawn(async move {
+    let path = path.wait().await?;                    // complete, parsed
+    let mut session = open_editor(path.as_str().unwrap());
+    while let Some(text) = content.delta().await {    // decoded, live
+        session.type_text(&text);
+    }
+    Ok::<_, minillmlib::MiniLLMError>(session.close())
+});
 
-// When the provider signals the call's end (the fragments stop):
-let tail = extractor.finish()?;             // validates + flushes holdback
-print!("{tail}");
+// The driver feeds the fragments from the streaming loop:
+# let provider_fragments: Vec<String> = vec![];
+for fragment in provider_fragments {
+    args.feed(&fragment)?;
+}
+args.finish()?;      // resolves holdbacks, closes every handle
+tool.await.unwrap()?;
 # Ok(()) }
+# fn open_editor(_p: &str) -> Session { Session }
+# struct Session; impl Session { fn type_text(&mut self, _t: &str) {} fn close(self) {} }
 ```
 
 Two modes:
 
-- **`strict(field)`** (default choice): the arguments must be well-formed JSON;
-  a bad escape, unescaped control character, or unterminated string/object
-  fails loudly with the raw text in the error.
-- **`lenient(field)`**: for models sloppy at escaping. Because the payload is
-  the object's only (therefore last) field, its TRUE closing quote is the one
-  at the very end of the arguments, and the provider signals that end
-  explicitly, which makes leniency deterministic: an unescaped `"` that is not
-  at the true end is literal content, a raw newline is itself, `\` before a
-  non-escape character is a literal backslash, and a model that just stops
-  (forgot the closing `"` or `}`) still yields the full payload. Payload is
-  never silently dropped.
+- **`ArgumentStream::strict()`** (default choice): the arguments must be
+  well-formed JSON; a bad escape, unescaped control character, or unterminated
+  string/object fails loudly with the raw text in the error.
+- **`ArgumentStream::lenient()`**: for models sloppy at escaping, applied to
+  EVERY top-level string value. The rule is deterministic because the
+  legitimate ways a string can end are known: an unescaped `"` closes the
+  string only when followed by `, "key":` (the next field's declaration;
+  whitespace optional everywhere, and the key is a full JSON string, spaces
+  included) or by `}` at the true end of the call (the provider signals that
+  end explicitly). Every other `"` is literal content, a raw newline is
+  itself, `\` before a non-escape character is a literal backslash, and a
+  model that just stops (forgot the closing `"` or `}`) still delivers the
+  full content, never silently dropped. On `finish()`, lenient mode also runs
+  the raw arguments through the crate's JSON repair and fills anything the
+  incremental parse missed into `fields()`. The one documented misfire:
+  content that literally contains `", "somekey": ` reads as a field boundary;
+  that ambiguity is unresolvable on the wire. Numbers, booleans, and nested
+  objects must be well-formed in both modes (they have no end anchor).
 
-Constraints: the payload field must be the object's last field (any other
-fields must precede it; they are skipped as normal JSON), and its value must be
-a string. `examples/agent_loop.rs` uses it for its streaming tool.
+Any number of fields can be streamed (a `patch(old_code, new_code)` tool works
+fine); a handle whose field never arrives resolves as a loud error at
+`finish()`. `examples/agent_loop.rs` uses it for its streaming tool.
+
+For the fully non-streaming path, the assembled call offers the same
+robustness: `ToolCall::arguments_json()` parses strictly, and
+`ToolCall::arguments_json_repaired()` runs the arguments through the crate's
+JSON repair first (trailing commas, unclosed braces, single quotes).
 
 ## Custom wire shapes
 

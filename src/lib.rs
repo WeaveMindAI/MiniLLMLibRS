@@ -74,7 +74,8 @@ pub use provider::{
     TokenPrice, Usage,
 };
 pub use tools::{
-    PayloadExtractor, ToolCall, ToolCallAccumulator, ToolCallDelta, ToolChoice, ToolDefinition,
+    ArgumentStream, FieldHandle, ToolCall, ToolCallAccumulator, ToolCallDelta, ToolChoice,
+    ToolDefinition,
 };
 pub use tracking::{AsyncCostCallback, CompletionContext, CompletionMeta, TrackedStream};
 pub use utils::{

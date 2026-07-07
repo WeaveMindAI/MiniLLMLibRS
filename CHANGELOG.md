@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] - 2026-07-07
+
+### Added
+
+- **`ArgumentStream` + `FieldHandle`: per-field live decoding of streamed tool
+  arguments.** Every field of a call is a uniform handle: consume it with
+  `wait().await` (the complete parsed value) or `delta().await` (the DECODED
+  text chunk by chunk as the model generates it, escapes undone), your choice
+  per field; any number of fields can stream (a `patch(old_code, new_code)`
+  tool works). Fields without a handle are parsed into `fields()` as they
+  complete, so non-streaming consumers still get everything extracted.
+  Fragments may split at arbitrary positions (mid-escape included) without
+  changing the output.
+  - **Lenient mode** (opt-in) covers every top-level string value with a
+    deterministic rule: an unescaped `"` closes a string only when followed by
+    a `, "key":` field boundary (key parsed as a full JSON string, whitespace
+    optional) or by `}` at the true end of the call; everything else is
+    literal content, and a stream that just stops still delivers what arrived.
+    On `finish()`, lenient mode additionally repair-parses the raw arguments
+    (via the crate's JSON repair) and fills anything the incremental parse
+    missed into `fields()`.
+- **`ToolCall::arguments_json_repaired()`**: the non-streaming counterpart,
+  parsing a completed call's arguments through the crate's JSON repair
+  (trailing commas, unclosed braces, single quotes).
+
+### Changed
+
+- **BREAKING:** `PayloadExtractor` (introduced in 0.4.3) is replaced by
+  `ArgumentStream`: the "one designated payload field" concept is gone;
+  streaming vs buffering is now the consumer's per-field choice.
+
 ## [0.4.3] - 2026-07-07
 
 ### Added

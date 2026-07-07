@@ -15,7 +15,7 @@
 //! (makes real, billed API calls).
 
 use minillmlib::{
-    ChatNode, CompletionParameters, GeneratorInfo, NodeCompletionParameters, PayloadExtractor,
+    ArgumentStream, ChatNode, CompletionParameters, GeneratorInfo, NodeCompletionParameters,
     ToolDefinition,
 };
 use std::collections::HashMap;
@@ -27,49 +27,54 @@ const MODEL: &str = "google/gemini-2.5-flash-lite";
 const MAX_TURNS: usize = 8;
 
 /// The streaming tool: starts on the first fragment, consumes the payload as
-/// the model generates it. A `PayloadExtractor` turns the raw JSON fragments
-/// into the DECODED `content` string live (escapes undone), so what a real
-/// tool would receive on stdin is exactly the text the model meant. Lenient
-/// mode tolerates a model that is sloppy with escaping or forgets to close
-/// the JSON.
+/// the model generates it. An `ArgumentStream` decodes the raw JSON fragments
+/// and the tool takes a `FieldHandle` on `content`: a spawned consumer task
+/// drinks its decoded deltas live (escapes undone, exactly the text the model
+/// meant) while the driver keeps feeding. Lenient mode tolerates a model that
+/// is sloppy with escaping or forgets to close the JSON.
 struct DraftNotesSession {
     /// The call id from the first fragment, used to match this session back to
     /// the assembled `ToolCall` after the turn ends.
     call_id: String,
-    extractor: PayloadExtractor,
-    decoded_len: usize,
+    args: ArgumentStream,
+    consumer: tokio::task::JoinHandle<usize>,
 }
 
 impl DraftNotesSession {
     fn start(call_id: &str) -> Self {
         println!("\n[draft_notes {call_id}] started, receiving decoded payload live:");
+        let mut args = ArgumentStream::lenient();
+        let mut content = args.field("content");
+        // The tool runs concurrently with the wire: a real one would pipe
+        // into a process's stdin here.
+        let consumer = tokio::spawn(async move {
+            let mut bytes = 0;
+            while let Some(text) = content.delta().await {
+                print!("{text}");
+                std::io::stdout().flush().ok();
+                bytes += text.len();
+            }
+            bytes
+        });
         Self {
             call_id: call_id.to_string(),
-            extractor: PayloadExtractor::lenient("content"),
-            decoded_len: 0,
+            args,
+            consumer,
         }
     }
 
     fn feed(&mut self, fragment: &str) -> minillmlib::Result<()> {
-        // Decoded payload text, live: \n is a real newline, \" a quote.
-        let text = self.extractor.feed(fragment)?;
-        print!("{text}");
-        std::io::stdout().flush().ok();
-        self.decoded_len += text.len();
-        Ok(())
+        self.args.feed(fragment)
     }
 
-    fn finish(mut self) -> String {
-        match self.extractor.finish() {
-            Ok(tail) => {
-                self.decoded_len += tail.len();
-                print!("{tail}");
-            }
-            Err(e) => eprintln!("\n[draft_notes {}] malformed call: {e}", self.call_id),
+    async fn finish(mut self) -> String {
+        if let Err(e) = self.args.finish() {
+            eprintln!("\n[draft_notes {}] malformed call: {e}", self.call_id);
         }
+        let bytes = self.consumer.await.unwrap_or(0);
         println!(
             "\n[draft_notes {}] done ({} decoded bytes streamed)",
-            self.call_id, self.decoded_len
+            self.call_id, bytes
         );
         "notes saved".to_string()
     }
@@ -173,7 +178,7 @@ async fn main() -> minillmlib::Result<()> {
         for call in &calls {
             let output = match call.name.as_str() {
                 "draft_notes" => match sessions.remove(&call.id) {
-                    Some(session) => session.finish(),
+                    Some(session) => session.finish().await,
                     // Defensive only for a call the stream never fragmented.
                     None => "notes saved".to_string(),
                 },

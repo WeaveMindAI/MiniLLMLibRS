@@ -16,9 +16,9 @@
 //! into [`ToolCall`] (complete calls) and [`ToolCallDelta`] (streaming
 //! fragments), which [`ToolCallAccumulator`] assembles.
 
-mod payload;
+mod args;
 
-pub use payload::PayloadExtractor;
+pub use args::{ArgumentStream, FieldHandle};
 
 use crate::error::{MiniLLMError, Result};
 use serde::{Deserialize, Serialize};
@@ -192,6 +192,20 @@ impl ToolCall {
         serde_json::from_str(&self.arguments).map_err(|e| {
             MiniLLMError::InvalidParameter(format!(
                 "tool call '{}' ({}) carries invalid JSON arguments: {} (raw: {})",
+                self.name, self.id, e, self.arguments
+            ))
+        })
+    }
+
+    /// Parse the raw argument text through this crate's JSON REPAIR first
+    /// (the non-streaming counterpart of [`ArgumentStream::lenient`]): a
+    /// sloppy model's trailing commas, unclosed braces, or single quotes
+    /// still yield the arguments. Fails loudly only when nothing parseable
+    /// can be recovered.
+    pub fn arguments_json_repaired(&self) -> Result<serde_json::Value> {
+        crate::utils::extract_json_value(&self.arguments).map_err(|e| {
+            MiniLLMError::InvalidParameter(format!(
+                "tool call '{}' ({}) carries unrepairable JSON arguments: {} (raw: {})",
                 self.name, self.id, e, self.arguments
             ))
         })
