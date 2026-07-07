@@ -32,7 +32,7 @@ let params = CompletionParameters::new()
 | `seed` | Reproducibility |
 | `response_format` | Force JSON output (`with_json_response()`) |
 | `reasoning` | Extended-thinking effort/budget |
-| `tools`, `tool_choice` | Tool definitions (OpenAI-shaped, passed through) |
+| `tools`, `tool_choice`, `parallel_tool_calls` | Normalized tool calling; the provider emits its wire shape (see [Tool Calling](./tool-calling.md)) |
 | `extra` | Provider-specific keys (the honest escape hatch, e.g. OpenRouter routing) |
 
 ## NodeCompletionParameters

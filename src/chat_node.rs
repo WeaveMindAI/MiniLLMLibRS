@@ -701,6 +701,24 @@ impl ChatNode {
         self.insert_child(&self.id, Message::assistant(content))
     }
 
+    /// Add a tool-result message as a child, answering one of this node's tool
+    /// calls (`call_id` is [`ToolCall::id`](crate::tools::ToolCall::id)). For
+    /// parallel calls, chain one `add_tool_result` per call; the provider groups
+    /// them on its wire (Anthropic packs consecutive results into one user turn).
+    pub fn add_tool_result(
+        &self,
+        call_id: impl Into<String>,
+        content: impl Into<MessageContent>,
+    ) -> ChatNode {
+        self.insert_child(&self.id, Message::tool(call_id, content))
+    }
+
+    /// The tool calls carried by this node's message, if the assistant made any
+    /// (set by the completion when the model called tools).
+    pub fn tool_calls(&self) -> Option<Vec<crate::tools::ToolCall>> {
+        self.message.tool_calls.clone()
+    }
+
     /// Get the parent node (`None` for a root).
     pub fn parent(&self) -> Option<ChatNode> {
         let parent_id = self.with_node(&self.id, |n| n.parent.clone())?;
@@ -1407,6 +1425,15 @@ impl ChatNode {
             .await
     }
 
+    /// Append the assistant node for a response you consumed manually, e.g. a
+    /// streaming loop over [`StreamingCompletion::next_chunk`] followed by
+    /// [`StreamingCompletion::collect`]. Threads content, tool_calls, and
+    /// response metadata exactly like the built-in completion paths, so a
+    /// hand-driven stream ends in the same tree shape as `complete`.
+    pub fn append_response(&self, response: &CompletionResponse) -> ChatNode {
+        self.build_assistant_node(response.content.clone(), response, true)
+    }
+
     /// Complete with streaming and collect into a new node.
     ///
     /// Shares the retry/post-processing/cost pipeline with the non-streaming
@@ -1933,8 +1960,7 @@ mod completion_pipeline_tests {
 
         let mut response = response_with("answer");
         response.finish_reason = Some("tool_calls".into());
-        response.tool_calls = Some(vec![serde_json::json!({"id": "c1"})]);
-
+        response.tool_calls = Some(vec![crate::tools::ToolCall::new("c1", "t", "{}")]);
         let node = user.build_assistant_node("answer".into(), &response, true);
 
         // Real child: parent lists it.
@@ -1946,6 +1972,35 @@ mod completion_pipeline_tests {
             node.get_metadata("finish_reason"),
             Some(serde_json::json!("tool_calls"))
         );
+        assert_eq!(
+            node.get_metadata("model"),
+            Some(serde_json::json!("test-model"))
+        );
+
+        // The typed accessor exposes the calls, and a tool result answers one:
+        // the result node carries role=tool + the call id in its message.
+        let calls = node.tool_calls().expect("accessor exposes tool calls");
+        assert_eq!(calls[0].id, "c1");
+        let result = node.add_tool_result(&calls[0].id, "42");
+        assert_eq!(result.role(), Role::Tool);
+        assert_eq!(result.message.tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(result.text(), Some("42"));
+    }
+
+    #[test]
+    fn append_response_builds_the_same_node_as_the_completion_paths() {
+        // The public escape hatch for hand-driven streams must produce the same
+        // tree shape as `complete`: a real child carrying content, tool_calls,
+        // and response metadata.
+        let root = ChatNode::root("sys");
+        let user = root.add_user("hi");
+        let mut response = response_with("answer");
+        response.tool_calls = Some(vec![crate::tools::ToolCall::new("c1", "t", "{}")]);
+
+        let node = user.append_response(&response);
+        assert_eq!(user.child_count(), 1);
+        assert_eq!(node.text(), Some("answer"));
+        assert_eq!(node.tool_calls().unwrap()[0].id, "c1");
         assert_eq!(
             node.get_metadata("model"),
             Some(serde_json::json!("test-model"))

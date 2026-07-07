@@ -33,15 +33,16 @@ pub(crate) fn openai_auth_headers(auth: &Auth) -> Result<Vec<(String, String)>> 
 /// struct is normalized intent, not a wire shape). The request-owned keys
 /// (`model`/`messages`/`stream`, the provider token-limit key, usage opt-in) are
 /// overlaid, then `extra` is merged, failing loudly on a collision with any key
-/// already set.
-pub(crate) fn openai_build_request(
+/// already set. The provider's `openai_*` hooks supply the dialect points that
+/// vary across OpenAI-compatible wires (token-limit key, usage opt-in, tool
+/// shapes).
+pub(crate) fn openai_build_request<P: Provider + ?Sized>(
     model: &str,
     messages: &[Message],
     params: &CompletionParameters,
     stream: bool,
     include_usage: bool,
-    token_limit_field: &str,
-    request_usage: impl FnOnce(&mut serde_json::Value),
+    provider: &P,
 ) -> Result<serde_json::Value> {
     let mut body = serde_json::json!({
         "model": model,
@@ -52,7 +53,10 @@ pub(crate) fn openai_build_request(
 
     // Normalized sampling/intent fields → OpenAI keys.
     if let Some(v) = params.max_tokens {
-        obj.insert(token_limit_field.to_string(), serde_json::json!(v));
+        obj.insert(
+            provider.openai_token_limit_field().to_string(),
+            serde_json::json!(v),
+        );
     }
     if let Some(v) = params.temperature {
         obj.insert("temperature".into(), serde_json::json!(v));
@@ -82,17 +86,20 @@ pub(crate) fn openai_build_request(
         obj.insert("response_format".into(), v.to_openai_value());
     }
     if let Some(v) = &params.tools {
-        obj.insert("tools".into(), serde_json::json!(v));
+        obj.insert("tools".into(), provider.openai_tools_value(v));
     }
     if let Some(v) = &params.tool_choice {
-        obj.insert("tool_choice".into(), v.clone());
+        obj.insert("tool_choice".into(), provider.openai_tool_choice_value(v));
+    }
+    if let Some(v) = params.parallel_tool_calls {
+        obj.insert("parallel_tool_calls".into(), serde_json::json!(v));
     }
     if let Some(v) = &params.reasoning {
         obj.insert("reasoning".into(), serde_json::to_value(v)?);
     }
 
     if include_usage {
-        request_usage(&mut body);
+        provider.openai_request_usage(&mut body, stream);
     }
 
     // Merge `extra`, failing loudly on a collision with any key already present.
@@ -432,19 +439,16 @@ pub struct AnthropicProvider;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 impl AnthropicProvider {
-    /// Map a normalized message's content to Anthropic's content shape. A plain
-    /// string for text-only content (our common case); the block-array form with a
-    /// `cache_control` marker when `cached` (a string can't carry the marker).
+    /// The message's full text, FAILING LOUDLY on multimodal content (image/audio/
+    /// video) which has no Anthropic mapping wired yet. `all_text()` joins every
+    /// text part, so a multi-text message never silently drops its later parts the
+    /// way `get_text()` (first part only) would. Shared by the turn and system paths.
     ///
     /// Multimodal content (image/audio/video parts) has no Anthropic mapping wired
     /// yet, and Anthropic's block shape differs from the OpenAI-shaped normalized
     /// parts, so a multimodal message FAILS LOUDLY rather than silently shipping a
     /// text-only request that drops the attachment. (Wiring Anthropic image/document
     /// blocks is a clean future extension.)
-    /// The message's full text, FAILING LOUDLY on multimodal content (image/audio/
-    /// video) which has no Anthropic mapping wired yet. `all_text()` joins every
-    /// text part, so a multi-text message never silently drops its later parts the
-    /// way `get_text()` (first part only) would. Shared by the turn and system paths.
     fn text_only(msg: &Message) -> Result<String> {
         use crate::message::MessageContent;
         if let MessageContent::Parts(parts) = &msg.content {
@@ -457,17 +461,60 @@ impl AnthropicProvider {
         Ok(msg.content.all_text())
     }
 
-    fn message_content(msg: &Message, cached: bool) -> Result<serde_json::Value> {
+    /// Map one non-system message to its Anthropic turn: the wire role
+    /// (`user`/`assistant`; a tool RESULT is a `user` turn on this wire) plus its
+    /// content blocks:
+    /// - assistant `tool_calls` become `tool_use` blocks after any text,
+    /// - a `Role::Tool` message becomes a `tool_result` block (requiring its
+    ///   `tool_call_id`, failing loudly without one),
+    /// - `cached` puts a `cache_control` marker on the message's last block.
+    fn turn_blocks(msg: &Message, cached: bool) -> Result<(&'static str, Vec<serde_json::Value>)> {
+        use crate::message::Role;
         let text = Self::text_only(msg)?;
-        Ok(if cached {
-            serde_json::json!([{
-                "type": "text",
-                "text": text,
-                "cache_control": {"type": "ephemeral"},
-            }])
-        } else {
-            serde_json::json!(text)
-        })
+        let mut blocks: Vec<serde_json::Value> = Vec::new();
+
+        let role = match msg.role {
+            Role::Tool => {
+                let Some(call_id) = &msg.tool_call_id else {
+                    return Err(MiniLLMError::InvalidParameter(
+                        "a tool-result message needs a tool_call_id (build it via Message::tool)"
+                            .to_string(),
+                    ));
+                };
+                blocks.push(serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": text,
+                }));
+                "user"
+            }
+            role => {
+                // A text block only when there is text OR nothing else to say
+                // (Anthropic rejects empty text blocks, but an all-empty message
+                // still needs a body).
+                if !text.is_empty() || msg.tool_calls.is_none() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+                if let Some(calls) = &msg.tool_calls {
+                    for call in calls {
+                        blocks.push(call.to_anthropic_block()?);
+                    }
+                }
+                if role == Role::Assistant {
+                    "assistant"
+                } else {
+                    "user"
+                }
+            }
+        };
+
+        if cached {
+            let last = blocks
+                .last_mut()
+                .expect("every turn has at least one block");
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
+        Ok((role, blocks))
     }
 }
 
@@ -521,12 +568,9 @@ impl Provider for AnthropicProvider {
         use crate::message::Role;
 
         // Fail loudly on normalized fields with no Anthropic mapping wired yet,
-        // rather than silently dropping them (which would, e.g., make tools never
-        // fire even though the response parser DOES handle Anthropic tool_use).
-        // Each is a clean future translation, not a silent "for now" omission.
+        // rather than silently dropping them. Each is a clean future translation,
+        // not a silent "for now" omission.
         for (present, field) in [
-            (params.tools.is_some(), "tools"),
-            (params.tool_choice.is_some(), "tool_choice"),
             (params.response_format.is_some(), "response_format"),
             (params.reasoning.is_some(), "reasoning"),
         ] {
@@ -560,9 +604,14 @@ impl Provider for AnthropicProvider {
 
         // System turns are hoisted. Track whether any hoisted system message is a
         // (kept) breakpoint so the system block carries the marker.
+        //
+        // Non-system messages become (role, blocks) turns; consecutive turns with
+        // the same wire role are merged (Anthropic requires alternating roles, and
+        // parallel tool results MUST share one user turn with their tool_result
+        // blocks together, immediately after the assistant's tool_use turn).
         let mut system = String::new();
         let mut system_cached = false;
-        let mut turns: Vec<serde_json::Value> = Vec::new();
+        let mut turns: Vec<(&'static str, Vec<serde_json::Value>)> = Vec::new();
         for (i, msg) in messages.iter().enumerate() {
             let cached = kept.contains(&i);
             if msg.role == Role::System {
@@ -576,12 +625,29 @@ impl Provider for AnthropicProvider {
                 system.push_str(&text);
                 system_cached |= cached;
             } else {
-                turns.push(serde_json::json!({
-                    "role": msg.role,
-                    "content": Self::message_content(msg, cached)?,
-                }));
+                let (role, blocks) = Self::turn_blocks(msg, cached)?;
+                match turns.last_mut() {
+                    Some((last_role, last_blocks)) if *last_role == role => {
+                        last_blocks.extend(blocks)
+                    }
+                    _ => turns.push((role, blocks)),
+                }
             }
         }
+        // A single plain text block collapses to the string form (the common
+        // no-tools wire); anything richer keeps the block array.
+        let turns: Vec<serde_json::Value> = turns
+            .into_iter()
+            .map(|(role, blocks)| {
+                let content = match blocks.as_slice() {
+                    [only] if only["type"] == "text" && only.get("cache_control").is_none() => {
+                        only["text"].clone()
+                    }
+                    _ => serde_json::json!(blocks),
+                };
+                serde_json::json!({ "role": role, "content": content })
+            })
+            .collect();
 
         let mut body = serde_json::json!({
             "model": model,
@@ -615,6 +681,35 @@ impl Provider for AnthropicProvider {
         }
         if let Some(stop) = &params.stop {
             body["stop_sequences"] = serde_json::json!(stop);
+        }
+
+        // Tools: normalized definitions → Anthropic's {name, description,
+        // input_schema} shape.
+        if let Some(tools) = &params.tools {
+            body["tools"] = serde_json::Value::Array(
+                tools
+                    .iter()
+                    .map(crate::tools::ToolDefinition::to_anthropic_value)
+                    .collect(),
+            );
+        }
+        // tool_choice: Anthropic carries the parallel-calls setting INSIDE this
+        // object (`disable_parallel_tool_use`), so `parallel_tool_calls: false`
+        // forces a tool_choice (defaulting to auto) to have somewhere to live.
+        // `Some(true)` is the wire default and emits nothing extra; on a `None`
+        // choice (tool calling forbidden) the flag is meaningless and omitted.
+        let choice = match (&params.tool_choice, params.parallel_tool_calls) {
+            (Some(c), _) => Some(c.clone()),
+            (None, Some(false)) => Some(crate::tools::ToolChoice::Auto),
+            (None, _) => None,
+        };
+        if let Some(choice) = choice {
+            let mut value = choice.to_anthropic_value();
+            if params.parallel_tool_calls == Some(false) && choice != crate::tools::ToolChoice::None
+            {
+                value["disable_parallel_tool_use"] = serde_json::json!(true);
+            }
+            body["tool_choice"] = value;
         }
 
         // Merge `extra`, rejecting collisions with a reserved key loudly.
@@ -877,28 +972,13 @@ mod tests {
     #[test]
     fn anthropic_build_request_fails_loudly_on_every_untranslated_field() {
         // EVERY field the rejection loop guards must fail loudly, never be silently
-        // dropped (a dropped `tools` would make the model never call a tool even
-        // though the response parser handles tool_use). One assertion per field, so
-        // removing any entry from the production list fails this test.
+        // dropped. One assertion per field, so removing any entry from the
+        // production list fails this test.
         use crate::generator::ReasoningConfig;
         let p = AnthropicProvider;
         let messages = vec![Message::user("Hi")];
 
         let cases: Vec<(&str, CompletionParameters)> = vec![
-            (
-                "tools",
-                CompletionParameters {
-                    tools: Some(vec![serde_json::json!({"type": "function"})]),
-                    ..CompletionParameters::new()
-                },
-            ),
-            (
-                "tool_choice",
-                CompletionParameters {
-                    tool_choice: Some(serde_json::json!("auto")),
-                    ..CompletionParameters::new()
-                },
-            ),
             (
                 "response_format",
                 CompletionParameters::new().with_json_response(),
@@ -968,6 +1048,183 @@ mod tests {
         assert_eq!(body["system"], "sysA\nsysB");
     }
 
+    // ---- Anthropic tool calling -----------------------------------------------
+
+    use crate::tools::{ToolCall, ToolChoice, ToolDefinition};
+
+    fn weather_tool() -> ToolDefinition {
+        ToolDefinition::new(
+            "get_weather",
+            "Get the weather",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "city": { "type": "string" } },
+                "required": ["city"],
+            }),
+        )
+    }
+
+    #[test]
+    fn anthropic_build_request_emits_tools_and_tool_choice() {
+        let p = AnthropicProvider;
+        let messages = vec![Message::user("weather in Paris?")];
+        let params = CompletionParameters::new()
+            .with_tool(weather_tool().with_strict(true))
+            .with_tool_choice(ToolChoice::Required)
+            .with_parallel_tool_calls(false);
+        let body = p
+            .build_request("m", &messages, &params, false, true)
+            .unwrap();
+
+        assert_eq!(body["tools"][0]["name"], "get_weather");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(body["tools"][0]["strict"], true);
+        // Required → Anthropic "any"; parallel=false folds into tool_choice.
+        assert_eq!(body["tool_choice"]["type"], "any");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+    }
+
+    #[test]
+    fn anthropic_parallel_false_without_choice_forces_auto_choice() {
+        // Anthropic has no top-level parallel flag; with no explicit choice, the
+        // flag needs an auto tool_choice object to live in.
+        let p = AnthropicProvider;
+        let params = CompletionParameters::new()
+            .with_tool(weather_tool())
+            .with_parallel_tool_calls(false);
+        let body = p
+            .build_request("m", &[Message::user("hi")], &params, false, true)
+            .unwrap();
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+        // parallel=true is the wire default: nothing emitted.
+        let params = CompletionParameters::new()
+            .with_tool(weather_tool())
+            .with_parallel_tool_calls(true);
+        let body = p
+            .build_request("m", &[Message::user("hi")], &params, false, true)
+            .unwrap();
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn anthropic_assistant_tool_calls_become_tool_use_blocks() {
+        let p = AnthropicProvider;
+        let mut assistant = Message::assistant("checking");
+        assistant.tool_calls = Some(vec![ToolCall::new(
+            "tu_1",
+            "get_weather",
+            r#"{"city":"Paris"}"#,
+        )]);
+        let messages = vec![Message::user("weather?"), assistant];
+        let body = p
+            .build_request("m", &messages, &CompletionParameters::new(), false, true)
+            .unwrap();
+
+        let blocks = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "checking");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "tu_1");
+        assert_eq!(blocks[1]["name"], "get_weather");
+        assert_eq!(blocks[1]["input"]["city"], "Paris", "input is an object");
+    }
+
+    #[test]
+    fn anthropic_assistant_tool_call_without_text_has_no_empty_text_block() {
+        // Anthropic rejects empty text blocks: a tool-call-only assistant turn
+        // must emit ONLY the tool_use block.
+        let p = AnthropicProvider;
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![ToolCall::new("tu_1", "get_weather", "{}")]);
+        let body = p
+            .build_request(
+                "m",
+                &[Message::user("weather?"), assistant],
+                &CompletionParameters::new(),
+                false,
+                true,
+            )
+            .unwrap();
+        let blocks = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn anthropic_tool_results_become_one_user_turn_with_tool_result_blocks() {
+        // Parallel tool results (consecutive Role::Tool messages) must share ONE
+        // user turn, tool_result blocks first; trailing user text joins that turn
+        // AFTER the results (Anthropic's required ordering).
+        let p = AnthropicProvider;
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![
+            ToolCall::new("tu_1", "get_weather", r#"{"city":"Paris"}"#),
+            ToolCall::new("tu_2", "get_weather", r#"{"city":"Lyon"}"#),
+        ]);
+        let messages = vec![
+            Message::user("weather?"),
+            assistant,
+            Message::tool("tu_1", "15 degrees"),
+            Message::tool("tu_2", "18 degrees"),
+            Message::user("thanks, summarize"),
+        ];
+        let body = p
+            .build_request("m", &messages, &CompletionParameters::new(), false, true)
+            .unwrap();
+
+        let turns = body["messages"].as_array().unwrap();
+        assert_eq!(
+            turns.len(),
+            3,
+            "user / assistant / merged results+text user"
+        );
+        assert_eq!(turns[2]["role"], "user");
+        let blocks = turns[2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["tool_use_id"], "tu_1");
+        assert_eq!(blocks[0]["content"], "15 degrees");
+        assert_eq!(blocks[1]["type"], "tool_result");
+        assert_eq!(blocks[1]["tool_use_id"], "tu_2");
+        assert_eq!(blocks[2]["type"], "text");
+        assert_eq!(blocks[2]["text"], "thanks, summarize");
+    }
+
+    #[test]
+    fn anthropic_tool_result_without_call_id_fails_loudly() {
+        let p = AnthropicProvider;
+        let mut orphan = Message::tool("x", "result");
+        orphan.tool_call_id = None;
+        assert!(p
+            .build_request(
+                "m",
+                &[Message::user("hi"), orphan],
+                &CompletionParameters::new(),
+                false,
+                true
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn anthropic_invalid_tool_call_arguments_fail_loudly() {
+        // An assistant tool call whose stored arguments are not valid JSON cannot
+        // be expressed as an Anthropic `input` object; it must error, not ship "{}".
+        let p = AnthropicProvider;
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![ToolCall::new("tu_1", "t", "{not json")]);
+        assert!(p
+            .build_request(
+                "m",
+                &[Message::user("hi"), assistant],
+                &CompletionParameters::new(),
+                false,
+                true
+            )
+            .is_err());
+    }
+
     // ---- Anthropic cache breakpoints -----------------------------------------
 
     /// A message with the cache breakpoint flag set.
@@ -1017,14 +1274,15 @@ mod tests {
         let body = p
             .build_request("m", &messages, &CompletionParameters::new(), false, true)
             .unwrap();
-        // The marked user turn is a block-array with cache_control; the unmarked
-        // one stays a plain string.
-        assert_eq!(body["messages"][0]["content"][0]["text"], "cache me");
-        assert_eq!(
-            body["messages"][0]["content"][0]["cache_control"]["type"],
-            "ephemeral"
-        );
-        assert!(body["messages"][1]["content"].is_string());
+        // Consecutive user messages merge into ONE user turn (Anthropic wants
+        // alternating roles); the marked message's block carries cache_control,
+        // the unmarked one's block does not.
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "cache me");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["text"], "new");
+        assert!(blocks[1].get("cache_control").is_none());
     }
 
     #[test]
@@ -1037,11 +1295,16 @@ mod tests {
         let body = p
             .build_request("m", &messages, &CompletionParameters::new(), false, true)
             .unwrap();
-        let turns = body["messages"].as_array().unwrap();
-        // turn0 (the oldest, dropped) → plain string; turns 1..=4 → cached blocks.
-        assert!(turns[0]["content"].is_string(), "oldest mark dropped");
-        for t in &turns[1..5] {
-            assert_eq!(t["content"][0]["cache_control"]["type"], "ephemeral");
+        // The 5 consecutive user messages merge into one user turn of 5 text
+        // blocks; only the LAST 4 blocks carry cache_control.
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 5);
+        assert!(
+            blocks[0].get("cache_control").is_none(),
+            "oldest mark dropped"
+        );
+        for b in &blocks[1..5] {
+            assert_eq!(b["cache_control"]["type"], "ephemeral");
         }
     }
 

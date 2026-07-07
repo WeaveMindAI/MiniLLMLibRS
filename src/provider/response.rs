@@ -1,5 +1,6 @@
 //! Response types from LLM APIs
 
+use crate::tools::{ToolCall, ToolCallDelta};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -166,8 +167,8 @@ pub struct CompletionResponse {
     /// Token usage statistics
     pub usage: Option<Usage>,
 
-    /// Tool calls made by the model (if any)
-    pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// Tool calls made by the model (if any), normalized across providers.
+    pub tool_calls: Option<Vec<ToolCall>>,
 
     /// Raw response for debugging
     #[serde(skip)]
@@ -225,8 +226,9 @@ pub struct StreamChunk {
     /// Usage info (only present in final chunk for some providers)
     pub usage: Option<Usage>,
 
-    /// Tool call deltas
-    pub tool_calls: Option<Vec<serde_json::Value>>,
+    /// Tool call fragments carried by this chunk (assembled by
+    /// [`ToolCallAccumulator`](crate::tools::ToolCallAccumulator)).
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 impl StreamChunk {
@@ -342,7 +344,10 @@ pub fn parse_openai_response<P: super::Provider + ?Sized>(
 
     // `content` may legitimately be null/absent for a tool-call-only response.
     let content = message["content"].as_str().unwrap_or("").to_string();
-    let tool_calls = message["tool_calls"].as_array().cloned();
+    let tool_calls = message["tool_calls"]
+        .as_array()
+        .map(|entries| parse_openai_tool_calls(entries))
+        .transpose()?;
     let finish_reason = choice["finish_reason"].as_str().map(String::from);
 
     // Usage parsing is provider-specific (field names, native cost fields).
@@ -359,58 +364,51 @@ pub fn parse_openai_response<P: super::Provider + ?Sized>(
     })
 }
 
-/// Merge streaming tool-call deltas into an accumulator.
-///
-/// OpenAI-style streaming sends tool calls as deltas keyed by `index`: the first
-/// delta for an index carries `id`/`type`/`function.name`, and subsequent deltas
-/// append `function.arguments` fragments. This folds each delta into the slot at
-/// its `index`, concatenating argument fragments, so the accumulator ends up with
-/// the fully assembled tool calls.
-pub fn accumulate_tool_call_deltas(acc: &mut Vec<serde_json::Value>, deltas: &[serde_json::Value]) {
-    for delta in deltas {
-        // `index` de-multiplexes the deltas and is structurally required. A
-        // missing/non-numeric index would silently merge distinct calls into
-        // slot 0; an out-of-order high index would let a malicious stream size an
-        // arbitrary allocation (OOM). Real indices are small and contiguous, so we
-        // only accept "update an existing slot" or "append exactly one", and skip
-        // anything else loudly.
-        let Some(index) = delta["index"].as_u64().map(|i| i as usize) else {
-            tracing::warn!("tool_call delta missing numeric index, skipping");
-            continue;
-        };
-        if index > acc.len() {
-            tracing::warn!(
+/// Parse the OpenAI-wire `tool_calls` array of a COMPLETE message into typed
+/// [`ToolCall`]s. On this wire every entry carries `id`, `function.name`, and
+/// `function.arguments` (a JSON string); an entry missing any of them is a
+/// malformed response and fails loudly rather than yielding a call the caller
+/// cannot answer.
+fn parse_openai_tool_calls(entries: &[serde_json::Value]) -> crate::error::Result<Vec<ToolCall>> {
+    entries
+        .iter()
+        .map(|entry| {
+            let id = entry["id"].as_str();
+            let name = entry["function"]["name"].as_str();
+            let arguments = entry["function"]["arguments"].as_str();
+            match (id, name) {
+                (Some(id), Some(name)) => {
+                    Ok(ToolCall::new(id, name, arguments.unwrap_or_default()))
+                }
+                _ => Err(crate::error::MiniLLMError::MalformedResponse(format!(
+                    "tool_calls entry missing id or function.name: {}",
+                    preview_str(&entry.to_string())
+                ))),
+            }
+        })
+        .collect()
+}
+
+/// Parse the OpenAI-wire streaming `delta.tool_calls` entries into normalized
+/// [`ToolCallDelta`]s. `index` de-multiplexes parallel calls and is structurally
+/// required; a delta without a numeric index cannot be routed to a slot and is
+/// skipped loudly.
+fn parse_openai_tool_call_deltas(entries: &[serde_json::Value]) -> Vec<ToolCallDelta> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let Some(index) = entry["index"].as_u64() else {
+                tracing::warn!("tool_call delta missing numeric index, skipping");
+                return None;
+            };
+            Some(ToolCallDelta {
                 index,
-                len = acc.len(),
-                "tool_call delta index out of order, skipping"
-            );
-            continue;
-        }
-        if index == acc.len() {
-            acc.push(serde_json::json!({}));
-        }
-        let slot = &mut acc[index];
-
-        for key in ["id", "type"] {
-            if let Some(v) = delta.get(key).filter(|v| !v.is_null()) {
-                slot[key] = v.clone();
-            }
-        }
-
-        if let Some(func) = delta.get("function") {
-            if !slot["function"].is_object() {
-                slot["function"] = serde_json::json!({});
-            }
-            let slot_func = &mut slot["function"];
-            if let Some(name) = func.get("name").filter(|v| !v.is_null()) {
-                slot_func["name"] = name.clone();
-            }
-            if let Some(frag) = func.get("arguments").and_then(|v| v.as_str()) {
-                let existing = slot_func["arguments"].as_str().unwrap_or("").to_string();
-                slot_func["arguments"] = serde_json::json!(format!("{}{}", existing, frag));
-            }
-        }
-    }
+                id: entry["id"].as_str().map(String::from),
+                name: entry["function"]["name"].as_str().map(String::from),
+                arguments_fragment: entry["function"]["arguments"].as_str().map(String::from),
+            })
+        })
+        .collect()
 }
 
 /// Parse an OpenAI-wire streaming chunk from SSE data (the default
@@ -458,7 +456,10 @@ pub fn parse_openai_chunk<P: super::Provider + ?Sized>(
         .filter(|s| !s.is_empty())
         .map(String::from);
 
-    let tool_calls = choice.and_then(|c| c["delta"]["tool_calls"].as_array().cloned());
+    let tool_calls = choice
+        .and_then(|c| c["delta"]["tool_calls"].as_array())
+        .map(|entries| parse_openai_tool_call_deltas(entries))
+        .filter(|deltas| !deltas.is_empty());
 
     // Return a chunk if it carries anything we track (id alone is not enough to
     // surface, but it rides along with whatever else is present).
@@ -516,20 +517,23 @@ pub fn parse_anthropic_response(
         crate::error::MiniLLMError::MalformedResponse(preview_str(&raw.to_string()))
     })?;
 
-    // Join every text block; collect tool_use blocks into the normalized shape.
+    // Join every text block; collect tool_use blocks into normalized ToolCalls
+    // (the `input` object is serialized to raw JSON text, the normalized form).
     let mut text = String::new();
-    let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
     for block in content_blocks {
         match block["type"].as_str() {
             Some("text") => text.push_str(block["text"].as_str().unwrap_or("")),
-            Some("tool_use") => tool_calls.push(serde_json::json!({
-                "id": block["id"],
-                "type": "function",
-                "function": {
-                    "name": block["name"],
-                    "arguments": block["input"].to_string(),
-                },
-            })),
+            Some("tool_use") => {
+                let (id, name) = (block["id"].as_str(), block["name"].as_str());
+                let (Some(id), Some(name)) = (id, name) else {
+                    return Err(crate::error::MiniLLMError::MalformedResponse(format!(
+                        "tool_use block missing id or name: {}",
+                        preview_str(&block.to_string())
+                    )));
+                };
+                tool_calls.push(ToolCall::new(id, name, block["input"].to_string()));
+            }
             _ => {}
         }
     }
@@ -548,11 +552,16 @@ pub fn parse_anthropic_response(
 /// Parse one Anthropic SSE event payload into a [`StreamChunk`]. Anthropic streams
 /// a sequence of typed events; each maps to at most one chunk:
 /// - `message_start` → carries the message `id` + initial usage (input tokens),
+/// - `content_block_start` (`content_block.tool_use`) → a tool call's id + name,
 /// - `content_block_delta` (`delta.text_delta`) → the text delta,
+/// - `content_block_delta` (`delta.input_json_delta`) → a tool-argument fragment,
 /// - `message_delta` → final usage (output tokens) + `stop_reason`,
 /// - `message_stop` → terminal marker.
 ///
-/// Other events (`content_block_start/stop`, `ping`) carry nothing trackable.
+/// Tool events reuse the block `index` as the [`ToolCallDelta`] index; that index
+/// space is shared with text blocks (so it may be sparse), which the accumulator
+/// handles. Other events (text `content_block_start`, `content_block_stop`,
+/// `ping`) carry nothing trackable.
 pub fn parse_anthropic_chunk(data: &str) -> Option<crate::error::Result<StreamChunk>> {
     let json: serde_json::Value = serde_json::from_str(data).ok()?;
     match json["type"].as_str()? {
@@ -581,15 +590,49 @@ pub fn parse_anthropic_chunk(data: &str) -> Option<crate::error::Result<StreamCh
                 })
             })
         }
-        "content_block_delta" => {
-            let delta = json["delta"]["text"].as_str().unwrap_or("").to_string();
-            (!delta.is_empty()).then(|| {
-                Ok(StreamChunk {
-                    delta,
-                    ..Default::default()
-                })
-            })
+        "content_block_start" => {
+            // Only a tool_use block start carries anything trackable (the call's
+            // id + name); a text block start is ignorable.
+            let block = &json["content_block"];
+            if block["type"].as_str() != Some("tool_use") {
+                return None;
+            }
+            let index = json["index"].as_u64()?;
+            Some(Ok(StreamChunk {
+                tool_calls: Some(vec![ToolCallDelta {
+                    index,
+                    id: block["id"].as_str().map(String::from),
+                    name: block["name"].as_str().map(String::from),
+                    arguments_fragment: None,
+                }]),
+                ..Default::default()
+            }))
         }
+        "content_block_delta" => match json["delta"]["type"].as_str() {
+            Some("input_json_delta") => {
+                let index = json["index"].as_u64()?;
+                let frag = json["delta"]["partial_json"].as_str().unwrap_or("");
+                (!frag.is_empty()).then(|| {
+                    Ok(StreamChunk {
+                        tool_calls: Some(vec![ToolCallDelta {
+                            index,
+                            arguments_fragment: Some(frag.to_string()),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    })
+                })
+            }
+            _ => {
+                let delta = json["delta"]["text"].as_str().unwrap_or("").to_string();
+                (!delta.is_empty()).then(|| {
+                    Ok(StreamChunk {
+                        delta,
+                        ..Default::default()
+                    })
+                })
+            }
+        },
         "message_delta" => {
             let finish_reason = json["delta"]["stop_reason"].as_str().map(String::from);
             let usage = parse_anthropic_usage(&json["usage"]);
@@ -635,7 +678,26 @@ mod tests {
         assert_eq!(resp.content, "");
         assert_eq!(resp.finish_reason.as_deref(), Some("tool_calls"));
         let tc = resp.tool_calls.expect("tool_calls threaded through");
-        assert_eq!(tc[0]["function"]["name"], "get_weather");
+        assert_eq!(tc[0].id, "call_1");
+        assert_eq!(tc[0].name, "get_weather");
+        assert_eq!(tc[0].arguments, "{}");
+    }
+
+    #[test]
+    fn parse_response_rejects_malformed_tool_call_entry() {
+        // An entry without id or function.name is unusable (no way to answer the
+        // call); it must fail loudly, not produce a fabricated ToolCall.
+        let raw = serde_json::json!({
+            "id": "gen-1", "model": "m",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{"type": "function", "function": {"arguments": "{}"}}]
+                }
+            }]
+        });
+        assert!(acct().parse_response(raw).is_err());
     }
 
     #[test]
@@ -817,57 +879,25 @@ mod tests {
     }
 
     #[test]
-    fn accumulate_tool_call_deltas_merges_by_index() {
-        let mut acc = Vec::new();
-        accumulate_tool_call_deltas(
-            &mut acc,
-            &[serde_json::json!({
-                "index": 0, "id": "call_1", "type": "function",
-                "function": {"name": "search", "arguments": "{\"q\":"}
-            })],
-        );
-        accumulate_tool_call_deltas(
-            &mut acc,
-            &[serde_json::json!({
-                "index": 0, "function": {"arguments": "\"rust\"}"}
-            })],
-        );
-        assert_eq!(acc.len(), 1);
-        assert_eq!(acc[0]["id"], "call_1");
-        assert_eq!(acc[0]["function"]["name"], "search");
-        assert_eq!(acc[0]["function"]["arguments"], "{\"q\":\"rust\"}");
-    }
-
-    #[test]
-    fn accumulate_tool_call_deltas_appends_two_distinct_calls() {
-        let mut acc = Vec::new();
-        accumulate_tool_call_deltas(
-            &mut acc,
-            &[
-                serde_json::json!({"index": 0, "id": "c0", "function": {"name": "a"}}),
-                serde_json::json!({"index": 1, "id": "c1", "function": {"name": "b"}}),
-            ],
-        );
-        assert_eq!(acc.len(), 2);
-        assert_eq!(acc[0]["id"], "c0");
-        assert_eq!(acc[1]["id"], "c1");
-    }
-
-    #[test]
-    fn accumulate_tool_call_deltas_rejects_out_of_range_and_missing_index() {
-        let mut acc = Vec::new();
-        // Huge index must NOT resize/allocate; it's skipped.
-        accumulate_tool_call_deltas(
-            &mut acc,
-            &[serde_json::json!({"index": 4_000_000_000u64, "id": "x"})],
-        );
-        assert!(acc.is_empty(), "out-of-order high index must be skipped");
-        // Missing index must NOT collapse into slot 0.
-        accumulate_tool_call_deltas(&mut acc, &[serde_json::json!({"id": "y"})]);
-        assert!(
-            acc.is_empty(),
-            "missing index must be skipped, not coerced to 0"
-        );
+    fn parse_stream_chunk_extracts_typed_tool_call_deltas() {
+        // First delta carries index/id/name + an argument fragment; the second
+        // continues the arguments. A delta without an index is skipped loudly.
+        let c = acct()
+            .parse_chunk(
+                r#"{"id":"gen-1","choices":[{"delta":{"tool_calls":[
+                    {"index":0,"id":"c0","type":"function",
+                     "function":{"name":"search","arguments":"{\"q\":"}},
+                    {"function":{"arguments":"ignored, no index"}}
+                ]}}]}"#,
+            )
+            .unwrap()
+            .unwrap();
+        let deltas = c.tool_calls.expect("tool call deltas parsed");
+        assert_eq!(deltas.len(), 1, "index-less delta skipped");
+        assert_eq!(deltas[0].index, 0);
+        assert_eq!(deltas[0].id.as_deref(), Some("c0"));
+        assert_eq!(deltas[0].name.as_deref(), Some("search"));
+        assert_eq!(deltas[0].arguments_fragment.as_deref(), Some("{\"q\":"));
     }
 
     #[test]
@@ -950,9 +980,43 @@ mod tests {
         let resp = parse_anthropic_response(raw).unwrap();
         assert_eq!(resp.content, "calling");
         let tc = resp.tool_calls.expect("tool_use threaded");
-        assert_eq!(tc[0]["function"]["name"], "get_weather");
-        // input is serialized to a JSON string argument (OpenAI-normalized shape).
-        assert_eq!(tc[0]["function"]["arguments"], r#"{"city":"Paris"}"#);
+        assert_eq!(tc[0].id, "tu_1");
+        assert_eq!(tc[0].name, "get_weather");
+        // input is serialized to raw JSON text (the normalized argument form).
+        assert_eq!(tc[0].arguments, r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
+    fn anthropic_chunk_tool_use_block_start_and_json_deltas() {
+        // content_block_start (tool_use) carries the call's id/name at its block
+        // index; input_json_delta events carry argument fragments at that index.
+        let start = parse_anthropic_chunk(
+            r#"{"type":"content_block_start","index":1,
+                "content_block":{"type":"tool_use","id":"tu_1","name":"get_weather","input":{}}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let d = start.tool_calls.expect("tool_use start mapped");
+        assert_eq!(d[0].index, 1);
+        assert_eq!(d[0].id.as_deref(), Some("tu_1"));
+        assert_eq!(d[0].name.as_deref(), Some("get_weather"));
+
+        let frag = parse_anthropic_chunk(
+            r#"{"type":"content_block_delta","index":1,
+                "delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#,
+        )
+        .unwrap()
+        .unwrap();
+        let d = frag.tool_calls.expect("json delta mapped");
+        assert_eq!(d[0].index, 1);
+        assert_eq!(d[0].arguments_fragment.as_deref(), Some("{\"city\":"));
+
+        // A TEXT content_block_start stays ignorable.
+        assert!(parse_anthropic_chunk(
+            r#"{"type":"content_block_start","index":0,
+                "content_block":{"type":"text","text":""}}"#
+        )
+        .is_none());
     }
 
     #[test]

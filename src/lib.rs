@@ -48,6 +48,7 @@ pub mod generator;
 pub mod json_repair;
 pub mod message;
 pub mod provider;
+pub mod tools;
 pub mod tracking;
 pub mod utils;
 
@@ -72,6 +73,7 @@ pub use provider::{
     OpenAiProvider, OpenRouterProvider, PostStreamCtx, Provider, StreamChunk, StreamingCompletion,
     TokenPrice, Usage,
 };
+pub use tools::{ToolCall, ToolCallAccumulator, ToolCallDelta, ToolChoice, ToolDefinition};
 pub use tracking::{AsyncCostCallback, CompletionContext, CompletionMeta, TrackedStream};
 pub use utils::{
     configure_logging, extract_json, extract_json_value, pretty_json, to_dict, LogLevel,

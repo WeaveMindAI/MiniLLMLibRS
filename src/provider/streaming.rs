@@ -1,8 +1,9 @@
 //! Streaming completion handling
 
-use super::response::{accumulate_tool_call_deltas, CompletionResponse, StreamChunk, Usage};
+use super::response::{CompletionResponse, StreamChunk, Usage};
 use super::Provider;
 use crate::error::{MiniLLMError, Result};
+use crate::tools::ToolCallAccumulator;
 use futures::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
 use std::sync::Arc;
@@ -17,8 +18,8 @@ pub struct StreamingCompletion {
     /// Accumulated content so far
     accumulated: String,
 
-    /// Accumulated tool-call deltas (merged by index as they stream in)
-    tool_calls: Vec<serde_json::Value>,
+    /// Accumulated tool-call fragments (assembled by wire index as they stream in)
+    tool_calls: ToolCallAccumulator,
 
     /// Final usage stats (set when stream completes)
     usage: Option<Usage>,
@@ -115,7 +116,7 @@ impl StreamingCompletion {
         Self {
             rx,
             accumulated: String::new(),
-            tool_calls: Vec::new(),
+            tool_calls: ToolCallAccumulator::default(),
             usage: None,
             model,
             id: String::new(),
@@ -139,7 +140,7 @@ impl StreamingCompletion {
         let stream = Self {
             rx,
             accumulated: String::new(),
-            tool_calls: Vec::new(),
+            tool_calls: ToolCallAccumulator::default(),
             usage: None,
             model: model.to_string(),
             id: id.to_string(),
@@ -178,7 +179,7 @@ impl StreamingCompletion {
         }
 
         if let Some(deltas) = &chunk.tool_calls {
-            accumulate_tool_call_deltas(&mut self.tool_calls, deltas);
+            self.tool_calls.ingest(deltas);
         }
 
         // Merge usage rather than replace: a provider may split it across events
@@ -210,7 +211,7 @@ impl StreamingCompletion {
             content: self.accumulated.clone(),
             finish_reason: self.finish_reason.clone(),
             usage: self.usage.clone(),
-            tool_calls: (!self.tool_calls.is_empty()).then(|| self.tool_calls.clone()),
+            tool_calls: (!self.tool_calls.is_empty()).then(|| self.tool_calls.finish()),
             raw_response: None,
         }
     }
@@ -316,14 +317,13 @@ mod tests {
     }
 
     fn tool_delta(index: u64, name: Option<&str>, args: &str) -> StreamChunk {
-        let mut func = serde_json::json!({ "arguments": args });
-        if let Some(n) = name {
-            func["name"] = serde_json::json!(n);
-        }
         StreamChunk {
-            tool_calls: Some(vec![
-                serde_json::json!({ "index": index, "function": func }),
-            ]),
+            tool_calls: Some(vec![crate::tools::ToolCallDelta {
+                index,
+                id: name.map(|_| format!("call_{index}")),
+                name: name.map(String::from),
+                arguments_fragment: Some(args.to_string()),
+            }]),
             ..Default::default()
         }
     }
@@ -379,8 +379,8 @@ mod tests {
         let resp = stream.collect().await.unwrap();
         let tc = resp.tool_calls.expect("tool calls assembled");
         assert_eq!(tc.len(), 1);
-        assert_eq!(tc[0]["function"]["name"], "search");
-        assert_eq!(tc[0]["function"]["arguments"], "{\"q\":\"rust\"}");
+        assert_eq!(tc[0].name, "search");
+        assert_eq!(tc[0].arguments, "{\"q\":\"rust\"}");
     }
 
     #[tokio::test]

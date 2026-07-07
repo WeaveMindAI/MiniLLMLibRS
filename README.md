@@ -21,6 +21,7 @@ A minimalist, async-first Rust library for LLM interactions with streaming suppo
 - **Template Substitution**: Format kwargs with `{placeholders}` in messages
 - **Thread Serialization**: Save/load conversation threads to/from JSON files
 - **Cost Tracking**: OpenRouter usage accounting with callbacks
+- **Tool Calling**: Normalized `ToolDefinition`/`ToolChoice`/`ToolCall` types; each provider emits its own wire (OpenAI `tools`, Anthropic `tool_use`), streaming included
 - **Multimodal**: Support for images and audio in messages
 - **JSON Repair**: Robust handling of malformed JSON from LLM outputs
 - **OpenRouter Compatible**: Works with OpenRouter, OpenAI, and any OpenAI-compatible API
@@ -121,20 +122,14 @@ let response2 = response1.chat("What's my name?", &generator).await?;
 ### Image Input
 
 ```rust
-use minillmlib::{ChatNode, GeneratorInfo, ImageData, MessageContent, Message, Role};
+use minillmlib::{ChatNode, GeneratorInfo, ImageData, MessageContent};
 
 let generator = GeneratorInfo::openrouter("google/gemini-2.5-flash-lite");
 let image = ImageData::from_file("./image.jpg")?;
 
 let content = MessageContent::with_images("Describe this image.", &[image]);
 let root = ChatNode::root("You are helpful.");
-let user = root.add_child(ChatNode::new(Message {
-    role: Role::User,
-    content,
-    name: None,
-    tool_call_id: None,
-    tool_calls: None,
-}));
+let user = root.add_user(content);
 
 let response = user.complete(&generator, None).await?;
 ```
@@ -147,6 +142,45 @@ use minillmlib::{AudioData, MessageContent};
 let audio = AudioData::from_file("./audio.mp3")?;
 let content = MessageContent::with_audio("Transcribe this audio.", &[audio]);
 ```
+
+### Tool / Function Calling
+
+Tools are normalized: define them once, and each provider emits its own wire
+shape (OpenAI-wire `tools`/`tool_calls`, Anthropic `tool_use`/`tool_result`).
+See the guide's Tool Calling chapter for the full loop.
+
+```rust
+use minillmlib::{CompletionParameters, NodeCompletionParameters, ToolChoice, ToolDefinition};
+
+let params = NodeCompletionParameters::new().with_params(
+    CompletionParameters::new()
+        .with_tool(ToolDefinition::new(
+            "get_weather",
+            "Get the current weather for a city",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "city": { "type": "string" } },
+                "required": ["city"],
+            }),
+        ))
+        .with_tool_choice(ToolChoice::Auto),
+);
+
+let node = user.complete(&generator, Some(&params)).await?;
+if let Some(calls) = node.tool_calls() {
+    let mut current = node.clone();
+    for call in &calls {
+        let args = call.arguments_json()?;                 // typed arguments
+        let result = run_my_tool(&call.name, &args);       // your code
+        current = current.add_tool_result(&call.id, result);
+    }
+    let answer = current.complete(&generator, Some(&params)).await?;
+}
+```
+
+For a complete multi-turn agent loop (streaming prose live, one streaming tool
+fed argument bytes as the model generates them, one buffered tool), run
+`cargo run --example agent_loop` ([examples/agent_loop.rs](examples/agent_loop.rs)).
 
 ### JSON Response with Repair
 

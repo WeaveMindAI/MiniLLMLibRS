@@ -351,6 +351,7 @@ mod tests {
             response_format: None,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             extra: None,
         };
@@ -427,26 +428,25 @@ mod tests {
 
     #[test]
     fn test_body_includes_tools_and_tool_choice() {
+        use crate::tools::{ToolChoice, ToolDefinition};
         let client = LLMClient::new();
         let gen = test_generator();
-        let tool = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "parameters": { "type": "object", "properties": {} }
-            }
-        });
-        let params = CompletionParameters {
-            tools: Some(vec![tool.clone()]),
-            tool_choice: Some(serde_json::json!("auto")),
-            ..CompletionParameters::new()
-        };
+        let params = CompletionParameters::new()
+            .with_tool(ToolDefinition::new(
+                "get_weather",
+                "Get the weather",
+                serde_json::json!({ "type": "object", "properties": {} }),
+            ))
+            .with_tool_choice(ToolChoice::Auto)
+            .with_parallel_tool_calls(false);
         let body = client
             .build_body_with_usage(&gen, &test_messages(), &params, false, false)
             .unwrap();
 
+        assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]
@@ -478,6 +478,7 @@ mod tests {
             response_format: None,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             extra: None,
         };

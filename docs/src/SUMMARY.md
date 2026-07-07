@@ -6,6 +6,7 @@
 - [Conversation Trees](./conversation-trees.md)
 - [Providers](./providers.md)
 - [Completion Parameters](./parameters.md)
+- [Tool Calling](./tool-calling.md)
 - [Cost Tracking](./cost-tracking.md)
 - [Prompt Caching](./caching.md)
 - [Custom Providers](./custom-providers.md)

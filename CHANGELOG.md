@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] - 2026-07-07
+
+### Added
+
+- **Normalized tool / function calling** across every provider (`src/tools.rs`):
+  - `ToolDefinition` (name, description, JSON-Schema parameters, `strict`),
+    `ToolChoice` (`Auto`/`None`/`Required`/`Tool(name)`), and
+    `CompletionParameters::{with_tools, with_tool, with_tool_choice,
+    with_parallel_tool_calls}`. Each provider emits its own wire: OpenAI-wire
+    `tools`/`tool_choice`/`parallel_tool_calls`; Anthropic `input_schema` tools,
+    `{"type":"auto"|"none"|"any"|"tool"}` choice with
+    `disable_parallel_tool_use` folded in.
+  - Typed `ToolCall { id, name, arguments }` (arguments as raw JSON text, with
+    `arguments_json()` parsing loudly) replaces the raw `serde_json::Value`
+    tool-call passthrough in `Message`, `CompletionResponse`, and node trees.
+  - Streaming tool calls: typed `ToolCallDelta` fragments assembled by
+    `ToolCallAccumulator` (sparse-index safe). Anthropic streaming now parses
+    `content_block_start` (tool_use) and `input_json_delta` events; previously
+    streamed Anthropic tool calls were silently dropped.
+  - The Anthropic provider now translates the full loop: assistant `tool_calls`
+    become `tool_use` blocks, `Role::Tool` messages become `tool_result` blocks
+    (consecutive user-side messages merge into one alternating-role turn, so
+    parallel results are grouped as the wire requires).
+  - `ChatNode::tool_calls()` and `ChatNode::add_tool_result(call_id, content)`
+    complete the agent loop on the tree API; `ChatNode::append_response(..)`
+    appends the assistant node after a hand-driven streaming loop (e.g.
+    piping tool-argument fragments into a tool as the model generates them).
+  - Custom OpenAI-envelope providers can override just the tool wire via new
+    `Provider::openai_tools_value` / `openai_tool_choice_value` hooks.
+  - Docs: a new "Tool Calling" guide chapter; live round-trip + streaming
+    integration tests for both wires; a runnable full agent loop
+    (`examples/agent_loop.rs`) mixing a streaming tool (fed argument bytes as
+    the model generates them) with a buffered one.
+
+### Changed
+
+- **BREAKING:** `CompletionParameters::tools` is now `Option<Vec<ToolDefinition>>`
+  and `tool_choice` is `Option<ToolChoice>` (previously raw `serde_json::Value`
+  passthrough). `Message::tool_calls`, `CompletionResponse::tool_calls`, and
+  `StreamChunk::tool_calls` are typed likewise.
+
 ## [0.4.1] - 2026-06-16
 
 ### Changed

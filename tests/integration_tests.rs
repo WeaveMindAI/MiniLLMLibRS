@@ -3498,3 +3498,130 @@ mod custom_provider {
         );
     }
 }
+
+// =============================================================================
+// Tool calling (live round trips)
+// =============================================================================
+//
+// The full loop against real wires: definitions out, tool_calls back, results
+// in, final answer. OpenRouter exercises the OpenAI wire; the Anthropic test
+// exercises the native `/v1/messages` tool_use/tool_result translation.
+
+use minillmlib::{ToolChoice, ToolDefinition};
+
+/// A cheap OpenRouter model with reliable tool support (llama-3.1-8b's tool
+/// calling is too flaky to assert on; OpenAI models can be blocked by an
+/// account's data-policy settings, gemini-2.5-flash-lite is not).
+const TOOL_TEST_MODEL: &str = TEST_MODEL;
+
+fn weather_tool() -> ToolDefinition {
+    ToolDefinition::new(
+        "get_weather",
+        "Get the current weather for a city",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" } },
+            "required": ["city"],
+        }),
+    )
+}
+
+fn tool_params() -> NodeCompletionParameters {
+    NodeCompletionParameters::new().with_params(
+        CompletionParameters::new()
+            .with_max_tokens(200)
+            .with_tool(weather_tool())
+            // Force the call so the assertion is deterministic.
+            .with_tool_choice(ToolChoice::Tool("get_weather".into())),
+    )
+}
+
+/// Follow-up params: same tools, but let the model answer freely.
+fn tool_answer_params() -> NodeCompletionParameters {
+    NodeCompletionParameters::new().with_params(
+        CompletionParameters::new()
+            .with_max_tokens(200)
+            .with_tool(weather_tool())
+            .with_tool_choice(ToolChoice::Auto),
+    )
+}
+
+async fn run_tool_round_trip(generator: &GeneratorInfo) {
+    let root = ChatNode::root("You are helpful. Use the tools when asked about weather.");
+    let user = root.add_user("What's the weather in Paris?");
+
+    let node = user
+        .complete(generator, Some(&tool_params()))
+        .await
+        .expect("tool-forcing completion");
+    let calls = node.tool_calls().expect("model must call the forced tool");
+    assert_eq!(calls[0].name, "get_weather");
+    let args = calls[0].arguments_json().expect("valid JSON arguments");
+    assert!(
+        args["city"].as_str().is_some(),
+        "arguments should carry a city, got {args}"
+    );
+
+    // Answer every call, then complete again for the final answer.
+    let mut current = node.clone();
+    for call in &calls {
+        current = current.add_tool_result(&call.id, "15 degrees and sunny");
+    }
+    let answer = current
+        .complete(generator, Some(&tool_answer_params()))
+        .await
+        .expect("post-tool-result completion");
+    let text = answer.text().unwrap_or_default().to_lowercase();
+    assert!(
+        text.contains("15") || text.contains("sunny"),
+        "final answer should use the tool result, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn test_openrouter_tool_calling_round_trip() {
+    require_live!("OPENROUTER_API_KEY");
+    dotenvy::dotenv().ok();
+    run_tool_round_trip(&GeneratorInfo::openrouter(TOOL_TEST_MODEL)).await;
+}
+
+#[tokio::test]
+async fn test_anthropic_tool_calling_round_trip() {
+    require_live!("ANTHROPIC_API_KEY");
+    run_tool_round_trip(&GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL)).await;
+}
+
+#[tokio::test]
+async fn test_openrouter_streaming_tool_calls_assemble() {
+    require_live!("OPENROUTER_API_KEY");
+    dotenvy::dotenv().ok();
+    // Streaming: tool-call fragments must assemble into complete typed calls on
+    // the final node.
+    let generator = GeneratorInfo::openrouter(TOOL_TEST_MODEL);
+    let root = ChatNode::root("You are helpful.");
+    let user = root.add_user("What's the weather in Paris?");
+    let node = user
+        .complete_streaming_collect(&generator, Some(&tool_params()))
+        .await
+        .expect("streaming tool completion");
+    let calls = node.tool_calls().expect("streamed tool calls assembled");
+    assert_eq!(calls[0].name, "get_weather");
+    assert!(calls[0].arguments_json().is_ok(), "arguments reassembled");
+}
+
+#[tokio::test]
+async fn test_anthropic_streaming_tool_calls_assemble() {
+    require_live!("ANTHROPIC_API_KEY");
+    // Anthropic streams tool calls via content_block_start + input_json_delta;
+    // the fragments must assemble despite the shared text/tool index space.
+    let generator = GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL);
+    let root = ChatNode::root("You are helpful.");
+    let user = root.add_user("What's the weather in Paris?");
+    let node = user
+        .complete_streaming_collect(&generator, Some(&tool_params()))
+        .await
+        .expect("anthropic streaming tool completion");
+    let calls = node.tool_calls().expect("streamed tool calls assembled");
+    assert_eq!(calls[0].name, "get_weather");
+    assert!(calls[0].arguments_json().is_ok(), "arguments reassembled");
+}

@@ -1,5 +1,6 @@
 //! Completion parameters for LLM requests
 
+use crate::tools::{ToolChoice, ToolDefinition};
 use serde::{Deserialize, Serialize};
 
 /// Normalized, provider-agnostic completion parameters.
@@ -45,11 +46,19 @@ pub struct CompletionParameters {
     /// maps it to its wire (OpenAI `response_format`, Anthropic structured output).
     pub response_format: Option<ResponseFormat>,
 
-    /// Tool/function definitions (currently OpenAI-shaped JSON, passed through).
-    pub tools: Option<Vec<serde_json::Value>>,
+    /// Tools the model may call, as normalized [`ToolDefinition`]s. The provider
+    /// emits its wire shape (OpenAI `tools[].function`, Anthropic `input_schema`).
+    pub tools: Option<Vec<ToolDefinition>>,
 
-    /// Tool choice strategy.
-    pub tool_choice: Option<serde_json::Value>,
+    /// How the model must treat the tools (auto / none / required / a specific
+    /// tool). The provider emits its wire shape.
+    pub tool_choice: Option<ToolChoice>,
+
+    /// Whether the model may call several tools in one turn. `None` leaves the
+    /// provider default (parallel allowed). OpenAI-wire emits
+    /// `parallel_tool_calls`; Anthropic folds `disable_parallel_tool_use` into
+    /// `tool_choice`.
+    pub parallel_tool_calls: Option<bool>,
 
     /// Reasoning configuration (for models that support extended thinking).
     pub reasoning: Option<ReasoningConfig>,
@@ -184,6 +193,7 @@ impl Default for CompletionParameters {
             response_format: None,
             tools: None,
             tool_choice: None,
+            parallel_tool_calls: None,
             reasoning: None,
             extra: None,
         }
@@ -238,6 +248,30 @@ impl CompletionParameters {
         self
     }
 
+    /// Set the tools the model may call (replaces any already set).
+    pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Add a single tool the model may call.
+    pub fn with_tool(mut self, tool: ToolDefinition) -> Self {
+        self.tools.get_or_insert_with(Vec::new).push(tool);
+        self
+    }
+
+    /// Set the tool-choice strategy (auto / none / required / a specific tool).
+    pub fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
+        self
+    }
+
+    /// Allow or forbid the model calling several tools in one turn.
+    pub fn with_parallel_tool_calls(mut self, allow: bool) -> Self {
+        self.parallel_tool_calls = Some(allow);
+        self
+    }
+
     /// Merge with another set of parameters (other takes precedence)
     pub fn merge(&self, other: &CompletionParameters) -> CompletionParameters {
         // Merge extra params - combine both, with other taking precedence
@@ -271,6 +305,7 @@ impl CompletionParameters {
                 .tool_choice
                 .clone()
                 .or_else(|| self.tool_choice.clone()),
+            parallel_tool_calls: other.parallel_tool_calls.or(self.parallel_tool_calls),
             reasoning: other.reasoning.clone().or_else(|| self.reasoning.clone()),
             extra: merged_extra,
         }

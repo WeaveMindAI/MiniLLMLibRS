@@ -34,6 +34,11 @@ let gen = GeneratorInfo::custom("old", "http://localhost:8000/v1", "m")
     .with_provider(Arc::new(GenericProvider { legacy_token_limit: true }));
 ```
 
+If your server speaks the OpenAI envelope but its *tool* shape deviates,
+override just the two tool hooks in your `impl Provider`
+(`openai_tools_value`, `openai_tool_choice_value`); the rest of the default
+request builder stays. See [Tool Calling](./tool-calling.md).
+
 ## Case B: your server has a different wire
 
 Different endpoint, auth header, request/response shape: implement the `Provider`

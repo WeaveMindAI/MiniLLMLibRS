@@ -207,15 +207,7 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
         stream: bool,
         include_usage: bool,
     ) -> crate::error::Result<serde_json::Value> {
-        super::providers::openai_build_request(
-            model,
-            messages,
-            params,
-            stream,
-            include_usage,
-            self.openai_token_limit_field(),
-            |body| self.openai_request_usage(body, stream),
-        )
+        super::providers::openai_build_request(model, messages, params, stream, include_usage, self)
     }
 
     /// (OpenAI-default helper) the request-body key for the max-output-tokens
@@ -228,6 +220,25 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// (OpenAI-default helper) mutate the body to opt into usage reporting. Only
     /// consulted by the default [`build_request`](Self::build_request).
     fn openai_request_usage(&self, _body: &mut serde_json::Value, _stream: bool) {}
+
+    /// (OpenAI-default helper) the wire value for the `tools` array. Only
+    /// consulted by the default [`build_request`](Self::build_request); override
+    /// it for an OpenAI-envelope server whose tool shape deviates.
+    fn openai_tools_value(&self, tools: &[crate::tools::ToolDefinition]) -> serde_json::Value {
+        serde_json::Value::Array(
+            tools
+                .iter()
+                .map(crate::tools::ToolDefinition::to_openai_value)
+                .collect(),
+        )
+    }
+
+    /// (OpenAI-default helper) the wire value for `tool_choice`. Only consulted
+    /// by the default [`build_request`](Self::build_request); override it for an
+    /// OpenAI-envelope server whose tool-choice shape deviates.
+    fn openai_tool_choice_value(&self, choice: &crate::tools::ToolChoice) -> serde_json::Value {
+        choice.to_openai_value()
+    }
 
     /// Parse a completed (non-streaming) raw response into a normalized
     /// [`CompletionResponse`] (content, usage, tool calls, finish reason). Default

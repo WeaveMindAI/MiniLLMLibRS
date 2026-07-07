@@ -14,6 +14,7 @@ pub use media::{Media, MediaData};
 pub use role::Role;
 pub use video::VideoData;
 
+use crate::tools::ToolCall;
 use serde::{Deserialize, Serialize};
 
 /// A single message in a conversation
@@ -33,9 +34,10 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 
-    /// Tool calls made by the assistant
+    /// Tool calls made by the assistant (normalized; the provider emits its
+    /// wire shape: OpenAI `tool_calls`, Anthropic `tool_use` content blocks).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<serde_json::Value>>,
+    pub tool_calls: Option<Vec<ToolCall>>,
 
     /// Normalized cache **breakpoint**: when true, the prefix UP TO AND INCLUDING
     /// this message is a candidate for prompt caching. This is provider-agnostic
@@ -114,7 +116,9 @@ impl Message {
     }
 }
 
-/// Convert a list of messages to the API payload format
+/// Convert a list of messages to the OpenAI-wire payload format (assistant
+/// `tool_calls` as function entries, tool results as `role: tool` messages).
+/// Non-OpenAI wires (Anthropic) build their own payload in `build_request`.
 pub fn messages_to_payload(messages: &[Message]) -> Vec<serde_json::Value> {
     messages
         .iter()
@@ -131,7 +135,9 @@ pub fn messages_to_payload(messages: &[Message]) -> Vec<serde_json::Value> {
                 obj["tool_call_id"] = serde_json::json!(tool_call_id);
             }
             if let Some(tool_calls) = &msg.tool_calls {
-                obj["tool_calls"] = serde_json::json!(tool_calls);
+                obj["tool_calls"] = serde_json::Value::Array(
+                    tool_calls.iter().map(ToolCall::to_openai_value).collect(),
+                );
             }
 
             obj
@@ -196,11 +202,38 @@ mod tests {
         // An assistant message carrying tool_calls must not be merged into a
         // following assistant message, which would silently drop the tool_calls.
         let mut with_tools = Message::assistant("calling");
-        with_tools.tool_calls = Some(vec![serde_json::json!({"id": "c1"})]);
+        with_tools.tool_calls = Some(vec![crate::tools::ToolCall::new("c1", "t", "{}")]);
 
         let merged = merge_contiguous_messages(vec![with_tools, Message::assistant("after")]);
         assert_eq!(merged.len(), 2, "tool-call message must stay separate");
         assert!(merged[0].tool_calls.is_some());
+    }
+
+    #[test]
+    fn payload_emits_openai_tool_wire_shapes() {
+        // Assistant tool_calls → OpenAI function entries (arguments as a JSON
+        // string); a tool result → role=tool with tool_call_id.
+        let mut assistant = Message::assistant("checking");
+        assistant.tool_calls = Some(vec![crate::tools::ToolCall::new(
+            "c1",
+            "get_weather",
+            r#"{"city":"Paris"}"#,
+        )]);
+        let payload = messages_to_payload(&[assistant, Message::tool("c1", "15 degrees")]);
+
+        assert_eq!(payload[0]["tool_calls"][0]["id"], "c1");
+        assert_eq!(payload[0]["tool_calls"][0]["type"], "function");
+        assert_eq!(
+            payload[0]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert!(
+            payload[0]["tool_calls"][0]["function"]["arguments"].is_string(),
+            "OpenAI wire wants arguments as a JSON string"
+        );
+        assert_eq!(payload[1]["role"], "tool");
+        assert_eq!(payload[1]["tool_call_id"], "c1");
+        assert_eq!(payload[1]["content"], "15 degrees");
     }
 
     #[test]
