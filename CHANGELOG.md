@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] - 2026-07-07
+
+### Security
+
+- Refreshed `Cargo.lock` to pull transitively-depended crates to patched
+  versions, clearing all open advisories: `openssl` 0.10.75 -> 0.10.81
+  (GHSA-xp3w-r5p5-63rr and others), `rustls-webpki` 0.103.8 -> 0.103.13
+  (GHSA-82j2-j2ch-gfr8), and `bytes` 1.11.0 -> 1.12.0 (GHSA-434x-w66g-qw3r),
+  plus routine bumps across the rest of the locked graph. No direct dependency
+  version ranges changed; the manifest floors stay loose for downstream
+  compatibility. `reqwest` is held at 0.12 (its 0.13 line has no compatible
+  `reqwest-eventsource` release yet).
+
 ## [0.4.5] - 2026-07-07
 
 ### Added
