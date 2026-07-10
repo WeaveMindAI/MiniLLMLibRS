@@ -1,14 +1,20 @@
 //! LLM Provider implementations
 
 mod auth;
-mod client;
+#[cfg(feature = "estimate")]
+mod bpe;
+pub(crate) mod client;
+#[cfg(feature = "estimate")]
+mod estimate;
 mod providers;
 mod response;
 mod streaming;
-mod wire;
+pub(crate) mod wire;
 
 pub use auth::{resolve_claude_subscription_auth, Auth};
 pub use client::{global_client, LLMClient};
+#[cfg(feature = "estimate")]
+pub use estimate::{estimate_cost_usd, estimate_prompt_tokens, PromptEstimate, SAFETY_MULTIPLIER};
 pub use providers::{AnthropicProvider, GenericProvider, OpenAiProvider, OpenRouterProvider};
 pub use response::{
     CompletionResponse, CostCallback, CostInfo, CostResolution, StreamChunk, Usage,

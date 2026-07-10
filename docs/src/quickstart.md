@@ -5,7 +5,7 @@
 ```toml
 # Cargo.toml
 [dependencies]
-minillmlib = "0.3"
+minillmlib = "0.5"
 tokio = { version = "1", features = ["full"] }
 ```
 

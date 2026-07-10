@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-10
+
+### Added
+
+- **Pre-send cost estimation** (opt-in feature `estimate`). Ask a
+  `GeneratorInfo` what a completion will cost BEFORE sending it:
+  `generator.estimate_cost_usd(&messages, &params).await` returns a
+  deliberately high USD figure to reserve against (assumes no caching, the
+  largest completion the request permits including any reasoning budget, and a
+  one-minute clip for media of unstated length). Text is counted by a built-in
+  `o200k_base` BPE tokenizer (no external tokenizer dependency; 1.6 MB
+  embedded vocabulary) corrected by a measured safety multiplier; images,
+  video frames, and audio seconds are priced at each model's published media
+  rates. A prompt larger than the model accepts is priced as the largest input
+  it does accept, so an estimate always exists; the one error is a model the
+  catalog does not know.
+- **Published price lookup on the generator** (no feature needed):
+  `generator.model_rates()` fetches OpenRouter's per-provider price sheet (the
+  only public one; it lists first-party vendors at their own standard rates,
+  so it also prices direct OpenAI/Anthropic calls). A price is a property of
+  (model, provider): rates are the serving provider's own when known
+  (`Provider::openrouter_slug`), else the dearest rate any provider of the
+  model charges, the only ceiling that holds wherever routing lands. Prices
+  are cached on the generator for an hour and clones share the cache; pool
+  long-lived generators keyed by `generator.pricing_key()`.
+  `generator.model_rates_served_by(Some(slug))` prices a per-request routing
+  pin (see `ProviderSettings::billing_provider()`).
+- `GeneratorInfo::with_openrouter_name` sets the model's OpenRouter catalog id
+  when the generator's own model id differs (e.g. Anthropic's dated ids); this
+  is what unlocks estimation for direct-vendor generators.
+- `AudioData::with_duration` / `VideoData::with_duration` declare a clip's
+  length so media estimates stop guessing. The duration is estimation
+  metadata: saved conversation trees keep it, and it is stripped from request
+  payloads so provider schemas never see an unknown key.
+- `TokenPrice` gained `audio_per_mtok` / `image_per_mtok` with honest
+  fallbacks (an unpublished image rate bills as text; an unpublished audio
+  rate at a measured premium multiple).
+- Opt-in `live` feature gates the network/billed integration tests.
+
+### Changed
+
+- **Breaking:** `GeneratorInfo` gained a private field (its price cache), so
+  struct-literal construction outside the crate no longer compiles; use the
+  constructors and builders.
+- **Breaking:** `ProviderSettings::billing_provider()` now returns
+  `Option<String>` (the pinned provider slug, or `None` when routing is free).
+- `ModelRates` is re-exported from the crate root and now lives beside the
+  generator rather than the provider internals.
+
 ## [0.4.6] - 2026-07-07
 
 ### Security

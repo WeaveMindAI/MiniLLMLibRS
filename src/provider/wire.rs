@@ -28,11 +28,24 @@ use crate::message::Message;
 use std::future::Future;
 use std::pin::Pin;
 
+/// What to charge for audio when a model publishes no audio rate, as a multiple of
+/// its text rate.
+///
+/// Every model that does publish one charges a premium: 2x to 3.3x on Gemini,
+/// 12.8x on OpenAI's audio model. This bounds that range, so an unpublished rate
+/// is over-charged rather than silently under-charged. Mistral's Voxtral charges a
+/// thousand times text, but it publishes that rate, so the fallback never applies.
+pub const AUDIO_RATE_FALLBACK_MULTIPLE: f64 = 13.0;
+
 /// Per-token pricing, used to derive cost for providers that report token counts
 /// but no dollar amount (OpenAI, Anthropic, ...). Rates are USD per **million**
 /// tokens (the unit every provider's price sheet quotes), so a number off a
 /// pricing page drops straight in.
+/// Grows as providers invent new billing buckets (`#[non_exhaustive]`), so code
+/// outside this crate constructs it through [`TokenPrice::new`] and the `with_*`
+/// setters, never a struct literal.
 #[derive(Debug, Clone, Default, PartialEq)]
+#[non_exhaustive]
 pub struct TokenPrice {
     /// USD per million full-price input/prompt tokens.
     pub input_per_mtok: f64,
@@ -45,6 +58,23 @@ pub struct TokenPrice {
     /// for a 5-minute cache, ~2× for 1-hour). Falls back to `input_per_mtok` when
     /// `None` (e.g. providers with no separate write charge, like OpenAI).
     pub cache_write_per_mtok: Option<f64>,
+    /// USD per million **audio input** tokens, a steep premium: twice the input
+    /// rate on most models that price it separately, thirteen times on OpenAI's
+    /// audio model, a thousand times on Mistral's Voxtral. `None` when the model
+    /// does not price audio apart from text, in which case the input rate applies.
+    ///
+    /// Not used by [`cost_of`](Self::cost_of): providers fold audio tokens into the
+    /// prompt count on the wire, so a completion's real cost cannot separate them.
+    /// It exists for estimating a call BEFORE it is sent, where the caller knows
+    /// how much audio it is about to send.
+    pub audio_per_mtok: Option<f64>,
+    /// USD per million **image input** tokens. Every model publishing one today
+    /// prices it equal to the input rate, so the fallback is exact rather than a
+    /// guess; it is read anyway so a model that starts charging a premium is
+    /// billed correctly instead of silently under-charged.
+    ///
+    /// Not used by [`cost_of`](Self::cost_of), for the same reason as audio.
+    pub image_per_mtok: Option<f64>,
 }
 
 impl TokenPrice {
@@ -56,6 +86,8 @@ impl TokenPrice {
             output_per_mtok,
             cache_read_per_mtok: None,
             cache_write_per_mtok: None,
+            audio_per_mtok: None,
+            image_per_mtok: None,
         }
     }
 
@@ -66,6 +98,37 @@ impl TokenPrice {
         self.cache_read_per_mtok = Some(read_per_mtok);
         self.cache_write_per_mtok = Some(write_per_mtok);
         self
+    }
+
+    /// Set the audio-input and image-input rates (USD per million tokens). Pass
+    /// `None` for a modality the model does not price apart from text.
+    pub fn with_media_rates(
+        mut self,
+        audio_per_mtok: Option<f64>,
+        image_per_mtok: Option<f64>,
+    ) -> Self {
+        self.audio_per_mtok = audio_per_mtok;
+        self.image_per_mtok = image_per_mtok;
+        self
+    }
+
+    /// What a million audio-input tokens cost.
+    ///
+    /// A model that publishes no audio rate still charges a premium for audio, so
+    /// falling back to the plain input rate would under-charge. Among models that
+    /// do publish one, the premium runs from 2x (Gemini) to 12.8x (OpenAI's audio
+    /// model); [`AUDIO_RATE_FALLBACK_MULTIPLE`] bounds the mainstream range. The
+    /// thousand-fold outlier (Mistral's Voxtral) publishes its rate, so the
+    /// fallback never applies to it.
+    pub fn audio_rate(&self) -> f64 {
+        self.audio_per_mtok
+            .unwrap_or(self.input_per_mtok * AUDIO_RATE_FALLBACK_MULTIPLE)
+    }
+
+    /// What a million image-input tokens cost. Falls back to the plain input rate,
+    /// which is exactly what every model publishing an image rate charges.
+    pub fn image_rate(&self) -> f64 {
+        self.image_per_mtok.unwrap_or(self.input_per_mtok)
     }
 
     /// Price a usage record as a clean weighted sum over the DISJOINT input
@@ -180,6 +243,16 @@ pub struct AppIdentity {
 /// A provider with a different envelope (Anthropic's `/v1/messages` + `content[]`)
 /// overrides the shape methods too.
 pub trait Provider: Send + Sync + std::fmt::Debug {
+    /// This provider's slug in OpenRouter's catalog (`anthropic`, `openai`, ...),
+    /// when it is a vendor the catalog lists. Cost estimation prices a call at
+    /// this provider's own published rates. `None` for a provider the catalog
+    /// does not list as a vendor (a router, a custom API): estimation then falls
+    /// back to the generator's name, and past that to the dearest rate any
+    /// provider of the model charges.
+    fn openrouter_slug(&self) -> Option<&'static str> {
+        None
+    }
+
     // ---- wire shape (default = OpenAI `/chat/completions` + `choices[]`) -------
 
     /// The full completions endpoint URL for `base_url`. Default appends

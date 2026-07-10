@@ -438,6 +438,10 @@ async fn query_generation(
 pub struct OpenAiProvider;
 
 impl Provider for OpenAiProvider {
+    fn openrouter_slug(&self) -> Option<&'static str> {
+        Some("openai")
+    }
+
     fn openai_request_usage(&self, body: &mut serde_json::Value, stream: bool) {
         // OpenAI only emits a usage chunk on streaming when explicitly asked.
         if stream {
@@ -596,6 +600,10 @@ impl AnthropicProvider {
 }
 
 impl Provider for AnthropicProvider {
+    fn openrouter_slug(&self) -> Option<&'static str> {
+        Some("anthropic")
+    }
+
     fn endpoint_url(&self, base_url: &str) -> String {
         format!("{}/v1/messages", base_url.trim_end_matches('/'))
     }

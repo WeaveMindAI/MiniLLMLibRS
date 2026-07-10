@@ -21,8 +21,9 @@ A minimalist, async-first Rust library for LLM interactions with streaming suppo
 - **Template Substitution**: Format kwargs with `{placeholders}` in messages
 - **Thread Serialization**: Save/load conversation threads to/from JSON files
 - **Cost Tracking**: OpenRouter usage accounting with callbacks
+- **Cost Estimation**: what a call will cost *before* it is sent, so you can decide whether to allow it (opt-in `estimate` feature)
 - **Tool Calling**: Normalized `ToolDefinition`/`ToolChoice`/`ToolCall` types; each provider emits its own wire (OpenAI `tools`, Anthropic `tool_use`), streaming included
-- **Multimodal**: Support for images and audio in messages
+- **Multimodal**: Support for images, audio and video in messages
 - **JSON Repair**: Robust handling of malformed JSON from LLM outputs
 - **OpenRouter Compatible**: Works with OpenRouter, OpenAI, and any OpenAI-compatible API
 - **Retry with Backoff**: Built-in exponential backoff and retry logic
@@ -34,9 +35,16 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-minillmlib = "0.2"
+minillmlib = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
+
+### Optional features
+
+| Feature | Default | What it adds |
+| --- | --- | --- |
+| `estimate` | off | [Cost estimation](#estimating-a-calls-cost) before a call is sent. Embeds a 1.6 MB token vocabulary, which a plain completion has no use for. |
+| `live` | off | Integration tests that make real, billed API calls. |
 
 ## Quick Start
 
@@ -385,6 +393,76 @@ let response = user.complete(&generator, Some(&params)).await?;
 
 println!("Total spent: {} credits", *total_cost.lock().unwrap());
 ```
+
+### Estimating a call's cost
+
+Cost tracking tells you what a call *did* cost. Estimation tells you what it *will*
+cost, before you send it, so you can decide whether to allow it. Enable the
+`estimate` feature.
+
+The `GeneratorInfo` you already have answers it directly:
+
+```rust
+use minillmlib::{ChatNode, CompletionParameters, GeneratorInfo};
+
+let generator = GeneratorInfo::openrouter("anthropic/claude-haiku-4.5");
+let params = CompletionParameters::new().with_max_tokens(1024);
+
+let root = ChatNode::root("You are terse.");
+let prompt = root.add_user("Name three primary colours.");
+
+let usd = generator.estimate_cost_usd(&prompt.thread(), &params).await?;
+println!("this call will cost at most ${usd:.6}");
+```
+
+The prices come from OpenRouter's catalog, the one public price sheet, so the
+model is looked up by its OpenRouter id. An OpenRouter generator's model id
+already is one. A direct-vendor generator whose id differs (Anthropic's
+`claude-haiku-4-5-20251001` is the catalog's `anthropic/claude-haiku-4.5`) sets
+`.with_openrouter_name("anthropic/claude-haiku-4.5")`: that is what unlocks
+estimation. The only failure is a model the catalog does not know at all.
+
+One model is served by many providers at different prices. The rates used are the
+serving provider's own when the generator knows who that is (the built-in
+Anthropic and OpenAI providers do); otherwise the **dearest** rate any provider
+of the model charges, the only figure that is a ceiling wherever routing lands.
+
+The figure is a **deliberately high estimate**, never a best guess, because only
+the low side lets you overspend. Every assumption leans expensive; it is still an
+estimate (tokenizers differ across model families), so treat it as a strong
+ceiling to reserve against, not a guarantee. Concretely it assumes:
+
+- no prompt caching (caching only ever makes the real cost lower);
+- the largest completion the request permits, including any reasoning budget,
+  which providers bill *on top of* `max_tokens` rather than inside it;
+- a minute of media, for a clip whose length you did not state. **If your prompt
+  carries audio or video, set the clip's real duration** (`with_duration`): the
+  one-minute assumption overshoots short clips by a lot (measured live: 5-7x on
+  an 8-second clip) and *undershoots* anything longer than a minute, which is
+  the one way the estimate can come in below the real cost.
+
+There is no error case. A prompt counted larger than the model accepts is priced
+as the largest input that model *does* accept, so you always get a number and never
+have to handle "unknown". Replace it with the real cost once the call returns.
+
+To sharpen the estimate:
+
+- If your OpenRouter routing settings pin one provider (a single-entry `order`
+  with fallbacks off), `ProviderSettings::billing_provider()` gives you its slug;
+  price with `generator.model_rates_served_by(Some(&slug))` to get exactly that
+  provider's rates.
+- Pass a clip's length with `AudioData::with_duration` / `VideoData::with_duration`
+  and the estimate stops guessing. Audio is billed by the second, at up to a
+  thousand times the text rate on some models, so this matters.
+
+**Keep your generators alive.** Each `GeneratorInfo` caches the prices it fetches
+for an hour, and clones share the cache, so reusing a generator means only the
+first estimate in an hour touches the network; recreating it per call refetches
+the price sheet every time. The library holds no registry: if you multiplex many
+models, pool your generators yourself in a map keyed by
+`generator.pricing_key()` (the catalog model id plus provider slug, exactly the
+pair that determines the price). If you never estimate costs, none of this
+matters.
 
 ## API Reference
 

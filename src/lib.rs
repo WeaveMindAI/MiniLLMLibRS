@@ -19,6 +19,9 @@
 //! - **Cost Tracking**: Per-provider usage & cost accounting behind the [`Provider`]
 //!   trait; enforced tracking via [`CompletionContext`], with honest
 //!   [`CostResolution`] (`Resolved`/`Unpriced`/`Unknown`, never a fake $0)
+//! - **Cost Estimation**: What a call will cost BEFORE it is sent, so a caller can
+//!   decide whether to allow it. Off by default: enable the `estimate` feature.
+//!   See [Estimating a call's cost](#estimating-a-calls-cost).
 //! - **JSON Repair**: Robust handling of malformed JSON from LLM outputs
 //! - **Async/Parallel**: Built on Tokio for high-performance async operations
 //!
@@ -40,6 +43,21 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Estimating a call's cost
+//!
+//! With the `estimate` feature, the generator answers directly (a deliberately
+//! high figure, to reserve against):
+//!
+//! ```no_run
+//! # #[cfg(feature = "estimate")]
+//! # async fn example(generator: minillmlib::GeneratorInfo, prompt: minillmlib::ChatNode, params: minillmlib::CompletionParameters) -> minillmlib::error::Result<()> {
+//! let usd = generator.estimate_cost_usd(&prompt.thread(), &params).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! See [`GeneratorInfo::estimate_cost_usd`] and [`GeneratorInfo::model_rates`].
 
 // Core modules
 pub mod chat_node;
@@ -59,7 +77,7 @@ pub use chat_node::{
 };
 pub use error::{MiniLLMError, Result};
 pub use generator::{
-    CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings,
+    CompletionParameters, GeneratorInfo, ModelRates, NodeCompletionParameters, ProviderSettings,
     ReasoningConfig,
 };
 pub use json_repair::{loads, repair_json, JsonValue, RepairOptions};
@@ -70,8 +88,15 @@ pub use message::{
 pub use provider::{
     resolve_claude_subscription_auth, AnthropicProvider, AppIdentity, Auth, CompletionResponse,
     CostCallback, CostInfo, CostOutcome, CostResolution, GenericProvider, LLMClient,
-    OpenAiProvider, OpenRouterProvider, PostStreamCtx, Provider, StreamChunk, StreamingCompletion,
-    TokenPrice, Usage,
+    OpenAiProvider, OpenRouterProvider, PostStreamCtx, Provider, StreamChunk,
+    StreamingCompletion, TokenPrice, Usage,
+};
+
+/// Pre-call cost estimation. Requires the `estimate` feature, which pulls in a
+/// BPE tokenizer that a plain completion has no use for.
+#[cfg(feature = "estimate")]
+pub use provider::{
+    estimate_cost_usd, estimate_prompt_tokens, PromptEstimate, SAFETY_MULTIPLIER,
 };
 pub use tools::{
     ArgumentStream, FieldHandle, ToolCall, ToolCallAccumulator, ToolCallDelta, ToolChoice,

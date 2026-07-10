@@ -3625,3 +3625,148 @@ async fn test_anthropic_streaming_tool_calls_assemble() {
     assert_eq!(calls[0].name, "get_weather");
     assert!(calls[0].arguments_json().is_ok(), "arguments reassembled");
 }
+
+// ---------------------------------------------------------------------------
+// Model catalog (live). The catalog endpoint is public, so these need no key;
+// they are still `live`-gated because they hit the network.
+// ---------------------------------------------------------------------------
+
+/// Skip a live test that needs no credential, only the network.
+macro_rules! require_network {
+    () => {
+        if !cfg!(feature = "live") {
+            eprintln!("Skipping live test (enable with `cargo test --features live`)");
+            return;
+        }
+    };
+}
+
+#[tokio::test]
+async fn test_catalog_prices_a_first_party_model_with_cache_buckets() {
+    require_network!();
+    let generator = GeneratorInfo::anthropic("sonnet")
+        .with_openrouter_name("anthropic/claude-sonnet-4.6");
+    let rates = generator.model_rates().await.expect("anthropic serves its own sonnet 4.6");
+
+    // Rates are per MILLION tokens once parsed (the wire carries per-token strings).
+    assert!(rates.price.input_per_mtok > 0.1, "{:?}", rates.price);
+    assert!(rates.price.output_per_mtok > rates.price.input_per_mtok, "output costs more than input");
+
+    // Anthropic models publish both cache buckets: read is a discount, write a premium.
+    let read = rates.price.cache_read_per_mtok.expect("sonnet publishes a cache-read rate");
+    let write = rates.price.cache_write_per_mtok.expect("sonnet publishes a cache-write rate");
+    assert!(read < rates.price.input_per_mtok, "cache reads are discounted");
+    assert!(write > rates.price.input_per_mtok, "cache writes carry a premium");
+
+    assert!(rates.context_length > 0);
+}
+
+/// The bug this shape exists to prevent. A model served by many providers has no
+/// single price: `z-ai/glm-5.2` is served by more than twenty, and a real request
+/// was once billed at nearly four times the rate OpenRouter advertises for it.
+/// So an unpinned lookup MUST bound every pinned one.
+#[tokio::test]
+async fn test_an_unpinned_price_bounds_every_provider_that_serves_the_model() {
+    require_network!();
+    let generator = GeneratorInfo::openrouter("z-ai/glm-5.2");
+
+    let bound = generator
+        .model_rates_served_by(None)
+        .await
+        .expect("a catalogued model has endpoints");
+
+    // Fireworks is one of the pricier endpoints; whoever serves it, the unpinned
+    // figure must not come in under them.
+    for slug in ["fireworks", "together", "novita"] {
+        let Ok(pinned) = generator.model_rates_served_by(Some(slug)).await else {
+            continue; // that provider may not serve this model today
+        };
+        assert!(
+            bound.price.output_per_mtok >= pinned.price.output_per_mtok,
+            "the unpinned bound ({}) is under {slug} ({})",
+            bound.price.output_per_mtok,
+            pinned.price.output_per_mtok
+        );
+        assert!(bound.price.input_per_mtok >= pinned.price.input_per_mtok);
+    }
+}
+
+#[tokio::test]
+async fn test_catalog_refuses_an_unknown_model_rather_than_guessing_a_price() {
+    require_network!();
+    let err = GeneratorInfo::openrouter("definitely/not-a-real-model")
+        .model_rates()
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("not in OpenRouter's catalog"), "{msg}");
+}
+
+/// A provider that does not serve a model prices at the dearest of ALL its
+/// providers: a known model must always estimate, and the dearest rate is the
+/// only bound that holds wherever the call really lands.
+#[tokio::test]
+async fn test_a_provider_that_does_not_serve_the_model_prices_at_the_dearest_of_all() {
+    require_network!();
+    let generator = GeneratorInfo::openrouter("anthropic/claude-sonnet-4.6");
+    let fallback = generator
+        .model_rates_served_by(Some("fireworks"))
+        .await
+        .expect("a known model always prices, whoever was named");
+    let dearest = generator.model_rates_served_by(None).await.expect("known model");
+    assert_eq!(fallback, dearest);
+}
+
+#[tokio::test]
+async fn test_catalog_serves_repeat_lookups_of_one_model_from_one_fetch() {
+    require_network!();
+    // Two lookups over the SAME generator must not refetch: the endpoints are
+    // cached on the generator, and the provider filter is applied to the cache.
+    let generator = GeneratorInfo::openrouter("anthropic/claude-sonnet-4.6");
+    generator.model_rates().await.expect("first lookup");
+    generator
+        .model_rates_served_by(Some("anthropic"))
+        .await
+        .expect("second selection over the cached endpoints");
+}
+
+/// The property the whole reservation scheme rests on: an estimate made BEFORE a
+/// call must never come in under what the call really cost, or a caller can spend
+/// past a limit it was told it had room for.
+#[cfg(feature = "estimate")]
+#[tokio::test]
+async fn test_estimate_is_an_upper_bound_on_a_real_completion() {
+    require_live!("OPENROUTER_API_KEY");
+
+    let model = "anthropic/claude-haiku-4.5";
+    let generator = GeneratorInfo::openrouter(model);
+
+    let root = ChatNode::root("You are terse.");
+    let user = root.add_user("Name three primary colours, comma separated, nothing else.");
+    let params = CompletionParameters::new().with_max_tokens(64);
+
+    // The generator pins no provider, so the estimate is bounded by the dearest
+    // endpoint that routing could pick. One call: the generator resolves the
+    // catalog id, fetches and caches the rates, and prices the prompt.
+    let estimate = generator
+        .estimate_cost_usd(&user.thread(), &params)
+        .await
+        .expect("haiku is catalogued");
+
+    let captured: Arc<Mutex<Option<CostInfo>>> = Arc::new(Mutex::new(None));
+    let slot = captured.clone();
+    let callback: AsyncCostCallback = Arc::new(move |info: CostInfo, _m: CompletionMeta| {
+        let slot = slot.clone();
+        Box::pin(async move { *slot.lock().unwrap() = Some(info); })
+    });
+    let ctx = CompletionContext::new(generator, serde_json::json!({}), callback, "https://weavemind.ai", "Weft");
+    let node_params = NodeCompletionParameters::new().with_params(params);
+    user.complete_tracked(&ctx, Some(&node_params)).await.expect("live completion");
+
+    let actual = captured.lock().unwrap().take().expect("cost reported").cost;
+    assert!(actual > 0.0, "a real completion cost something");
+    assert!(
+        estimate >= actual,
+        "the estimate ({estimate}) must never fall below the real cost ({actual})"
+    );
+}

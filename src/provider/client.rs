@@ -33,6 +33,12 @@ impl Default for LLMClient {
 }
 
 impl LLMClient {
+    /// The underlying pooled HTTP client, for the crate's other HTTP needs (the
+    /// model catalog), so they share one connection pool.
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.client
+    }
+
     /// Create a new LLM client with default settings.
     ///
     /// The 600s timeout is a connection-pool-wide backstop; individual requests

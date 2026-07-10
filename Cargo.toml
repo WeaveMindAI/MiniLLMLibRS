@@ -1,6 +1,6 @@
 [package]
 name = "minillmlib"
-version = "0.4.6"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.86"
 description = "A minimalist, async-first Rust library for LLM interactions with streaming support"
@@ -24,6 +24,13 @@ exclude = [
 # Run with: `cargo test --features live` (needs OPENROUTER_API_KEY and/or
 # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN in the environment).
 live = []
+
+# Estimate a completion's cost BEFORE sending it. Off by default: it is only
+# useful to a caller that must gate a request on affordability, and it embeds a
+# 1.6 MB token vocabulary that a plain completion never needs. The price lookup
+# (`GeneratorInfo::model_rates`) is NOT behind this feature: pricing a completion
+# after the fact needs rates, not a tokenizer.
+estimate = ["dep:regex"]
 
 [lib]
 name = "minillmlib"
@@ -61,6 +68,10 @@ dotenvy = "0.15"
 secrecy = { version = "0.10", features = ["serde"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+
+# Splitting a prompt into byte-pair pieces, for the optional `estimate` feature.
+# The rust-lang regex crate; the tokenizer itself is ours (`provider::bpe`).
+regex = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -19,6 +19,18 @@ pub struct GeneratorInfo {
     /// Model identifier (e.g., "anthropic/claude-3.5-sonnet")
     pub model: String,
 
+    /// The model's id in OpenRouter's catalog, when it differs from [`model`].
+    /// This is what unlocks cost estimation: [`model_rates`] looks the model up
+    /// by this name, falling back to `model` itself (an OpenRouter generator's
+    /// model id already IS the catalog id, so it needs nothing set here). A
+    /// vendor's own id rarely matches the catalog's (Anthropic's
+    /// `claude-haiku-4-5-20251001` is the catalog's `anthropic/claude-haiku-4.5`),
+    /// so a direct-vendor generator sets this to become estimable.
+    ///
+    /// [`model`]: Self::model
+    /// [`model_rates`]: Self::model_rates
+    pub openrouter_name: Option<String>,
+
     /// How this generator authenticates. The provider maps it to concrete headers
     /// (OpenAI-wire `Authorization: Bearer`, Anthropic `x-api-key` or bearer).
     pub auth: Auth,
@@ -54,6 +66,11 @@ pub struct GeneratorInfo {
 
     /// Default completion parameters for this generator
     pub default_params: super::CompletionParameters,
+
+    /// The generator's cached view of OpenRouter's published prices for its
+    /// model, behind [`model_rates`](Self::model_rates). Clones share it, so a
+    /// generator kept alive keeps its prices warm instead of refetching per call.
+    pub(crate) prices: super::pricing::PriceCache,
 }
 
 impl GeneratorInfo {
@@ -68,6 +85,7 @@ impl GeneratorInfo {
             name: name.into(),
             base_url: base_url.into(),
             model: model.into(),
+            openrouter_name: None,
             auth: Auth::None,
             custom_headers: Vec::new(),
             supports_streaming: true,
@@ -78,7 +96,16 @@ impl GeneratorInfo {
             token_price: None,
             app_attribution: None,
             default_params: super::CompletionParameters::default(),
+            prices: super::pricing::PriceCache::default(),
         }
+    }
+
+    /// Set the model's OpenRouter catalog id, which unlocks cost estimation when
+    /// the generator's own model id is not already a catalog id (see
+    /// [`openrouter_name`](Self::openrouter_name)).
+    pub fn with_openrouter_name(mut self, name: impl Into<String>) -> Self {
+        self.openrouter_name = Some(name.into());
+        self
     }
 
     /// Set the calling-app identity for provider usage attribution.
@@ -247,5 +274,44 @@ impl GeneratorInfo {
         model: impl Into<String>,
     ) -> Self {
         Self::new(name, base_url, model)
+    }
+}
+
+#[cfg(test)]
+mod estimation_identity_tests {
+    use super::GeneratorInfo;
+
+    /// The names cost estimation resolves from live on concepts that already
+    /// exist: the provider impl knows its catalog slug, and the generator knows
+    /// its model's catalog id (defaulting to the model itself).
+    #[test]
+    fn each_vendor_provider_knows_its_own_catalog_slug() {
+        assert_eq!(GeneratorInfo::anthropic("m").provider.openrouter_slug(), Some("anthropic"));
+        assert_eq!(
+            GeneratorInfo::claude_subscription("m").provider.openrouter_slug(),
+            Some("anthropic"),
+            "a subscription call is still served by Anthropic"
+        );
+        assert_eq!(GeneratorInfo::openai("m").provider.openrouter_slug(), Some("openai"));
+    }
+
+    /// A router or a custom API is not a vendor the catalog lists, so it claims
+    /// no slug: estimation bounds over every provider serving the model, which is
+    /// exactly where such a call may land.
+    #[test]
+    fn a_router_or_custom_provider_claims_no_slug() {
+        assert_eq!(GeneratorInfo::openrouter("m").provider.openrouter_slug(), None);
+        assert_eq!(GeneratorInfo::custom("n", "u", "m").provider.openrouter_slug(), None);
+    }
+
+    /// A vendor's own model id rarely matches the catalog's; setting the catalog
+    /// id is what unlocks estimation. Unset, the model id itself is the lookup.
+    #[test]
+    fn the_openrouter_name_defaults_to_unset_and_is_settable() {
+        let plain = GeneratorInfo::anthropic("claude-haiku-4-5-20251001");
+        assert_eq!(plain.openrouter_name, None);
+
+        let estimable = plain.with_openrouter_name("anthropic/claude-haiku-4.5");
+        assert_eq!(estimable.openrouter_name.as_deref(), Some("anthropic/claude-haiku-4.5"));
     }
 }

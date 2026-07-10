@@ -123,6 +123,28 @@ impl ProviderSettings {
         Self::default()
     }
 
+    /// The provider slug whose rates will bill this request, as far as these
+    /// settings can promise, or `None` when the request may be served by anyone.
+    ///
+    /// Exactly one provider is guaranteed only when `order` names one AND
+    /// fallbacks are off. With fallbacks left on (OpenRouter's default), a listed
+    /// provider is a preference, not a promise, and the request may be served by
+    /// anyone: the price must then be bounded across every provider. Same for
+    /// `sort`, which reorders candidates without excluding any.
+    ///
+    /// This is deliberately conservative. Reading it as "pinned" when it is not
+    /// under-estimates the cost, and an estimate that is sometimes low is the one
+    /// failure a reservation cannot tolerate. When a request pins a provider this
+    /// way, price it with
+    /// [`GeneratorInfo::model_rates_served_by`](crate::GeneratorInfo::model_rates_served_by)
+    /// passing the pinned slug, so the estimate reflects who will really bill.
+    pub fn billing_provider(&self) -> Option<String> {
+        match (&self.order, self.allow_fallbacks) {
+            (Some(order), Some(false)) if order.len() == 1 => Some(order[0].clone()),
+            _ => None,
+        }
+    }
+
     /// Serialize to the JSON value OpenRouter expects under the request's
     /// `"provider"` key (used by [`CompletionParameters::with_openrouter_routing`]).
     pub fn to_value(&self) -> serde_json::Value {
@@ -616,5 +638,54 @@ impl NodeCompletionParameters {
     {
         self.cost_callback = Some(std::sync::Arc::new(callback));
         self
+    }
+}
+
+#[cfg(test)]
+mod billing_provider_tests {
+    use super::ProviderSettings;
+
+    /// The only configuration that guarantees who bills us: one provider, no
+    /// fallbacks. Anything else may be served by anyone.
+    #[test]
+    fn one_provider_with_fallbacks_off_pins_the_price() {
+        let settings = ProviderSettings::new()
+            .with_order(vec!["anthropic".into()])
+            .with_fallbacks(false);
+        assert_eq!(settings.billing_provider(), Some("anthropic".to_string()));
+    }
+
+    /// Fallbacks left on (OpenRouter's default) make an ordered provider a
+    /// preference, not a promise. Reading it as pinned would under-estimate.
+    #[test]
+    fn one_provider_with_fallbacks_on_is_not_pinned() {
+        let settings = ProviderSettings::new().with_order(vec!["anthropic".into()]);
+        assert_eq!(settings.billing_provider(), None);
+
+        let explicit =
+            ProviderSettings::new().with_order(vec!["anthropic".into()]).with_fallbacks(true);
+        assert_eq!(explicit.billing_provider(), None);
+    }
+
+    #[test]
+    fn several_ordered_providers_are_not_pinned_even_without_fallbacks() {
+        let settings = ProviderSettings::new()
+            .with_order(vec!["anthropic".into(), "amazon-bedrock".into()])
+            .with_fallbacks(false);
+        assert_eq!(settings.billing_provider(), None);
+    }
+
+    /// `sort` reorders the candidates without excluding any, so it pins nothing.
+    /// Even "cheapest first" can land on a dearer provider when the cheapest is
+    /// unavailable, which is exactly the case that must not under-estimate.
+    #[test]
+    fn sorting_by_price_does_not_pin_a_provider() {
+        assert_eq!(ProviderSettings::new().sort_by_price().billing_provider(), None);
+        assert_eq!(ProviderSettings::new().sort_by_throughput().billing_provider(), None);
+    }
+
+    #[test]
+    fn no_settings_at_all_leaves_routing_free() {
+        assert_eq!(ProviderSettings::new().billing_provider(), None);
     }
 }

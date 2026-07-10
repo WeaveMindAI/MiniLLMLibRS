@@ -4,8 +4,12 @@ use super::media::MediaData;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Audio data for multimodal messages
+/// Audio data for multimodal messages.
+///
+/// Grows as more metadata proves billing-relevant, so it is built through
+/// `from_*` plus the `with_*` setters, never a struct literal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AudioData {
     /// Base64-encoded audio data, OR the URL verbatim when [`is_url`](Self::is_url).
     pub base64_data: String,
@@ -18,6 +22,15 @@ pub struct AudioData {
     /// format string can ever turn inline bytes into a counterfeit URL.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_url: bool,
+
+    /// Duration in seconds (if known).
+    ///
+    /// Providers bill audio by the second (Gemini at 32 tokens per second), and
+    /// the duration lives inside the container's header, which this type does not
+    /// parse. A caller that already opened the file knows it and should say so:
+    /// without it a request's cost cannot be bounded before it is sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f64>,
 
     /// Sample rate in Hz (if known)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -56,6 +69,7 @@ impl MediaData for AudioData {
             base64_data: base64_data.into(),
             format: format.into(),
             is_url: false,
+            duration_secs: None,
             sample_rate: None,
             channels: None,
         }
@@ -81,9 +95,19 @@ impl AudioData {
             base64_data: url.into(),
             format: String::new(),
             is_url: true,
+            duration_secs: None,
             sample_rate: None,
             channels: None,
         }
+    }
+
+    /// Set the clip's duration in seconds. Cost estimation assumes a default
+    /// length for a clip without one, which overshoots short clips and
+    /// undershoots long ones; providers bill audio by the second, so pass the
+    /// real length for an accurate figure.
+    pub fn with_duration(mut self, duration_secs: f64) -> Self {
+        self.duration_secs = Some(duration_secs);
+        self
     }
 
     /// Set sample rate
