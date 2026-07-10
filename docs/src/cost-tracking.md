@@ -26,6 +26,36 @@ Every reported `CostInfo` carries a `CostResolution`:
 
 Check `resolution` before trusting `cost`.
 
+## The reply and the bill together: `complete_costed`
+
+The simplest tracked shape, and the right default when the caller itself acts
+on the cost (settles a budget hold, gates the next call, logs it right there):
+the `CostInfo` comes back WITH the result, no callback to register.
+
+```rust,no_run
+use minillmlib::{ChatNode, GeneratorInfo};
+
+# async fn run() {
+let generator = GeneratorInfo::openrouter("google/gemini-2.5-flash-lite");
+let root = ChatNode::root("You are helpful.");
+
+let (result, cost) = root.add_user("Hi").complete_costed(&generator, None).await;
+let reply = result.expect("completion");
+if let Some(cost) = cost {
+    println!("that cost ${:.6} ({:?})", cost.cost, cost.resolution);
+}
+# }
+```
+
+Same accounting as every other tracked path (usage from the response, the
+provider's out-of-band resolution as backstop, never a fake $0). An errored
+completion carries no cost info: the request failed before a billable response
+existed.
+
+When many call sites should feed one central sink instead, use the callback
+shapes below; streaming always goes through them, since a stream's cost
+resolves only after it ends.
+
 ## A callback per completion
 
 ```rust,no_run

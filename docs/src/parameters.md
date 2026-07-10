@@ -35,6 +35,11 @@ let params = CompletionParameters::new()
 | `tools`, `tool_choice`, `parallel_tool_calls` | Normalized tool calling; the provider emits its wire shape (see [Tool Calling](./tool-calling.md)) |
 | `extra` | Provider-specific keys (the honest escape hatch, e.g. OpenRouter routing) |
 
+`CompletionParameters` is also a serde type: camelCase keys, every field
+optional (missing ones take the defaults above), unknown keys ignored. A flat
+JSON settings object (`{"maxTokens": 1024, "temperature": 0.2}`) deserializes
+directly, which is handy when parameters arrive as user-facing config.
+
 ## NodeCompletionParameters
 
 ```rust,no_run

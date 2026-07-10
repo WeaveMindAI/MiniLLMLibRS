@@ -1457,6 +1457,12 @@ impl ChatNode {
 
     /// Complete with enforced cost tracking via a [`crate::CompletionContext`].
     ///
+    /// One of two delivery shapes for the SAME accounting: this one pushes the
+    /// cost into the sink the context registered, for callers that route every
+    /// completion's cost to one place regardless of call site. When the caller
+    /// itself acts on the bill, use [`complete_costed`](Self::complete_costed),
+    /// which returns it with the result instead.
+    ///
     /// Always enables usage tracking and reports cost on every completion through
     /// the context's callback. How cost is determined is the generator's provider
     /// accounting: from the response's usage when present, otherwise via the
@@ -1480,6 +1486,32 @@ impl ChatNode {
         ctx.report_cost(ctx.cost_for_response(&response).await)
             .await;
         Ok(node)
+    }
+
+    /// Complete and hand back what it cost, no callback ceremony.
+    ///
+    /// One of two delivery shapes for the SAME accounting (usage from the
+    /// response, the provider's out-of-band resolution as the backstop, never a
+    /// fake $0): this one returns the [`CostInfo`](crate::CostInfo) WITH the
+    /// result, for the caller that acts on the bill itself. When many call
+    /// sites should feed one central sink instead, use
+    /// [`complete_tracked`](Self::complete_tracked); streaming always goes
+    /// through the tracked shape, since a stream's cost resolves only after it
+    /// ends. An errored completion carries no cost info: the request failed
+    /// before a billable response existed.
+    pub async fn complete_costed(
+        &self,
+        generator: &GeneratorInfo,
+        params: Option<&NodeCompletionParameters>,
+    ) -> (Result<ChatNode>, Option<crate::CostInfo>) {
+        let tracked_params = tracked_params(params);
+        match self.complete_collect(generator, Some(&tracked_params)).await {
+            Ok((node, response)) => {
+                let info = crate::tracking::cost_for_response(generator, &response).await;
+                (Ok(node), Some(info))
+            }
+            Err(e) => (Err(e), None),
+        }
     }
 
     /// Complete streaming with enforced cost tracking.

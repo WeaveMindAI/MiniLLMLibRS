@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-07-10
+
+### Added
+
+- `ChatNode::complete_costed(&generator, params)`: complete and get the
+  [`CostInfo`] back WITH the result, no `CompletionContext`/callback ceremony.
+  Same accounting as `complete_tracked` (usage from the response, the
+  provider's out-of-band resolution as backstop, never a fake $0); an errored
+  completion carries no cost info.
+- `CompletionParameters` (and `ResponseFormat`) are now serde types: camelCase
+  keys, every field optional (missing ones take the defaults), unknown keys
+  ignored, so a flat JSON settings object deserializes directly.
+
 ## [0.5.0] - 2026-07-10
 
 ### Added

@@ -12,7 +12,12 @@ use serde::{Deserialize, Serialize};
 /// knobs that have no normalized meaning (e.g. OpenRouter routing) go through
 /// [`extra`](Self::extra), the documented escape hatch: they are honestly just
 /// extra wire keys, not pretend-universal fields.
-#[derive(Debug, Clone)]
+///
+/// Serde uses camelCase keys with every field optional (missing fields take
+/// the defaults), so a JSON settings object (`{"maxTokens": 1024,
+/// "temperature": 0.2}`) deserializes directly; unknown keys are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct CompletionParameters {
     /// Maximum tokens to generate. The provider emits it under its own key
     /// (`max_completion_tokens`, `max_tokens`, Anthropic's required `max_tokens`).
@@ -368,7 +373,8 @@ impl CompletionParameters {
 /// JSON object. "Plain text" is the absence of a constraint (`response_format:
 /// None`), not a variant: a `Text` variant would be unreachable decoration until
 /// a builder produced it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ResponseFormat {
     /// Force the model to emit a JSON object.
     JsonObject,
@@ -638,6 +644,47 @@ impl NodeCompletionParameters {
     {
         self.cost_callback = Some(std::sync::Arc::new(callback));
         self
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::CompletionParameters;
+
+    /// A JSON settings object deserializes directly: camelCase keys, every
+    /// field optional (missing ones take the defaults), unknown keys ignored.
+    /// This is what lets a node's flat config map onto the parameters without
+    /// a hand-written field-by-field translation.
+    #[test]
+    fn a_camel_case_settings_object_deserializes_directly() {
+        let params: CompletionParameters = serde_json::from_value(serde_json::json!({
+            "maxTokens": 1024,
+            "temperature": 0.25,
+            "topP": 0.9,
+            "frequencyPenalty": 0.5,
+            "seed": 7,
+            "somebodyElsesKey": true,
+        }))
+        .unwrap();
+        assert_eq!(params.max_tokens, Some(1024));
+        assert_eq!(params.temperature, Some(0.25));
+        assert_eq!(params.top_p, Some(0.9));
+        assert_eq!(params.frequency_penalty, Some(0.5));
+        assert_eq!(params.seed, Some(7));
+
+        // Missing fields take the type's defaults, same as ::new().
+        let defaults: CompletionParameters = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(defaults.max_tokens, CompletionParameters::new().max_tokens);
+        assert_eq!(defaults.temperature, CompletionParameters::new().temperature);
+    }
+
+    #[test]
+    fn parameters_round_trip_through_json() {
+        let params = CompletionParameters::new().with_max_tokens(64).with_seed(3);
+        let back: CompletionParameters =
+            serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
+        assert_eq!(back.max_tokens, Some(64));
+        assert_eq!(back.seed, Some(3));
     }
 }
 

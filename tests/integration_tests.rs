@@ -2535,6 +2535,33 @@ async fn test_complete_tracked_fires_callback() {
     );
 }
 
+/// The callback-free shape: the reply and its bill come back together. Same
+/// accounting as the callback path, so the two must agree on what a call cost.
+#[tokio::test]
+async fn test_complete_costed_returns_the_bill_with_the_reply() {
+    dotenvy::dotenv().ok();
+    require_live!("OPENROUTER_API_KEY");
+
+    let generator = get_text_generator();
+    let root = ChatNode::root("You are a helpful assistant. Be very brief.");
+    let user = root.add_user("Say hello in exactly 3 words.");
+
+    let (result, cost) = user.complete_costed(&generator, None).await;
+    let reply = result.expect("live completion");
+    assert!(!reply.text().unwrap_or_default().is_empty());
+
+    let cost = cost.expect("a successful completion always carries cost info");
+    assert!(cost.cost > 0.0, "a real completion cost something: {}", cost.cost);
+    assert!(cost.prompt_tokens > 0 && cost.completion_tokens > 0);
+
+    // A request that never reaches a provider errs with no bill.
+    let dead = GeneratorInfo::new("Dead", "http://127.0.0.1:9", "no-model");
+    let no_retry = NodeCompletionParameters::new().with_retry(0);
+    let (result, cost) = user.complete_costed(&dead, Some(&no_retry)).await;
+    assert!(result.is_err(), "an unreachable endpoint fails loudly");
+    assert!(cost.is_none(), "and carries no cost info");
+}
+
 #[tokio::test]
 async fn test_complete_tracked_with_params() {
     dotenvy::dotenv().ok();
