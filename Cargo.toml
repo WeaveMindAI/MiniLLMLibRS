@@ -1,6 +1,6 @@
 [package]
 name = "minillmlib"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 rust-version = "1.86"
 description = "A minimalist, async-first Rust library for LLM interactions with streaming support"

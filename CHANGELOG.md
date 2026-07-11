@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-07-11
+
+### Added
+
+- `TrackedStream::collect_or_cancel(interrupt)`: drain until the stream
+  finishes or the given future fires, with the cost reported on every
+  outcome (`CollectOutcome::{Finished, Interrupted, Failed}`): a finished
+  stream books from usage, an interrupted one is cancelled and resolves the
+  actual out-of-band, a transport-errored one books nothing. The one-call
+  shape for consumers with a kill switch; hand-rolling the race and
+  forgetting `cancel().await` would silently lose the interrupted call's
+  cost.
+
 ## [0.5.2] - 2026-07-11
 
 ### Fixed

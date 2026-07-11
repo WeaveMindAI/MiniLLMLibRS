@@ -103,6 +103,20 @@ pub struct TrackedStream {
     rejected: bool,
 }
 
+/// How a [`TrackedStream::collect_or_cancel`] drain ended. Cost reporting has
+/// already happened by the time the caller holds one (booked on `Finished`,
+/// resolved out-of-band on `Interrupted`, nothing on `Failed`).
+#[derive(Debug)]
+pub enum CollectOutcome {
+    /// The stream ran to its end; the full response, cost booked from usage.
+    Finished(crate::provider::CompletionResponse),
+    /// `interrupt` fired first; the stream was cancelled and the actual cost
+    /// resolved out-of-band.
+    Interrupted,
+    /// The transport failed mid-stream; nothing was booked.
+    Failed(crate::error::MiniLLMError),
+}
+
 impl TrackedStream {
     pub(crate) fn new(
         inner: crate::provider::StreamingCompletion,
@@ -123,6 +137,54 @@ impl TrackedStream {
         &mut self,
     ) -> Option<crate::error::Result<crate::provider::StreamChunk>> {
         self.inner.next_chunk().await
+    }
+
+    /// Drain until the stream finishes or `interrupt` fires, whichever comes
+    /// first, with the cost reported through the context's callback on every
+    /// outcome: a finished stream books from its usage, an interrupted one is
+    /// cancelled (the actual cost resolves out-of-band, e.g. OpenRouter's
+    /// generation ledger, which bills the full generation whether the client
+    /// hangs up or not), and a transport-errored one books nothing (not an
+    /// accepted generation). The one-call shape for a consumer with a kill
+    /// switch: racing the chunks yourself and forgetting `cancel().await` on
+    /// the kill path would silently lose the interrupted call's cost.
+    ///
+    /// Unlike [`collect`](Self::collect) + [`report_cost`](Self::report_cost),
+    /// the finished cost is booked BEFORE the caller sees the content: use
+    /// this when the call must be paid for regardless of content quality
+    /// (metering), not when the caller may still [`reject`](Self::reject).
+    pub async fn collect_or_cancel(
+        mut self,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) -> CollectOutcome {
+        tokio::pin!(interrupt);
+        loop {
+            tokio::select! {
+                chunk = self.next_chunk() => match chunk {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        // A failed stream is not an accepted generation:
+                        // cancel books nothing, loudly.
+                        self.cancel().await;
+                        return CollectOutcome::Failed(e);
+                    }
+                    None => break,
+                },
+                _ = &mut interrupt => {
+                    self.cancel().await;
+                    return CollectOutcome::Interrupted;
+                }
+            }
+        }
+        let response = match self.collect().await {
+            Ok(response) => response,
+            Err(e) => {
+                self.cancel().await;
+                return CollectOutcome::Failed(e);
+            }
+        };
+        self.report_cost(&response).await;
+        CollectOutcome::Finished(response)
     }
 
     /// Drain the stream and return the typed response. Does NOT report cost, so
@@ -437,6 +499,71 @@ mod tests {
         assert!((cost.cost - 0.010).abs() < 1e-9, "cost was {}", cost.cost);
         assert_eq!(cost.total_tokens, 7);
         assert_eq!(cost.resolution, CostResolution::Resolved);
+    }
+
+    #[tokio::test]
+    async fn collect_or_cancel_finishes_and_books_once() {
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        let (stream, tx) = StreamingCompletion::from_channel("test-model", "gen-1", true);
+        let tracked = TrackedStream::new(stream, &ctx);
+
+        tx.send(Ok(StreamChunk::content("hi"))).await.unwrap();
+        tx.send(Ok(StreamChunk {
+            finish_reason: Some("stop".into()),
+            usage: Some(Usage {
+                cost: Some(0.002),
+                uncached_input_tokens: 5,
+                completion_tokens: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        // A never-firing interrupt: the stream must finish on its own.
+        let outcome = tracked.collect_or_cancel(std::future::pending()).await;
+        let CollectOutcome::Finished(response) = outcome else {
+            panic!("expected Finished, got {outcome:?}");
+        };
+        assert_eq!(response.content, "hi");
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1, "finished stream books exactly once");
+        assert_eq!(captured[0].0.resolution, CostResolution::Resolved);
+    }
+
+    #[tokio::test]
+    async fn collect_or_cancel_interrupt_cancels_and_still_books() {
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        // Empty id: cancel's out-of-band query is skipped and the cost books
+        // as an honest Unknown; the point pinned here is that an interrupted
+        // drain still fires the callback (never a silent drop).
+        let (stream, tx) = StreamingCompletion::from_channel("test-model", "", true);
+        let tracked = TrackedStream::new(stream, &ctx);
+        tx.send(Ok(StreamChunk::content("partial"))).await.unwrap();
+
+        // Interrupt fires immediately; the channel stays open (a live stream).
+        let outcome = tracked.collect_or_cancel(std::future::ready(())).await;
+        assert!(matches!(outcome, CollectOutcome::Interrupted), "got {outcome:?}");
+        let captured = log.lock().unwrap();
+        assert_eq!(captured.len(), 1, "an interrupted stream still books its cost");
+        assert_eq!(captured[0].0.resolution, CostResolution::Unknown);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn collect_or_cancel_transport_error_books_nothing() {
+        let (ctx, log) = capturing_context(serde_json::json!({}));
+        let (stream, tx) = StreamingCompletion::from_channel("test-model", "gen-1", true);
+        let tracked = TrackedStream::new(stream, &ctx);
+        tx.send(Ok(StreamChunk::content("hi"))).await.unwrap();
+        tx.send(Err(crate::error::MiniLLMError::Stream("wire cut".into()))).await.unwrap();
+        drop(tx);
+
+        let outcome = tracked.collect_or_cancel(std::future::pending()).await;
+        assert!(matches!(outcome, CollectOutcome::Failed(_)), "got {outcome:?}");
+        assert!(log.lock().unwrap().is_empty(), "a failed stream books nothing");
     }
 
     #[tokio::test]

@@ -102,7 +102,9 @@ pub use tools::{
     ArgumentStream, FieldHandle, ToolCall, ToolCallAccumulator, ToolCallDelta, ToolChoice,
     ToolDefinition,
 };
-pub use tracking::{AsyncCostCallback, CompletionContext, CompletionMeta, TrackedStream};
+pub use tracking::{
+    AsyncCostCallback, CollectOutcome, CompletionContext, CompletionMeta, TrackedStream,
+};
 pub use utils::{
     configure_logging, extract_json, extract_json_value, pretty_json, to_dict, LogLevel,
 };
