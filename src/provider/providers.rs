@@ -334,19 +334,22 @@ impl Provider for OpenRouterProvider {
             if ctx.generation_id.is_empty() {
                 return CostOutcome::unknown();
             }
-            // OpenRouter may not finalize the generation record immediately; retry
-            // with backoff before giving up to an honest Unknown.
-            for delay_secs in [1u64, 2, 4] {
-                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            // OpenRouter may not finalize the generation record immediately; poll
+            // every second before giving up to an honest Unknown. Plain 1s polls,
+            // no backoff: the endpoint is free and the caller is waiting, so the
+            // only cost of polling fast is nothing and the cost of polling slow
+            // is user-visible latency. Measured: a completed generation's record
+            // appears ~9s after it finishes, and a CANCELLED call's only after
+            // the upstream generation runs to its own end anyway (client aborts
+            // do not stop these routes) plus the same ~9s, i.e. ~18s for a short
+            // generation. We poll for 25s.
+            for _ in 0..25 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if let Some(usage) = query_generation(ctx.client, ctx.generation_id, ctx.auth).await
                 {
                     return self.cost_of(usage, ctx.price);
                 }
-                tracing::debug!(
-                    "OpenRouter generation {} not found yet (waited {}s)",
-                    ctx.generation_id,
-                    delay_secs
-                );
+                tracing::debug!("OpenRouter generation {} not found yet", ctx.generation_id);
             }
             CostOutcome::unknown()
         })
@@ -389,18 +392,23 @@ async fn query_generation(
         return None;
     }
     let json: serde_json::Value = response.json().await.ok()?;
-    let data = json.get("data")?;
+    usage_from_generation_record(json.get("data")?)
+}
 
-    // The /generation record uses different field names than chat-completions
-    // usage. Require a numeric total_cost: a record without it is unresolved, not
-    // free. tokens come from the native_tokens_* fields.
-    //
-    // IMPORTANT: unlike chat-completions `usage.cost` (the OpenRouter fee only,
-    // with the BYOK upstream charge in a SEPARATE field that `cost_of` adds),
-    // `/generation.total_cost` is the ALL-IN charge (upstream + fee). So we put it
-    // in `cost` and leave `upstream_inference_cost: None`, otherwise `cost_of`
-    // would re-add the upstream charge and double-count it.
-    let cost = data["total_cost"].as_f64()?;
+/// Parse a `/generation` record's `data` object into a `Usage`. Pure.
+///
+/// The record uses different field names than chat-completions usage. Require a
+/// numeric total_cost: a record without it is unresolved, not free. Tokens come
+/// from the native_tokens_* fields.
+///
+/// Same two-part money split as chat-completions usage: `total_cost` is what
+/// OpenRouter charged in credits, and on a BYOK route it is 0 with the real
+/// upstream charge (billed on the user's own provider key) in
+/// `upstream_inference_cost`. The all-in cost is their sum; it goes in `cost`
+/// with `upstream_inference_cost: None` so `cost_of` can't re-add it.
+fn usage_from_generation_record(data: &serde_json::Value) -> Option<Usage> {
+    let cost =
+        data["total_cost"].as_f64()? + data["upstream_inference_cost"].as_f64().unwrap_or(0.0);
     let prompt = data["tokens_prompt"].as_u64().unwrap_or(0) as u32;
     let completion = data["tokens_completion"].as_u64().unwrap_or(0) as u32;
     // `tokens_prompt` is total input; `native_tokens_cached` is the cached-read
@@ -1473,5 +1481,40 @@ mod tests {
         let resolved = p.cost_of(usage(1_000_000, 1_000_000), Some(&price));
         assert_eq!(resolved.resolution, CostResolution::Resolved);
         assert!((resolved.usd - 6.0).abs() < 1e-9);
+    }
+
+    /// A real BYOK `/generation` record (captured live): OpenRouter's own
+    /// charge is 0 and the upstream provider charge, billed on the user's
+    /// key, is in `upstream_inference_cost`. The parsed cost is their sum,
+    /// never a fake $0.
+    #[test]
+    fn a_byok_generation_record_books_the_upstream_charge() {
+        let data = serde_json::json!({
+            "tokens_prompt": 22, "tokens_completion": 2625,
+            "native_tokens_prompt": 22, "native_tokens_completion": 2230,
+            "native_tokens_reasoning": 0, "native_tokens_cached": 0,
+            "is_byok": true, "total_cost": 0, "upstream_inference_cost": 0.0008942,
+        });
+        let usage = usage_from_generation_record(&data).expect("parses");
+        assert!((usage.cost.unwrap() - 0.0008942).abs() < 1e-12);
+        assert_eq!(usage.upstream_inference_cost, None, "already summed; must not re-add");
+        assert_eq!(usage.uncached_input_tokens, 22);
+        assert_eq!(usage.completion_tokens, 2625);
+    }
+
+    #[test]
+    fn a_credits_generation_record_books_total_cost() {
+        let data = serde_json::json!({
+            "tokens_prompt": 30, "tokens_completion": 1800,
+            "total_cost": 0.000723, "upstream_inference_cost": null,
+        });
+        let usage = usage_from_generation_record(&data).expect("parses");
+        assert!((usage.cost.unwrap() - 0.000723).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_generation_record_without_total_cost_is_unresolved_not_free() {
+        let data = serde_json::json!({ "tokens_prompt": 30, "tokens_completion": 1800 });
+        assert!(usage_from_generation_record(&data).is_none());
     }
 }

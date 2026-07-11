@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-07-11
+
+### Fixed
+
+- `/generation` record resolution booked $0 for BYOK routes: the record's
+  `total_cost` is OpenRouter's credits charge only, and on BYOK it is 0 with
+  the real upstream charge (billed on the user's own provider key) in
+  `upstream_inference_cost`. The parsed cost is now their sum. The parse is
+  extracted into a pure function pinned by tests built from live records.
+- The out-of-band `/generation` resolver gave up before records become
+  readable. Measured live: a completed generation's record appears ~9s after
+  it finishes, and a CANCELLED call's only after the upstream generation runs
+  to its own end (client aborts do not stop these routes) plus the same ~9s.
+  The resolver now polls every second for 25s (the endpoint is free; backoff
+  only added latency).
+
+### Added
+
+- `TrackedStream::id()`: the provider's generation/response id (empty until
+  the first chunk), so callers can correlate a stream with the provider's
+  ledger.
+
 ## [0.5.1] - 2026-07-10
 
 ### Added

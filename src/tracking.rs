@@ -201,6 +201,11 @@ impl TrackedStream {
     pub fn accumulated(&self) -> &str {
         self.inner.accumulated()
     }
+
+    /// The provider's generation/response id (empty until the first chunk).
+    pub fn id(&self) -> &str {
+        self.inner.id()
+    }
 }
 
 impl Drop for TrackedStream {
@@ -610,7 +615,7 @@ mod tests {
         // would book an Unknown cost IMMEDIATELY (no out-of-band HTTP for an empty
         // id), so the assertion below deterministically distinguishes "drained →
         // booked nothing" from "not drained → booked a phantom" without racing a
-        // slow detached query (a non-empty id would book only after a ~7s backoff,
+        // slow detached query (a non-empty id would book only after a ~25s poll,
         // making this assertion pass for the wrong reason).
         let (ctx, log) = capturing_context(serde_json::json!({}));
         let (stream, tx) = StreamingCompletion::from_channel("test-model", "", true);
