@@ -1,6 +1,6 @@
 [package]
 name = "minillmlib"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2021"
 rust-version = "1.86"
 description = "A minimalist, async-first Rust library for LLM interactions with streaming support"
@@ -45,8 +45,17 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
 futures = "0.3"
 
-# HTTP & Streaming
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# HTTP & Streaming. rustls, not the default native-tls: native-tls links
+# OpenSSL, which forces every consumer to ship OpenSSL dev headers wherever it
+# builds (a slim container image has none). rustls needs nothing from the
+# system.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+    "charset",
+    "http2",
+] }
 reqwest-eventsource = "0.6"
 
 # Serialization
