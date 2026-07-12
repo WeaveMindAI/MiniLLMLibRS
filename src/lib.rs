@@ -88,8 +88,8 @@ pub use message::{
 pub use provider::{
     resolve_claude_subscription_auth, AnthropicProvider, AppIdentity, Auth, CompletionResponse,
     CostCallback, CostInfo, CostOutcome, CostResolution, GenericProvider, LLMClient,
-    OpenAiProvider, OpenRouterProvider, PostStreamCtx, Provider, StreamChunk,
-    StreamingCompletion, TokenPrice, Usage,
+    OpenAiProvider, OpenRouterProvider, PostStreamCtx, Provider, StreamChunk, StreamingCompletion,
+    TokenPrice, Usage,
 };
 
 /// Pre-call cost estimation. Requires the `estimate` feature, which pulls in a

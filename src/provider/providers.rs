@@ -345,7 +345,8 @@ impl Provider for OpenRouterProvider {
             // generation. We poll for 25s.
             for _ in 0..25 {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if let Some(usage) = query_generation(ctx.client, ctx.generation_id, ctx.auth).await
+                if let Some(usage) =
+                    query_generation(ctx.client, ctx.base_url, ctx.generation_id, ctx.auth).await
                 {
                     return self.cost_of(usage, ctx.price);
                 }
@@ -360,20 +361,20 @@ impl Provider for OpenRouterProvider {
 /// `None` on any failure or when the record carries no usable cost.
 async fn query_generation(
     client: &reqwest::Client,
+    base_url: &str,
     generation_id: &str,
     auth: &Auth,
 ) -> Option<Usage> {
     let api_key = auth.secret()?;
     let encoded =
         url::form_urlencoded::byte_serialize(generation_id.as_bytes()).collect::<String>();
-    let url = format!("https://openrouter.ai/api/v1/generation?id={}", encoded);
+    // The generator's own address, never a hardcoded host: a generator
+    // pointed at a gateway resolves its costs through that gateway too.
+    let url = format!("{}/generation?id={}", base_url.trim_end_matches('/'), encoded);
 
     let response = match client
         .get(&url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", api_key.expose_secret()),
-        )
+        .header("Authorization", format!("Bearer {}", api_key.expose_secret()))
         .send()
         .await
     {

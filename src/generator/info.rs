@@ -71,6 +71,7 @@ pub struct GeneratorInfo {
     /// model, behind [`model_rates`](Self::model_rates). Clones share it, so a
     /// generator kept alive keeps its prices warm instead of refetching per call.
     pub(crate) prices: super::pricing::PriceCache,
+
 }
 
 impl GeneratorInfo {
@@ -98,6 +99,14 @@ impl GeneratorInfo {
             default_params: super::CompletionParameters::default(),
             prices: super::pricing::PriceCache::default(),
         }
+    }
+
+    /// Point this generator at a different address (a gateway, a proxy, a
+    /// self-hosted endpoint). Every request the crate makes for it,
+    /// completions and out-of-band cost queries alike, goes here.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
     }
 
     /// Set the model's OpenRouter catalog id, which unlocks cost estimation when

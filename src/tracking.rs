@@ -383,6 +383,7 @@ pub(crate) async fn cost_for_response(
         None => {
             let ctx = crate::provider::PostStreamCtx {
                 client: reqwest_client(),
+                base_url: &generator.base_url,
                 generation_id: &response.id,
                 auth: &generator.auth,
                 price,

@@ -212,6 +212,10 @@ impl CostOutcome {
 /// stream). Carries what a provider needs to hit its own endpoint, if it has one.
 pub struct PostStreamCtx<'a> {
     pub client: &'a reqwest::Client,
+    /// The generator's base URL. The query goes to the same address as the
+    /// call it resolves (and authenticates with the same credential), so a
+    /// generator pointed at a gateway keeps working: never hardcode a host.
+    pub base_url: &'a str,
     pub generation_id: &'a str,
     pub auth: &'a Auth,
     pub price: Option<&'a TokenPrice>,

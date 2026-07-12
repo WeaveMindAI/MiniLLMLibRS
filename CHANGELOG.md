@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-07-11
+
+### Added
+
+- `GeneratorInfo::with_base_url`: point a generator at a different address (a
+  gateway, a proxy, a self-hosted endpoint). EVERY request the crate makes
+  for that generator goes there.
+
+### Fixed
+
+- The OpenRouter cost lookup (`/generation`) hardcoded `openrouter.ai`, so a
+  generator pointed at a gateway resolved its costs past the gateway (and
+  with a credential that gateway had not substituted). It now uses the
+  generator's own address, like every other request.
+- `PostStreamCtx` (the context a provider gets for an out-of-band cost query)
+  carries `base_url` instead of assuming the provider's host. Affects only
+  code implementing the `Provider` trait itself.
+
 ## [0.5.3] - 2026-07-11
 
 ### Added
