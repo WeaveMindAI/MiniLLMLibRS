@@ -79,7 +79,9 @@ impl LLMClient {
     /// plain `reqwest::Client` or a `ClientWithMiddleware`; every request
     /// this crate makes goes through it.
     pub fn with_client(client: impl Into<ClientWithMiddleware>) -> Self {
-        Self { client: client.into() }
+        Self {
+            client: client.into(),
+        }
     }
 
     /// Build headers for a request.

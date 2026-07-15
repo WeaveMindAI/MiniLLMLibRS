@@ -72,7 +72,8 @@ impl GeneratorInfo {
     /// Prices are cached on this generator for an hour; clones share the cache,
     /// so keep generators alive rather than recreating them per call.
     pub async fn model_rates(&self) -> Result<ModelRates> {
-        self.model_rates_served_by(Some(&self.catalog_provider())).await
+        self.model_rates_served_by(Some(&self.catalog_provider()))
+            .await
     }
 
     /// The key that determines this generator's prices: its catalog model id and
@@ -105,7 +106,8 @@ impl GeneratorInfo {
     pub async fn model_rates_served_by(&self, provider: Option<&str>) -> Result<ModelRates> {
         // The catalog read rides this generator's client, like every other
         // request made on its behalf (an injected client sees it too).
-        self.rates_with(provider, |model| fetch_endpoints(self.client(), model)).await
+        self.rates_with(provider, |model| fetch_endpoints(self.client(), model))
+            .await
     }
 
     /// A deliberately high estimate, in USD, of what one completion will cost:
@@ -119,7 +121,8 @@ impl GeneratorInfo {
     /// which overshoots short clips several-fold and UNDERSHOOTS anything
     /// longer, the one gap in the high-side guarantee.
     #[cfg(feature = "estimate")]
-    pub async fn estimate_cost_usd(&self,
+    pub async fn estimate_cost_usd(
+        &self,
         messages: &[crate::message::Message],
         params: &super::CompletionParameters,
     ) -> Result<f64> {
@@ -264,7 +267,9 @@ fn per_mtok(field: &str, raw: &str) -> Result<f64> {
     let malformed = |why: &str| {
         MiniLLMError::MalformedResponse(format!("model catalog: {field} rate {raw:?} {why}"))
     };
-    let parsed = raw.parse::<f64>().map_err(|_| malformed("is not a number"))?;
+    let parsed = raw
+        .parse::<f64>()
+        .map_err(|_| malformed("is not a number"))?;
     if !parsed.is_finite() {
         return Err(malformed("is not finite"));
     }
@@ -283,10 +288,15 @@ impl Endpoint {
         // Only set cache rates when BOTH are published. `TokenPrice` falls back to
         // the input rate for a missing bucket, which is the correct behaviour for
         // an endpoint that does not price that bucket separately.
-        match (&self.pricing.input_cache_read, &self.pricing.input_cache_write) {
+        match (
+            &self.pricing.input_cache_read,
+            &self.pricing.input_cache_write,
+        ) {
             (Some(r), Some(w)) => {
-                price = price
-                    .with_cache_rates(per_mtok("input_cache_read", r)?, per_mtok("input_cache_write", w)?)
+                price = price.with_cache_rates(
+                    per_mtok("input_cache_read", r)?,
+                    per_mtok("input_cache_write", w)?,
+                )
             }
             // Read-only caching (OpenAI charges nothing to write): a write costs
             // the plain input rate, which is what leaving it unset yields.
@@ -294,15 +304,30 @@ impl Endpoint {
             _ => {}
         }
         price = price.with_media_rates(
-            self.pricing.audio.as_deref().map(|r| per_mtok("audio", r)).transpose()?,
-            self.pricing.image.as_deref().map(|r| per_mtok("image", r)).transpose()?,
+            self.pricing
+                .audio
+                .as_deref()
+                .map(|r| per_mtok("audio", r))
+                .transpose()?,
+            self.pricing
+                .image
+                .as_deref()
+                .map(|r| per_mtok("image", r))
+                .transpose()?,
         );
 
         let context_length = self.context_length.ok_or_else(|| {
-            MiniLLMError::MalformedResponse(format!("model catalog: endpoint {} has no context_length", self.tag))
+            MiniLLMError::MalformedResponse(format!(
+                "model catalog: endpoint {} has no context_length",
+                self.tag
+            ))
         })?;
 
-        Ok(ModelRates { price, max_completion_tokens: self.max_completion_tokens, context_length })
+        Ok(ModelRates {
+            price,
+            max_completion_tokens: self.max_completion_tokens,
+            context_length,
+        })
     }
 }
 
@@ -353,16 +378,16 @@ fn price_endpoints(endpoints: Vec<Endpoint>) -> Result<Vec<PricedEndpoint>> {
 /// buckets alongside its dear one, and a sibling could bill more on exactly
 /// those. The token limits are likewise the most permissive, so an output bound
 /// is never understated. For a single candidate this is exactly its price.
-fn select(
-    endpoints: &[PricedEndpoint],
-    model: &str,
-    provider: Option<&str>,
-) -> Result<ModelRates> {
+fn select(endpoints: &[PricedEndpoint], model: &str, provider: Option<&str>) -> Result<ModelRates> {
     let matches_provider = |e: &&PricedEndpoint| match provider {
         Some(slug) => e.provider_slug.eq_ignore_ascii_case(slug),
         None => true,
     };
-    let candidates: Vec<&PricedEndpoint> = match endpoints.iter().filter(matches_provider).collect::<Vec<_>>() {
+    let candidates: Vec<&PricedEndpoint> = match endpoints
+        .iter()
+        .filter(matches_provider)
+        .collect::<Vec<_>>()
+    {
         served if !served.is_empty() => served,
         _ => endpoints.iter().collect(),
     };
@@ -386,17 +411,27 @@ fn select(
         };
 
         worst = Some(match worst {
-            None => ModelRates { price: effective, ..rates },
+            None => ModelRates {
+                price: effective,
+                ..rates
+            },
             Some(w) => ModelRates {
                 price: TokenPrice {
                     input_per_mtok: w.price.input_per_mtok.max(input),
                     output_per_mtok: w.price.output_per_mtok.max(output),
-                    cache_read_per_mtok: max_rate(w.price.cache_read_per_mtok, effective.cache_read_per_mtok),
-                    cache_write_per_mtok: max_rate(w.price.cache_write_per_mtok, effective.cache_write_per_mtok),
+                    cache_read_per_mtok: max_rate(
+                        w.price.cache_read_per_mtok,
+                        effective.cache_read_per_mtok,
+                    ),
+                    cache_write_per_mtok: max_rate(
+                        w.price.cache_write_per_mtok,
+                        effective.cache_write_per_mtok,
+                    ),
                     audio_per_mtok: max_rate(w.price.audio_per_mtok, effective.audio_per_mtok),
                     image_per_mtok: max_rate(w.price.image_per_mtok, effective.image_per_mtok),
                 },
-                max_completion_tokens: match (w.max_completion_tokens, rates.max_completion_tokens) {
+                max_completion_tokens: match (w.max_completion_tokens, rates.max_completion_tokens)
+                {
                     // No published cap is the LEAST restrictive, so it wins.
                     (None, _) | (_, None) => None,
                     (Some(a), Some(b)) => Some(a.max(b)),
@@ -433,7 +468,9 @@ fn is_model_id_char(c: char) -> bool {
 /// an error.
 fn validate_model_id(model: &str) -> Result<()> {
     let refuse = |why: &str| {
-        Err(MiniLLMError::InvalidParameter(format!("model id {model:?} {why}, so it cannot be priced")))
+        Err(MiniLLMError::InvalidParameter(format!(
+            "model id {model:?} {why}, so it cannot be priced"
+        )))
     };
 
     if model.is_empty() {
@@ -444,7 +481,10 @@ fn validate_model_id(model: &str) -> Result<()> {
     }
     // Made of legal characters, yet `.` and `..` mean "here" and "up one" to every
     // URL parser. A model is never named either.
-    if model.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..") {
+    if model
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
         return refuse("has an empty or dotted path segment");
     }
     Ok(())
@@ -457,7 +497,12 @@ mod tests {
     /// Parse a catalog response the same way a fetch does, so a test sees the
     /// failure exactly where a real response would produce it.
     fn parse(json: &str) -> Result<Vec<PricedEndpoint>> {
-        price_endpoints(serde_json::from_str::<EndpointsResponse>(json).unwrap().data.endpoints)
+        price_endpoints(
+            serde_json::from_str::<EndpointsResponse>(json)
+                .unwrap()
+                .data
+                .endpoints,
+        )
     }
 
     /// The same, for a response known to be well formed.
@@ -469,7 +514,10 @@ mod tests {
     /// carry float error and must never be compared with `==`.
     #[track_caller]
     fn assert_rate(actual: f64, expected: f64) {
-        assert!((actual - expected).abs() < 1e-9, "rate {actual} is not {expected}");
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "rate {actual} is not {expected}"
+        );
     }
 
     /// Three providers, three prices. Real shape: `glm-5.2` spans 0.54 to 3.00 in
@@ -537,12 +585,20 @@ mod tests {
             {"tag":"anthropic","context_length":200000,
              "pricing":{"prompt":"0.000002","completion":"0.00001"}}
         ]}}"#;
-        let bedrock =
-            select(&endpoints(json), "anthropic/claude-sonnet-5", Some("amazon-bedrock")).unwrap();
+        let bedrock = select(
+            &endpoints(json),
+            "anthropic/claude-sonnet-5",
+            Some("amazon-bedrock"),
+        )
+        .unwrap();
         assert_rate(bedrock.price.output_per_mtok, 11.0);
 
-        let direct =
-            select(&endpoints(json), "anthropic/claude-sonnet-5", Some("anthropic")).unwrap();
+        let direct = select(
+            &endpoints(json),
+            "anthropic/claude-sonnet-5",
+            Some("anthropic"),
+        )
+        .unwrap();
         assert_rate(direct.price.output_per_mtok, 10.0);
     }
 
@@ -593,10 +649,16 @@ mod tests {
         // This endpoint prices neither image nor audio. An image bills exactly as
         // text; audio always carries a premium, so it bills at the assumed multiple.
         assert_rate(rates.price.image_rate(), 5.0);
-        assert_rate(rates.price.audio_rate(), 5.0 * crate::provider::wire::AUDIO_RATE_FALLBACK_MULTIPLE);
+        assert_rate(
+            rates.price.audio_rate(),
+            5.0 * crate::provider::wire::AUDIO_RATE_FALLBACK_MULTIPLE,
+        );
 
         // Which is what a write really costs, resolved or not.
-        let usage = crate::provider::Usage { cache_write_tokens: 1_000_000, ..Default::default() };
+        let usage = crate::provider::Usage {
+            cache_write_tokens: 1_000_000,
+            ..Default::default()
+        };
         assert!((rates.price.cost_of(&usage) - 5.0).abs() < 1e-9);
     }
 
@@ -635,7 +697,9 @@ mod tests {
     /// and a cheaper sibling would win the bound.
     #[test]
     fn a_rate_that_is_not_a_finite_non_negative_number_fails_the_fetch() {
-        for bad in ["free", "NaN", "nan", "inf", "-inf", "infinity", "1e400", "-1", "-0.5"] {
+        for bad in [
+            "free", "NaN", "nan", "inf", "-inf", "infinity", "1e400", "-1", "-0.5",
+        ] {
             let json = format!(
                 r#"{{"data":{{"endpoints":[{{"tag":"x","context_length":1000,
                    "pricing":{{"prompt":"{bad}","completion":"0.000001"}}}}]}}}}"#
@@ -643,7 +707,10 @@ mod tests {
             let Err(err) = parse(&json) else {
                 panic!("rate {bad:?} was accepted; it must fail loudly");
             };
-            assert!(matches!(err, MiniLLMError::MalformedResponse(_)), "{bad:?}: {err:?}");
+            assert!(
+                matches!(err, MiniLLMError::MalformedResponse(_)),
+                "{bad:?}: {err:?}"
+            );
         }
     }
 
@@ -658,7 +725,10 @@ mod tests {
             {"tag":"dear","context_length":1000,
              "pricing":{"prompt":"NaN","completion":"0.00001"}}
         ]}}"#;
-        assert!(parse(json).is_err(), "one poisoned endpoint condemns the model");
+        assert!(
+            parse(json).is_err(),
+            "one poisoned endpoint condemns the model"
+        );
     }
 
     /// A fetch that never touches the network: it counts its calls and hands back a
@@ -684,12 +754,18 @@ mod tests {
         // The same model through OpenRouter prices at the dearest of ALL its
         // providers, not at Anthropic's own rate, so the keys must differ.
         let routed = GeneratorInfo::openrouter("anthropic/claude-haiku-4.5");
-        assert_eq!(routed.pricing_key(), "openrouter:anthropic/claude-haiku-4.5");
+        assert_eq!(
+            routed.pricing_key(),
+            "openrouter:anthropic/claude-haiku-4.5"
+        );
         assert_ne!(direct.pricing_key(), routed.pricing_key());
 
         // Two independently built but identically configured generators share a
         // key: that is what lets a caller pool them in a map.
-        assert_eq!(routed.pricing_key(), GeneratorInfo::openrouter("anthropic/claude-haiku-4.5").pricing_key());
+        assert_eq!(
+            routed.pricing_key(),
+            GeneratorInfo::openrouter("anthropic/claude-haiku-4.5").pricing_key()
+        );
     }
 
     /// A price already fetched is not fetched again while it is fresh.
@@ -725,7 +801,11 @@ mod tests {
             .rates_with(None, |_| async { fake_fetch(&calls) })
             .await
             .expect("served from the shared cache");
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "the clone reused the fetch");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the clone reused the fetch"
+        );
     }
 
     /// Two provider selections over one generator share the one fetch, and each
@@ -737,13 +817,20 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let generator = generator();
 
-        let any = generator.rates_with(None, |_| async { fake_fetch(&calls) }).await.unwrap();
+        let any = generator
+            .rates_with(None, |_| async { fake_fetch(&calls) })
+            .await
+            .unwrap();
         let pinned = generator
             .rates_with(Some("fireworks"), |_| async { fake_fetch(&calls) })
             .await
             .unwrap();
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "one fetch serves both selections");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one fetch serves both selections"
+        );
         assert_rate(any.price.output_per_mtok, 10.25);
         assert_rate(pinned.price.output_per_mtok, 6.6);
     }
@@ -762,13 +849,20 @@ mod tests {
                 Err(MiniLLMError::Timeout)
             })
             .await;
-        assert!(failed.is_err(), "the error surfaces rather than a zero price");
+        assert!(
+            failed.is_err(),
+            "the error surfaces rather than a zero price"
+        );
 
         generator
             .rates_with(None, |_| async { fake_fetch(&calls) })
             .await
             .expect("the retry succeeds");
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "the failure was not cached");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the failure was not cached"
+        );
     }
 
     /// A failed REFETCH over a populated slot keeps the previous entry, and the
@@ -781,7 +875,10 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let mut generator = generator();
 
-        generator.rates_with(None, |_| async { fake_fetch(&calls) }).await.unwrap();
+        generator
+            .rates_with(None, |_| async { fake_fetch(&calls) })
+            .await
+            .unwrap();
 
         // Switching the model makes the entry stale; the refetch for it fails.
         generator.model = "openai/gpt-5.5".to_string();
@@ -795,9 +892,16 @@ mod tests {
 
         // Back on the first model: served from the surviving entry, no refetch.
         generator.model = "z-ai/glm-5.2".to_string();
-        let rates = generator.rates_with(None, |_| async { fake_fetch(&calls) }).await.unwrap();
+        let rates = generator
+            .rates_with(None, |_| async { fake_fetch(&calls) })
+            .await
+            .unwrap();
         assert_rate(rates.price.output_per_mtok, 10.25);
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "the survivor was served, not refetched");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the survivor was served, not refetched"
+        );
 
         // The other model is still unpriced: it retries rather than reading the
         // survivor's prices. Its fixture prices differently, so the returned rate
@@ -813,7 +917,11 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "the unpriced model refetched");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the unpriced model refetched"
+        );
         assert_rate(other.price.output_per_mtok, 30.0);
     }
 
@@ -826,10 +934,20 @@ mod tests {
         let calls = AtomicUsize::new(0);
         let mut generator = generator();
 
-        generator.rates_with(None, |_| async { fake_fetch(&calls) }).await.unwrap();
+        generator
+            .rates_with(None, |_| async { fake_fetch(&calls) })
+            .await
+            .unwrap();
         generator.model = "openai/gpt-5.5".to_string();
-        generator.rates_with(None, |_| async { fake_fetch(&calls) }).await.unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 2, "a different model is a different fetch");
+        generator
+            .rates_with(None, |_| async { fake_fetch(&calls) })
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a different model is a different fetch"
+        );
     }
 
     /// A lookup on one generator must not wait on a fetch for another: the cache
@@ -876,7 +994,10 @@ mod tests {
         let hostile = [
             ("evil?free=1", "a query would swallow the /endpoints suffix"),
             ("x#frag", "a fragment would truncate the path"),
-            ("../../../models", "traversal would climb out of the api version"),
+            (
+                "../../../models",
+                "traversal would climb out of the api version",
+            ),
             ("a/../b", "traversal, buried mid-path"),
             ("a/./b", "a dot segment resolves away"),
             ("a//b", "an empty segment collapses"),
@@ -889,14 +1010,22 @@ mod tests {
             let Err(err) = validate_model_id(bad) else {
                 panic!("{bad:?} was accepted, but {why}");
             };
-            assert!(matches!(err, MiniLLMError::InvalidParameter(_)), "{bad:?}: {err:?}");
+            assert!(
+                matches!(err, MiniLLMError::InvalidParameter(_)),
+                "{bad:?}: {err:?}"
+            );
         }
     }
 
     /// A real model id is accepted, separator and all.
     #[test]
     fn a_real_model_id_is_accepted() {
-        for real in ["anthropic/claude-sonnet-4.6", "openai/gpt-5.5", "o3", "z-ai/glm-5.2"] {
+        for real in [
+            "anthropic/claude-sonnet-4.6",
+            "openai/gpt-5.5",
+            "o3",
+            "z-ai/glm-5.2",
+        ] {
             assert!(validate_model_id(real).is_ok(), "{real} is a real id");
         }
     }

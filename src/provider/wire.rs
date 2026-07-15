@@ -117,7 +117,7 @@ impl TokenPrice {
     /// A model that publishes no audio rate still charges a premium for audio, so
     /// falling back to the plain input rate would under-charge. Among models that
     /// do publish one, the premium runs from 2x (Gemini) to 12.8x (OpenAI's audio
-    /// model); [`AUDIO_RATE_FALLBACK_MULTIPLE`] bounds the mainstream range. The
+    /// model); `AUDIO_RATE_FALLBACK_MULTIPLE` bounds the mainstream range. The
     /// thousand-fold outlier (Mistral's Voxtral) publishes its rate, so the
     /// fallback never applies to it.
     pub fn audio_rate(&self) -> f64 {

@@ -1508,7 +1508,10 @@ impl ChatNode {
         params: Option<&NodeCompletionParameters>,
     ) -> (Result<ChatNode>, Option<crate::CostInfo>) {
         let tracked_params = tracked_params(params);
-        match self.complete_collect(generator, Some(&tracked_params)).await {
+        match self
+            .complete_collect(generator, Some(&tracked_params))
+            .await
+        {
             Ok((node, response)) => {
                 let info = crate::tracking::cost_for_response(generator, &response).await;
                 (Ok(node), Some(info))

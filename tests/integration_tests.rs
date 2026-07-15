@@ -2551,7 +2551,11 @@ async fn test_complete_costed_returns_the_bill_with_the_reply() {
     assert!(!reply.text().unwrap_or_default().is_empty());
 
     let cost = cost.expect("a successful completion always carries cost info");
-    assert!(cost.cost > 0.0, "a real completion cost something: {}", cost.cost);
+    assert!(
+        cost.cost > 0.0,
+        "a real completion cost something: {}",
+        cost.cost
+    );
     assert!(cost.prompt_tokens > 0 && cost.completion_tokens > 0);
 
     // A request that never reaches a provider errs with no bill.
@@ -3671,19 +3675,37 @@ macro_rules! require_network {
 #[tokio::test]
 async fn test_catalog_prices_a_first_party_model_with_cache_buckets() {
     require_network!();
-    let generator = GeneratorInfo::anthropic("sonnet")
-        .with_openrouter_name("anthropic/claude-sonnet-4.6");
-    let rates = generator.model_rates().await.expect("anthropic serves its own sonnet 4.6");
+    let generator =
+        GeneratorInfo::anthropic("sonnet").with_openrouter_name("anthropic/claude-sonnet-4.6");
+    let rates = generator
+        .model_rates()
+        .await
+        .expect("anthropic serves its own sonnet 4.6");
 
     // Rates are per MILLION tokens once parsed (the wire carries per-token strings).
     assert!(rates.price.input_per_mtok > 0.1, "{:?}", rates.price);
-    assert!(rates.price.output_per_mtok > rates.price.input_per_mtok, "output costs more than input");
+    assert!(
+        rates.price.output_per_mtok > rates.price.input_per_mtok,
+        "output costs more than input"
+    );
 
     // Anthropic models publish both cache buckets: read is a discount, write a premium.
-    let read = rates.price.cache_read_per_mtok.expect("sonnet publishes a cache-read rate");
-    let write = rates.price.cache_write_per_mtok.expect("sonnet publishes a cache-write rate");
-    assert!(read < rates.price.input_per_mtok, "cache reads are discounted");
-    assert!(write > rates.price.input_per_mtok, "cache writes carry a premium");
+    let read = rates
+        .price
+        .cache_read_per_mtok
+        .expect("sonnet publishes a cache-read rate");
+    let write = rates
+        .price
+        .cache_write_per_mtok
+        .expect("sonnet publishes a cache-write rate");
+    assert!(
+        read < rates.price.input_per_mtok,
+        "cache reads are discounted"
+    );
+    assert!(
+        write > rates.price.input_per_mtok,
+        "cache writes carry a premium"
+    );
 
     assert!(rates.context_length > 0);
 }
@@ -3740,7 +3762,10 @@ async fn test_a_provider_that_does_not_serve_the_model_prices_at_the_dearest_of_
         .model_rates_served_by(Some("fireworks"))
         .await
         .expect("a known model always prices, whoever was named");
-    let dearest = generator.model_rates_served_by(None).await.expect("known model");
+    let dearest = generator
+        .model_rates_served_by(None)
+        .await
+        .expect("known model");
     assert_eq!(fallback, dearest);
 }
 
@@ -3784,11 +3809,21 @@ async fn test_estimate_is_an_upper_bound_on_a_real_completion() {
     let slot = captured.clone();
     let callback: AsyncCostCallback = Arc::new(move |info: CostInfo, _m: CompletionMeta| {
         let slot = slot.clone();
-        Box::pin(async move { *slot.lock().unwrap() = Some(info); })
+        Box::pin(async move {
+            *slot.lock().unwrap() = Some(info);
+        })
     });
-    let ctx = CompletionContext::new(generator, serde_json::json!({}), callback, "https://weavemind.ai", "Weft");
+    let ctx = CompletionContext::new(
+        generator,
+        serde_json::json!({}),
+        callback,
+        "https://weavemind.ai",
+        "Weft",
+    );
     let node_params = NodeCompletionParameters::new().with_params(params);
-    user.complete_tracked(&ctx, Some(&node_params)).await.expect("live completion");
+    user.complete_tracked(&ctx, Some(&node_params))
+        .await
+        .expect("live completion");
 
     let actual = captured.lock().unwrap().take().expect("cost reported").cost;
     assert!(actual > 0.0, "a real completion cost something");

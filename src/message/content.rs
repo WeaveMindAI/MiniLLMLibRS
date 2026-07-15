@@ -223,7 +223,8 @@ impl MessageContent {
                 // keep it; only the request payload sheds it.
                 for part in value.as_array_mut().expect("parts serialize to an array") {
                     for media_key in ["input_audio", "video_url"] {
-                        if let Some(media) = part.get_mut(media_key).and_then(|v| v.as_object_mut()) {
+                        if let Some(media) = part.get_mut(media_key).and_then(|v| v.as_object_mut())
+                        {
                             media.remove("duration_secs");
                         }
                     }
@@ -344,9 +345,18 @@ mod tests {
 
         let parts = wire.as_array().expect("parts stay an array");
         assert_eq!(parts[0]["text"], "what is in this?");
-        assert!(parts[1]["input_audio"].get("duration_secs").is_none(), "{wire}");
-        assert_eq!(parts[1]["input_audio"]["format"], "mp3", "only the duration is shed");
-        assert!(parts[2]["video_url"].get("duration_secs").is_none(), "{wire}");
+        assert!(
+            parts[1]["input_audio"].get("duration_secs").is_none(),
+            "{wire}"
+        );
+        assert_eq!(
+            parts[1]["input_audio"]["format"], "mp3",
+            "only the duration is shed"
+        );
+        assert!(
+            parts[2]["video_url"].get("duration_secs").is_none(),
+            "{wire}"
+        );
         assert_eq!(parts[2]["video_url"]["url"], "https://x/y.mp4");
     }
 

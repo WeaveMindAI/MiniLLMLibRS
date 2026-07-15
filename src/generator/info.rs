@@ -321,13 +321,21 @@ mod estimation_identity_tests {
     /// its model's catalog id (defaulting to the model itself).
     #[test]
     fn each_vendor_provider_knows_its_own_catalog_slug() {
-        assert_eq!(GeneratorInfo::anthropic("m").provider.openrouter_slug(), Some("anthropic"));
         assert_eq!(
-            GeneratorInfo::claude_subscription("m").provider.openrouter_slug(),
+            GeneratorInfo::anthropic("m").provider.openrouter_slug(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            GeneratorInfo::claude_subscription("m")
+                .provider
+                .openrouter_slug(),
             Some("anthropic"),
             "a subscription call is still served by Anthropic"
         );
-        assert_eq!(GeneratorInfo::openai("m").provider.openrouter_slug(), Some("openai"));
+        assert_eq!(
+            GeneratorInfo::openai("m").provider.openrouter_slug(),
+            Some("openai")
+        );
     }
 
     /// A router or a custom API is not a vendor the catalog lists, so it claims
@@ -335,8 +343,16 @@ mod estimation_identity_tests {
     /// exactly where such a call may land.
     #[test]
     fn a_router_or_custom_provider_claims_no_slug() {
-        assert_eq!(GeneratorInfo::openrouter("m").provider.openrouter_slug(), None);
-        assert_eq!(GeneratorInfo::custom("n", "u", "m").provider.openrouter_slug(), None);
+        assert_eq!(
+            GeneratorInfo::openrouter("m").provider.openrouter_slug(),
+            None
+        );
+        assert_eq!(
+            GeneratorInfo::custom("n", "u", "m")
+                .provider
+                .openrouter_slug(),
+            None
+        );
     }
 
     /// A vendor's own model id rarely matches the catalog's; setting the catalog
@@ -347,6 +363,9 @@ mod estimation_identity_tests {
         assert_eq!(plain.openrouter_name, None);
 
         let estimable = plain.with_openrouter_name("anthropic/claude-haiku-4.5");
-        assert_eq!(estimable.openrouter_name.as_deref(), Some("anthropic/claude-haiku-4.5"));
+        assert_eq!(
+            estimable.openrouter_name.as_deref(),
+            Some("anthropic/claude-haiku-4.5")
+        );
     }
 }

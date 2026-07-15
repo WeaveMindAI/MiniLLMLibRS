@@ -370,11 +370,18 @@ async fn query_generation(
         url::form_urlencoded::byte_serialize(generation_id.as_bytes()).collect::<String>();
     // The generator's own address, never a hardcoded host: a generator
     // pointed at a gateway resolves its costs through that gateway too.
-    let url = format!("{}/generation?id={}", base_url.trim_end_matches('/'), encoded);
+    let url = format!(
+        "{}/generation?id={}",
+        base_url.trim_end_matches('/'),
+        encoded
+    );
 
     let response = match client
         .get(&url)
-        .header("Authorization", format!("Bearer {}", api_key.expose_secret()))
+        .header(
+            "Authorization",
+            format!("Bearer {}", api_key.expose_secret()),
+        )
         .send()
         .await
     {
@@ -1498,7 +1505,10 @@ mod tests {
         });
         let usage = usage_from_generation_record(&data).expect("parses");
         assert!((usage.cost.unwrap() - 0.0008942).abs() < 1e-12);
-        assert_eq!(usage.upstream_inference_cost, None, "already summed; must not re-add");
+        assert_eq!(
+            usage.upstream_inference_cost, None,
+            "already summed; must not re-add"
+        );
         assert_eq!(usage.uncached_input_tokens, 22);
         assert_eq!(usage.completion_tokens, 2625);
     }

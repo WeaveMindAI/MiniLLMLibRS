@@ -106,6 +106,10 @@ pub struct TrackedStream {
 /// How a [`TrackedStream::collect_or_cancel`] drain ended. Cost reporting has
 /// already happened by the time the caller holds one (booked on `Finished`,
 /// resolved out-of-band on `Interrupted`, nothing on `Failed`).
+// The variant size skew is fine: one short-lived value on the caller's
+// stack, never stored in bulk; boxing the response would tax every caller's
+// happy path to shrink an enum nobody accumulates.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum CollectOutcome {
     /// The stream ran to its end; the full response, cost booked from usage.
@@ -543,9 +547,16 @@ mod tests {
 
         // Interrupt fires immediately; the channel stays open (a live stream).
         let outcome = tracked.collect_or_cancel(std::future::ready(())).await;
-        assert!(matches!(outcome, CollectOutcome::Interrupted), "got {outcome:?}");
+        assert!(
+            matches!(outcome, CollectOutcome::Interrupted),
+            "got {outcome:?}"
+        );
         let captured = log.lock().unwrap();
-        assert_eq!(captured.len(), 1, "an interrupted stream still books its cost");
+        assert_eq!(
+            captured.len(),
+            1,
+            "an interrupted stream still books its cost"
+        );
         assert_eq!(captured[0].0.resolution, CostResolution::Unknown);
         drop(tx);
     }
@@ -556,12 +567,20 @@ mod tests {
         let (stream, tx) = StreamingCompletion::from_channel("test-model", "gen-1", true);
         let tracked = TrackedStream::new(stream, &ctx);
         tx.send(Ok(StreamChunk::content("hi"))).await.unwrap();
-        tx.send(Err(crate::error::MiniLLMError::Stream("wire cut".into()))).await.unwrap();
+        tx.send(Err(crate::error::MiniLLMError::Stream("wire cut".into())))
+            .await
+            .unwrap();
         drop(tx);
 
         let outcome = tracked.collect_or_cancel(std::future::pending()).await;
-        assert!(matches!(outcome, CollectOutcome::Failed(_)), "got {outcome:?}");
-        assert!(log.lock().unwrap().is_empty(), "a failed stream books nothing");
+        assert!(
+            matches!(outcome, CollectOutcome::Failed(_)),
+            "got {outcome:?}"
+        );
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "a failed stream books nothing"
+        );
     }
 
     #[tokio::test]

@@ -20,9 +20,9 @@
 //! cost is known after the call and should always replace it.
 
 use crate::generator::CompletionParameters;
+use crate::generator::ModelRates;
 use crate::message::{ContentPart, Message, MessageContent};
 use crate::provider::bpe;
-use crate::generator::ModelRates;
 use crate::provider::wire::TokenPrice;
 
 /// Corrects `o200k_base`'s systematic undercount on non-GPT tokenizers.
@@ -47,7 +47,7 @@ const TOKENS_PER_MESSAGE: u32 = 4;
 /// image is about half. So this is the honest high figure for one still of
 /// unknown size.
 ///
-/// A video FRAME is a different quantity and costs [`TOKENS_PER_VIDEO_FRAME`]:
+/// A video FRAME is a different quantity and costs `TOKENS_PER_VIDEO_FRAME`:
 /// the provider resamples every frame to one fixed small size, so a frame is
 /// never an arbitrary-resolution still.
 const TOKENS_PER_STILL_IMAGE: u32 = 1_600;
@@ -117,9 +117,9 @@ fn video_frame_tokens_for(secs: f64) -> u64 {
 ///
 /// Text is tokenized and scaled by [`SAFETY_MULTIPLIER`]. A still image costs a
 /// flat upper-bound tile count. A video costs one frame per second of its length,
-/// plus its soundtrack in audio tokens. Audio costs [`AUDIO_TOKENS_PER_SECOND`]
+/// plus its soundtrack in audio tokens. Audio costs `AUDIO_TOKENS_PER_SECOND`
 /// per second. A clip of unstated length is assumed to run
-/// [`DEFAULT_MEDIA_SECONDS`].
+/// `DEFAULT_MEDIA_SECONDS`.
 ///
 /// The counts are unclamped, so they can exceed what a model would accept. Pricing
 /// clamps them: see [`estimate_cost_usd`].
@@ -147,12 +147,14 @@ pub fn estimate_prompt_tokens(messages: &[Message]) -> PromptEstimate {
                         // of a frame per second, which is the safe direction.
                         ContentPart::Video { video_url } => {
                             let secs = media_seconds(video_url.duration_secs);
-                            image_tokens = image_tokens.saturating_add(video_frame_tokens_for(secs));
+                            image_tokens =
+                                image_tokens.saturating_add(video_frame_tokens_for(secs));
                             audio_tokens = audio_tokens.saturating_add(audio_tokens_for(secs));
                         }
                         ContentPart::Audio { input_audio } => {
-                            audio_tokens = audio_tokens
-                                .saturating_add(audio_tokens_for(media_seconds(input_audio.duration_secs)))
+                            audio_tokens = audio_tokens.saturating_add(audio_tokens_for(
+                                media_seconds(input_audio.duration_secs),
+                            ))
                         }
                     }
                 }
@@ -180,8 +182,8 @@ pub fn estimate_prompt_tokens(messages: &[Message]) -> PromptEstimate {
 pub struct PromptEstimate {
     /// Text tokens, billed at the plain input rate.
     pub text_tokens: u64,
-    /// Image tokens: a still costs [`TOKENS_PER_STILL_IMAGE`], a video's frames
-    /// cost [`TOKENS_PER_VIDEO_FRAME`] each. Billed at the image rate.
+    /// Image tokens: a still costs `TOKENS_PER_STILL_IMAGE`, a video's frames
+    /// cost `TOKENS_PER_VIDEO_FRAME` each. Billed at the image rate.
     pub image_tokens: u64,
     /// Audio tokens, including a video's soundtrack. Billed at the audio rate,
     /// which runs from one to a thousand times the input rate.
@@ -283,7 +285,6 @@ pub fn estimate_cost_usd(
     (input + output) / 1_000_000.0
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,18 +322,27 @@ mod tests {
         ];
         for (text, truth) in corpus {
             let est = estimate_prompt_tokens(&[user(text)]).text_tokens;
-            assert!(est >= *truth, "estimate {est} under-counts {truth} real tokens for {text:?}");
+            assert!(
+                est >= *truth,
+                "estimate {est} under-counts {truth} real tokens for {text:?}"
+            );
         }
     }
 
     #[test]
     fn an_explicit_max_tokens_bounds_the_output_but_never_exceeds_the_model_ceiling() {
         let r = rates(Some(8_000), 200_000);
-        let p = CompletionParameters { max_tokens: Some(500), ..Default::default() };
+        let p = CompletionParameters {
+            max_tokens: Some(500),
+            ..Default::default()
+        };
         assert_eq!(max_output_tokens(&p, &r), 500);
 
         // A caller asking for more than the model can emit is bounded by the model.
-        let p = CompletionParameters { max_tokens: Some(999_999), ..Default::default() };
+        let p = CompletionParameters {
+            max_tokens: Some(999_999),
+            ..Default::default()
+        };
         assert_eq!(max_output_tokens(&p, &r), 8_000);
     }
 
@@ -342,7 +352,10 @@ mod tests {
     #[test]
     fn the_default_max_tokens_is_what_gets_priced() {
         let r = rates(Some(64_000), 200_000);
-        assert_eq!(max_output_tokens(&CompletionParameters::default(), &r), 4_096);
+        assert_eq!(
+            max_output_tokens(&CompletionParameters::default(), &r),
+            4_096
+        );
     }
 
     /// Only an explicitly unset `max_tokens` falls through to the model's ceiling,
@@ -350,7 +363,10 @@ mod tests {
     #[test]
     fn with_no_max_tokens_and_no_completion_cap_the_context_window_is_the_ceiling() {
         let r = rates(None, 32_768);
-        let p = CompletionParameters { max_tokens: None, ..Default::default() };
+        let p = CompletionParameters {
+            max_tokens: None,
+            ..Default::default()
+        };
         assert_eq!(max_output_tokens(&p, &r), 32_768);
 
         // A published completion cap wins over the context window.
@@ -363,13 +379,20 @@ mod tests {
     #[test]
     fn reasoning_tokens_are_added_on_top_of_the_visible_output_budget() {
         let r = rates(Some(8_000), 200_000);
-        let base = CompletionParameters { max_tokens: Some(1_000), ..Default::default() };
+        let base = CompletionParameters {
+            max_tokens: Some(1_000),
+            ..Default::default()
+        };
         assert_eq!(max_output_tokens(&base, &r), 1_000);
 
         // An explicit thinking budget adds exactly itself.
         let thinking = CompletionParameters {
             max_tokens: Some(1_000),
-            reasoning: Some(ReasoningConfig { effort: None, max_tokens: Some(4_000), exclude: None }),
+            reasoning: Some(ReasoningConfig {
+                effort: None,
+                max_tokens: Some(4_000),
+                exclude: None,
+            }),
             ..Default::default()
         };
         assert_eq!(max_output_tokens(&thinking, &r), 5_000);
@@ -377,7 +400,11 @@ mod tests {
         // An effort level bounds nothing, so the model's ceiling is the only bound.
         let effort = CompletionParameters {
             max_tokens: Some(1_000),
-            reasoning: Some(ReasoningConfig { effort: Some("high".into()), max_tokens: None, exclude: None }),
+            reasoning: Some(ReasoningConfig {
+                effort: Some("high".into()),
+                max_tokens: None,
+                exclude: None,
+            }),
             ..Default::default()
         };
         assert_eq!(max_output_tokens(&effort, &r), 9_000);
@@ -385,7 +412,11 @@ mod tests {
         // "none" disables reasoning entirely, so it costs nothing.
         let off = CompletionParameters {
             max_tokens: Some(1_000),
-            reasoning: Some(ReasoningConfig { effort: Some("none".into()), max_tokens: None, exclude: None }),
+            reasoning: Some(ReasoningConfig {
+                effort: Some("none".into()),
+                max_tokens: None,
+                exclude: None,
+            }),
             ..Default::default()
         };
         assert_eq!(max_output_tokens(&off, &r), 1_000);
@@ -393,7 +424,10 @@ mod tests {
 
     fn video(duration_secs: Option<f64>) -> Message {
         parts(vec![ContentPart::Video {
-            video_url: crate::message::VideoUrl { url: "https://x/y.mp4".into(), duration_secs },
+            video_url: crate::message::VideoUrl {
+                url: "https://x/y.mp4".into(),
+                duration_secs,
+            },
         }])
     }
 
@@ -425,8 +459,16 @@ mod tests {
     #[test]
     fn a_video_is_counted_as_frames_and_a_soundtrack() {
         let ten = estimate_prompt_tokens(&[video(Some(10.0))]);
-        assert_eq!(ten.image_tokens, 10 * u64::from(TOKENS_PER_VIDEO_FRAME), "one frame a second");
-        assert_eq!(ten.audio_tokens, 10 * AUDIO_TOKENS_PER_SECOND as u64, "its sound too");
+        assert_eq!(
+            ten.image_tokens,
+            10 * u64::from(TOKENS_PER_VIDEO_FRAME),
+            "one frame a second"
+        );
+        assert_eq!(
+            ten.audio_tokens,
+            10 * AUDIO_TOKENS_PER_SECOND as u64,
+            "its sound too"
+        );
 
         // A partial second still costs a whole frame.
         let sliver = estimate_prompt_tokens(&[video(Some(0.1))]);
@@ -454,14 +496,20 @@ mod tests {
         // An hour of silent video fits; its frames alone are under the window.
         assert!(hour.image_tokens < WINDOW, "an hour of silent video fits");
         // With sound it does not, which is why the published limit drops to ~45 min.
-        assert!(hour.total_tokens() > WINDOW, "an hour WITH audio does not fit");
+        assert!(
+            hour.total_tokens() > WINDOW,
+            "an hour WITH audio does not fit"
+        );
 
         // And forty-five minutes with sound does fit, as Gemini says.
         let three_quarters = estimate_prompt_tokens(&[video(Some(45.0 * 60.0))]);
-        assert!(three_quarters.total_tokens() < WINDOW, "45 min with audio fits");
+        assert!(
+            three_quarters.total_tokens() < WINDOW,
+            "45 min with audio fits"
+        );
     }
 
-    /// A clip of unstated length is assumed to run [`DEFAULT_MEDIA_SECONDS`], never
+    /// A clip of unstated length is assumed to run `DEFAULT_MEDIA_SECONDS`, never
     /// refused. Refusing would force every caller to handle an error for a case
     /// with a perfectly good answer.
     #[test]
@@ -482,8 +530,16 @@ mod tests {
     fn media_with_a_nonsense_duration_falls_back_to_the_assumption() {
         let assumed = estimate_prompt_tokens(&[audio(None)]).audio_tokens;
         for bad in [f64::INFINITY, f64::NAN, f64::NEG_INFINITY, -1.0] {
-            assert_eq!(estimate_prompt_tokens(&[audio(Some(bad))]).audio_tokens, assumed, "{bad}");
-            assert_eq!(estimate_prompt_tokens(&[video(Some(bad))]).audio_tokens, assumed, "{bad}");
+            assert_eq!(
+                estimate_prompt_tokens(&[audio(Some(bad))]).audio_tokens,
+                assumed,
+                "{bad}"
+            );
+            assert_eq!(
+                estimate_prompt_tokens(&[video(Some(bad))]).audio_tokens,
+                assumed,
+                "{bad}"
+            );
         }
     }
 
@@ -495,7 +551,10 @@ mod tests {
     fn an_absurdly_long_clip_counts_saturated_rather_than_overflowing() {
         for absurd in [1e30, f64::MAX] {
             let est = estimate_prompt_tokens(&[video(Some(absurd))]);
-            assert!(est.image_tokens > 0 && est.audio_tokens > 0, "{absurd} still counts");
+            assert!(
+                est.image_tokens > 0 && est.audio_tokens > 0,
+                "{absurd} still counts"
+            );
         }
 
         // Many such clips still add up without overflowing or panicking.
@@ -510,7 +569,10 @@ mod tests {
         ];
         let est = estimate_prompt_tokens(&[parts(many)]);
         assert_eq!(est.image_tokens, u64::MAX, "saturated, not wrapped");
-        assert!(est.total_tokens() == u64::MAX, "and the total does not panic");
+        assert!(
+            est.total_tokens() == u64::MAX,
+            "and the total does not panic"
+        );
     }
 
     /// However long the clip, the price is a full context window of the dearest
@@ -523,7 +585,10 @@ mod tests {
             max_completion_tokens: Some(0),
             context_length: window,
         };
-        let params = CompletionParameters { max_tokens: Some(0), ..Default::default() };
+        let params = CompletionParameters {
+            max_tokens: Some(0),
+            ..Default::default()
+        };
 
         let cost = estimate_cost_usd(&[video(Some(f64::MAX))], &params, &r);
         let full_window_of_audio = f64::from(window) * r.price.audio_rate() / 1e6;
@@ -541,7 +606,10 @@ mod tests {
             max_completion_tokens: Some(0),
             context_length: window,
         };
-        let params = CompletionParameters { max_tokens: Some(0), ..Default::default() };
+        let params = CompletionParameters {
+            max_tokens: Some(0),
+            ..Default::default()
+        };
 
         // A day of video is millions of tokens; the window is a thousand.
         let huge = estimate_prompt_tokens(&[video(Some(86_400.0))]);
@@ -550,7 +618,10 @@ mod tests {
         // Priced at exactly a full window of the dearest token present.
         let cost = estimate_cost_usd(&[video(Some(86_400.0))], &params, &r);
         let full_window_of_audio = f64::from(window) * r.price.audio_rate() / 1e6;
-        assert!((cost - full_window_of_audio).abs() < 1e-12, "{cost} vs {full_window_of_audio}");
+        assert!(
+            (cost - full_window_of_audio).abs() < 1e-12,
+            "{cost} vs {full_window_of_audio}"
+        );
     }
 
     /// The window fills with the DEAREST tokens present. Filling it with cheap ones
@@ -560,8 +631,15 @@ mod tests {
         let window = 100u32;
         // Audio at $1000/Mtok, text at $1/Mtok.
         let price = TokenPrice::new(1.0, 0.0).with_media_rates(Some(1000.0), None);
-        let r = ModelRates { price, max_completion_tokens: Some(0), context_length: window };
-        let params = CompletionParameters { max_tokens: Some(0), ..Default::default() };
+        let r = ModelRates {
+            price,
+            max_completion_tokens: Some(0),
+            context_length: window,
+        };
+        let params = CompletionParameters {
+            max_tokens: Some(0),
+            ..Default::default()
+        };
 
         // Ten seconds of audio is 320 tokens, well over the window, plus text.
         let long_text = "word ".repeat(500);
@@ -569,7 +647,10 @@ mod tests {
 
         let cost = estimate_cost_usd(&messages, &params, &r);
         let window_of_audio = f64::from(window) * 1000.0 / 1e6;
-        assert!((cost - window_of_audio).abs() < 1e-12, "audio must crowd out the cheap text");
+        assert!(
+            (cost - window_of_audio).abs() < 1e-12,
+            "audio must crowd out the cheap text"
+        );
 
         // Had text won the window, it would have been a thousand times cheaper.
         let window_of_text = f64::from(window) * 1.0 / 1e6;
@@ -587,18 +668,30 @@ mod tests {
             max_completion_tokens: Some(0),
             context_length: 1_000,
         };
-        let params = CompletionParameters { max_tokens: Some(0), ..Default::default() };
+        let params = CompletionParameters {
+            max_tokens: Some(0),
+            ..Default::default()
+        };
 
         // One second = 32 audio tokens at $100/Mtok = $0.0032, plus the message
         // envelope's few text tokens at $0.10/Mtok (negligible but nonzero).
         let cost = estimate_cost_usd(&[audio(Some(1.0))], &params, &r);
         let audio_only = 32.0 * 100.0 / 1e6;
-        assert!(cost > audio_only, "the envelope's text tokens count too: {cost}");
-        assert!(cost < audio_only * 1.01, "but audio dominates: {cost} vs {audio_only}");
+        assert!(
+            cost > audio_only,
+            "the envelope's text tokens count too: {cost}"
+        );
+        assert!(
+            cost < audio_only * 1.01,
+            "but audio dominates: {cost} vs {audio_only}"
+        );
 
         // Had we billed it as input, it would have been a thousand times cheaper.
         let as_input = 32.0 * 0.1 / 1e6;
-        assert!(cost > as_input * 500.0, "audio must not be billed at the input rate");
+        assert!(
+            cost > as_input * 500.0,
+            "audio must not be billed at the input rate"
+        );
     }
 
     /// An unpublished image rate is exactly the text rate. An unpublished AUDIO
@@ -609,7 +702,10 @@ mod tests {
         let plain = TokenPrice::new(3.0, 15.0);
         assert_eq!(plain.image_rate(), 3.0, "image is billed exactly as text");
         assert_eq!(plain.audio_rate(), 3.0 * AUDIO_RATE_FALLBACK_MULTIPLE);
-        assert!(plain.audio_rate() > plain.input_per_mtok, "audio always costs more");
+        assert!(
+            plain.audio_rate() > plain.input_per_mtok,
+            "audio always costs more"
+        );
 
         // A published rate always wins over the assumption, high or low.
         let priced = plain.clone().with_media_rates(Some(30.0), Some(4.0));
@@ -620,10 +716,17 @@ mod tests {
     #[test]
     fn a_still_image_is_charged_a_bounded_tile_cost_rather_than_nothing() {
         let with_image = parts(vec![ContentPart::Image {
-            image_url: crate::message::ImageUrl { url: "https://x/y.png".into(), detail: None },
+            image_url: crate::message::ImageUrl {
+                url: "https://x/y.png".into(),
+                detail: None,
+            },
         }]);
         let est = estimate_prompt_tokens(&[with_image]);
-        assert_eq!(est.image_tokens, u64::from(TOKENS_PER_STILL_IMAGE), "a still is not free");
+        assert_eq!(
+            est.image_tokens,
+            u64::from(TOKENS_PER_STILL_IMAGE),
+            "a still is not free"
+        );
         assert_eq!(est.audio_tokens, 0, "a still image has no soundtrack");
     }
 
@@ -635,7 +738,10 @@ mod tests {
             max_completion_tokens: Some(1_000_000),
             context_length: 2_000_000,
         };
-        let p = CompletionParameters { max_tokens: Some(1_000_000), ..Default::default() };
+        let p = CompletionParameters {
+            max_tokens: Some(1_000_000),
+            ..Default::default()
+        };
         let cost = estimate_cost_usd(&[user("hi")], &p, &r);
         assert!((cost - 15.0).abs() < 0.001, "{cost}");
     }

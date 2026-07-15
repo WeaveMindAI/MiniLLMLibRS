@@ -675,7 +675,10 @@ mod wire_tests {
         // Missing fields take the type's defaults, same as ::new().
         let defaults: CompletionParameters = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(defaults.max_tokens, CompletionParameters::new().max_tokens);
-        assert_eq!(defaults.temperature, CompletionParameters::new().temperature);
+        assert_eq!(
+            defaults.temperature,
+            CompletionParameters::new().temperature
+        );
     }
 
     #[test]
@@ -709,8 +712,9 @@ mod billing_provider_tests {
         let settings = ProviderSettings::new().with_order(vec!["anthropic".into()]);
         assert_eq!(settings.billing_provider(), None);
 
-        let explicit =
-            ProviderSettings::new().with_order(vec!["anthropic".into()]).with_fallbacks(true);
+        let explicit = ProviderSettings::new()
+            .with_order(vec!["anthropic".into()])
+            .with_fallbacks(true);
         assert_eq!(explicit.billing_provider(), None);
     }
 
@@ -727,8 +731,16 @@ mod billing_provider_tests {
     /// unavailable, which is exactly the case that must not under-estimate.
     #[test]
     fn sorting_by_price_does_not_pin_a_provider() {
-        assert_eq!(ProviderSettings::new().sort_by_price().billing_provider(), None);
-        assert_eq!(ProviderSettings::new().sort_by_throughput().billing_provider(), None);
+        assert_eq!(
+            ProviderSettings::new().sort_by_price().billing_provider(),
+            None
+        );
+        assert_eq!(
+            ProviderSettings::new()
+                .sort_by_throughput()
+                .billing_provider(),
+            None
+        );
     }
 
     #[test]

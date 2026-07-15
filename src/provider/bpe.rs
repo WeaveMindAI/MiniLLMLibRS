@@ -350,8 +350,14 @@ mod reference_equivalence {
             ("end.  ", 3),
             // Code and data, which is most of what a real prompt carries.
             ("def f():\n    return 1\n", 8),
-            ("fn main(){let x:Vec<u32>=(0..10).filter(|n|n%2==0).collect();}", 28),
-            ("{\"a\": 1, \"bb\": [1, 2, 3], \"ccc\": {\"d\": true, \"e\": null}}", 31),
+            (
+                "fn main(){let x:Vec<u32>=(0..10).filter(|n|n%2==0).collect();}",
+                28,
+            ),
+            (
+                "{\"a\": 1, \"bb\": [1, 2, 3], \"ccc\": {\"d\": true, \"e\": null}}",
+                31,
+            ),
             ("https://openrouter.ai/api/v1/models?limit=50&offset=0", 17),
             ("3f8a1c2e-9b4d-4f21-8e7a-1c0d5b6e2a94", 34),
             ("SELECT * FROM t WHERE x > 1 GROUP BY 1;", 14),
@@ -381,7 +387,11 @@ mod reference_equivalence {
         ];
 
         for (text, expected) in vectors {
-            assert_eq!(count_tokens(text), *expected, "token count diverged on {text:?}");
+            assert_eq!(
+                count_tokens(text),
+                *expected,
+                "token count diverged on {text:?}"
+            );
         }
     }
 
@@ -415,7 +425,11 @@ mod reference_equivalence {
     }
     parts.len() - 1
 }"#;
-        assert_eq!(SOURCE.len(), 800, "the recorded count is for exactly this text");
+        assert_eq!(
+            SOURCE.len(),
+            800,
+            "the recorded count is for exactly this text"
+        );
         assert_eq!(count_tokens(SOURCE), 246);
     }
 
@@ -437,18 +451,23 @@ mod reference_equivalence {
             state ^= state << 17;
             state
         };
-        let alphabet: Vec<char> =
-            " \t\n\rabcXYZ0129,.;:'\"/\\_-()[]{}日本語中文🚀é∀×".chars().collect();
+        let alphabet: Vec<char> = " \t\n\rabcXYZ0129,.;:'\"/\\_-()[]{}日本語中文🚀é∀×"
+            .chars()
+            .collect();
 
         let total: usize = (0..500)
             .map(|_| {
                 let len = (next() % 40) as usize;
-                let text: String =
-                    (0..len).map(|_| alphabet[(next() as usize) % alphabet.len()]).collect();
+                let text: String = (0..len)
+                    .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                    .collect();
                 count_tokens(&text)
             })
             .sum();
 
-        assert_eq!(total, REFERENCE_TOTAL, "the encoder diverged somewhere in the corpus");
+        assert_eq!(
+            total, REFERENCE_TOTAL,
+            "the encoder diverged somewhere in the corpus"
+        );
     }
 }

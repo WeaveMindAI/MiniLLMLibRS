@@ -95,9 +95,7 @@ pub use provider::{
 /// Pre-call cost estimation. Requires the `estimate` feature, which pulls in a
 /// BPE tokenizer that a plain completion has no use for.
 #[cfg(feature = "estimate")]
-pub use provider::{
-    estimate_cost_usd, estimate_prompt_tokens, PromptEstimate, SAFETY_MULTIPLIER,
-};
+pub use provider::{estimate_cost_usd, estimate_prompt_tokens, PromptEstimate, SAFETY_MULTIPLIER};
 pub use tools::{
     ArgumentStream, FieldHandle, ToolCall, ToolCallAccumulator, ToolCallDelta, ToolChoice,
     ToolDefinition,
