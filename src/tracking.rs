@@ -381,8 +381,12 @@ pub(crate) async fn cost_for_response(
     let outcome = match &response.usage {
         Some(usage) => generator.provider.cost_of(usage.clone(), price),
         None => {
+            // The out-of-band query rides the GENERATOR's client, the same
+            // one the call it resolves rode: an injected client's routing
+            // sees the follow-up too, never a second side-channel client.
+            let client = generator.client();
             let ctx = crate::provider::PostStreamCtx {
-                client: reqwest_client(),
+                client: client.http().clone(),
                 base_url: &generator.base_url,
                 generation_id: &response.id,
                 auth: &generator.auth,
@@ -392,13 +396,6 @@ pub(crate) async fn cost_for_response(
         }
     };
     outcome.into_cost_info(response.model.clone(), response.id.clone())
-}
-
-/// A shared reqwest client for out-of-band cost queries (avoids building one per
-/// resolution).
-fn reqwest_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
 }
 
 impl std::fmt::Debug for CompletionContext {

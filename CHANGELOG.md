@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] - 2026-07-15
+
+### Added
+
+- `LLMClient::with_client` and `GeneratorInfo::with_http_client`: supply your
+  own HTTP client (a plain `reqwest::Client` or a
+  `reqwest_middleware::ClientWithMiddleware`). EVERY request the crate makes
+  for that generator (completions, streaming, the OpenRouter price catalog,
+  out-of-band cost queries) rides the injected client, so a caller's routing
+  and middleware see the whole conversation with the provider.
+
+### Changed
+
+- Streaming no longer uses `reqwest-eventsource`. That crate owns the request
+  (it only accepts a bare `reqwest::RequestBuilder`, defeating client
+  injection) and silently RECONNECTS on error, which for a POST completion
+  would replay the generation and double-spend. The request is now sent once
+  through the (possibly injected) client and SSE frames are parsed off the
+  response's own byte stream (`eventsource-stream`); a broken stream fails
+  loudly instead of re-sending.
+- The streaming idle timeout now also bounds the wait for the response to
+  START: a server that accepts and goes silent fails with `Timeout` instead
+  of parking until the pool timeout.
+- The out-of-band cost query rides the generator's client instead of a
+  crate-internal static `reqwest::Client`, so it can no longer bypass an
+  injected client's routing. `PostStreamCtx.client` is now an owned
+  `ClientWithMiddleware` (provider-impl-facing API).
+- `StreamingCompletion::from_event_source` is replaced by
+  `from_sse_events` (takes a stream of parsed SSE events).
+
 ## [0.5.5] - 2026-07-12
 
 ### Fixed

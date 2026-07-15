@@ -16,7 +16,7 @@ use crate::error::{MiniLLMError, Result};
 use crate::generator::{GeneratorInfo, NodeCompletionParameters};
 use crate::json_repair::{loads, repair_json, JsonValue, RepairOptions};
 use crate::message::{merge_contiguous_messages, ContentPart, Message, MessageContent, Role};
-use crate::provider::{global_client, CompletionResponse, StreamingCompletion};
+use crate::provider::{CompletionResponse, StreamingCompletion};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
@@ -1155,7 +1155,8 @@ impl ChatNode {
         let completion_params = settings.merged_params(generator);
 
         // Track usage so we get real cache_write/cache_read counts back.
-        let response = global_client()
+        let response = generator
+            .client()
             .complete_with_usage_tracking(
                 generator,
                 &messages,
@@ -1192,7 +1193,8 @@ impl ChatNode {
             ResponseMode::NonStreaming => {
                 let messages = self.prepare_messages(settings);
                 let completion_params = settings.merged_params(generator);
-                global_client()
+                generator
+                    .client()
                     .complete_with_usage_tracking(
                         generator,
                         &messages,
@@ -1414,7 +1416,8 @@ impl ChatNode {
         let messages = self.prepare_messages(settings);
         let completion_params = settings.merged_params(generator);
 
-        global_client()
+        generator
+            .client()
             .complete_streaming_with_usage(
                 generator,
                 &messages,

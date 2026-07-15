@@ -209,9 +209,12 @@ impl CostOutcome {
 }
 
 /// Context for an out-of-band post-stream cost query (a cancelled/usage-less
-/// stream). Carries what a provider needs to hit its own endpoint, if it has one.
+/// stream). Carries what a provider needs to hit its own endpoint, if it has
+/// one. The client is the GENERATOR's (owned, since the resolve may outlive
+/// the borrow that built this context): an injected client's routing sees the
+/// follow-up exactly like the call it resolves.
 pub struct PostStreamCtx<'a> {
-    pub client: &'a reqwest::Client,
+    pub client: reqwest_middleware::ClientWithMiddleware,
     /// The generator's base URL. The query goes to the same address as the
     /// call it resolves (and authenticates with the same credential), so a
     /// generator pointed at a gateway keeps working: never hardcode a host.

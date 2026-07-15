@@ -103,7 +103,9 @@ impl GeneratorInfo {
     /// [`ProviderSettings::billing_provider`](crate::ProviderSettings::billing_provider).
     /// `None` prices at the dearest endpoint of any provider.
     pub async fn model_rates_served_by(&self, provider: Option<&str>) -> Result<ModelRates> {
-        self.rates_with(provider, fetch_endpoints).await
+        // The catalog read rides this generator's client, like every other
+        // request made on its behalf (an injected client sees it too).
+        self.rates_with(provider, |model| fetch_endpoints(self.client(), model)).await
     }
 
     /// A deliberately high estimate, in USD, of what one completion will cost:
@@ -171,17 +173,23 @@ impl GeneratorInfo {
 /// Fetch and validate every endpoint's prices for `model`. Parsing here rather
 /// than per lookup means a corrupt rate fails once, loudly, instead of lying in
 /// the cache until some provider selection happens to read it.
-///
-/// HTTP goes through the crate's pooled client, so a generator costs nothing to
-/// create and every generator shares one connection pool.
-async fn fetch_endpoints(model: String) -> Result<Vec<PricedEndpoint>> {
+async fn fetch_endpoints(
+    client: crate::provider::LLMClient,
+    model: String,
+) -> Result<Vec<PricedEndpoint>> {
     debug_assert!(validate_model_id(&model).is_ok(), "callers validate first");
-    let response = crate::provider::client::global_client()
+    let response = client
         .http()
         .get(format!("{BASE_URL}/models/{model}/endpoints"))
         .timeout(FETCH_TIMEOUT)
         .send()
-        .await?;
+        .await
+        .map_err(|e| match e {
+            reqwest_middleware::Error::Reqwest(e) => MiniLLMError::Http(e),
+            reqwest_middleware::Error::Middleware(e) => MiniLLMError::InvalidParameter(format!(
+                "injected client refused the price-catalog read: {e:#}"
+            )),
+        })?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(MiniLLMError::InvalidParameter(format!(
             "model {model:?} is not in OpenRouter's catalog, so it cannot be priced"

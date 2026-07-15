@@ -346,7 +346,7 @@ impl Provider for OpenRouterProvider {
             for _ in 0..25 {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 if let Some(usage) =
-                    query_generation(ctx.client, ctx.base_url, ctx.generation_id, ctx.auth).await
+                    query_generation(&ctx.client, ctx.base_url, ctx.generation_id, ctx.auth).await
                 {
                     return self.cost_of(usage, ctx.price);
                 }
@@ -360,7 +360,7 @@ impl Provider for OpenRouterProvider {
 /// Query OpenRouter's `/api/v1/generation` for a finished generation's usage.
 /// `None` on any failure or when the record carries no usable cost.
 async fn query_generation(
-    client: &reqwest::Client,
+    client: &reqwest_middleware::ClientWithMiddleware,
     base_url: &str,
     generation_id: &str,
     auth: &Auth,

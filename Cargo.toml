@@ -1,6 +1,6 @@
 [package]
 name = "minillmlib"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2021"
 rust-version = "1.86"
 description = "A minimalist, async-first Rust library for LLM interactions with streaming support"
@@ -56,7 +56,17 @@ reqwest = { version = "0.12", default-features = false, features = [
     "charset",
     "http2",
 ] }
-reqwest-eventsource = "0.6"
+# The injected-client seam: `LLMClient::with_client` / `GeneratorInfo::
+# with_http_client` accept a `ClientWithMiddleware`, the ecosystem-standard
+# way for a caller to layer behavior (routing, observation, retries) behind
+# the client this crate uses.
+reqwest-middleware = { version = "0.4", features = ["json"] }
+# SSE frame parsing over a plain response byte stream. Replaces
+# reqwest-eventsource: that crate owns the request (it only takes a bare
+# `reqwest::RequestBuilder`, defeating client injection) and silently
+# RECONNECTS on error, which for a POST completion would replay the
+# generation and double-spend.
+eventsource-stream = "0.2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

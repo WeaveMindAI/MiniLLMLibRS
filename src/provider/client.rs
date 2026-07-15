@@ -5,14 +5,30 @@ use super::streaming::StreamingCompletion;
 use crate::error::{MiniLLMError, Result};
 use crate::generator::{CompletionParameters, GeneratorInfo};
 use crate::message::Message;
+use eventsource_stream::Eventsource;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
-use reqwest_eventsource::EventSource;
+use reqwest_middleware::ClientWithMiddleware;
 use std::time::Duration;
 
 /// Map a transport error from `send()` into a typed error, surfacing timeouts
 /// as the distinct `Timeout` variant (consumers and retry logic discriminate on
-/// it) rather than collapsing every transport failure into `Http`.
-fn map_send_error(e: reqwest::Error) -> MiniLLMError {
+/// it) rather than collapsing every transport failure into `Http`. An error
+/// raised by an injected middleware layer (not the wire) surfaces as
+/// `InvalidParameter`: it is the caller's own client refusing the request,
+/// with the middleware's message.
+fn map_send_error(e: reqwest_middleware::Error) -> MiniLLMError {
+    match e {
+        reqwest_middleware::Error::Reqwest(e) if e.is_timeout() => MiniLLMError::Timeout,
+        reqwest_middleware::Error::Reqwest(e) => MiniLLMError::Http(e),
+        reqwest_middleware::Error::Middleware(e) => {
+            MiniLLMError::InvalidParameter(format!("injected client refused the request: {e:#}"))
+        }
+    }
+}
+
+/// Body-read errors come from plain reqwest (the middleware only wraps the
+/// send), so they keep the original timeout/Http mapping.
+fn map_body_error(e: reqwest::Error) -> MiniLLMError {
     if e.is_timeout() {
         MiniLLMError::Timeout
     } else {
@@ -20,10 +36,16 @@ fn map_send_error(e: reqwest::Error) -> MiniLLMError {
     }
 }
 
-/// HTTP client for making LLM API requests
+/// HTTP client for making LLM API requests.
+///
+/// Wraps a `reqwest_middleware::ClientWithMiddleware`, so a caller can inject
+/// its own client ([`LLMClient::with_client`]) and every request this crate
+/// makes for a completion (including streaming and out-of-band cost queries)
+/// rides the caller's routing and middleware. A plain `reqwest::Client`
+/// converts into one, so injection costs the caller nothing extra.
 #[derive(Clone)]
 pub struct LLMClient {
-    client: reqwest::Client,
+    client: ClientWithMiddleware,
 }
 
 impl Default for LLMClient {
@@ -33,9 +55,10 @@ impl Default for LLMClient {
 }
 
 impl LLMClient {
-    /// The underlying pooled HTTP client, for the crate's other HTTP needs (the
-    /// model catalog), so they share one connection pool.
-    pub(crate) fn http(&self) -> &reqwest::Client {
+    /// The underlying client, for the crate's other HTTP needs (the model
+    /// catalog, out-of-band cost queries), so they share one pool AND one
+    /// middleware stack.
+    pub(crate) fn http(&self) -> &ClientWithMiddleware {
         &self.client
     }
 
@@ -49,8 +72,14 @@ impl LLMClient {
             .timeout(Duration::from_secs(600))
             .build()
             .expect("Failed to create HTTP client");
+        Self::with_client(client)
+    }
 
-        Self { client }
+    /// Create an LLM client over a caller-supplied HTTP client. Accepts a
+    /// plain `reqwest::Client` or a `ClientWithMiddleware`; every request
+    /// this crate makes goes through it.
+    pub fn with_client(client: impl Into<ClientWithMiddleware>) -> Self {
+        Self { client: client.into() }
     }
 
     /// Build headers for a request.
@@ -150,8 +179,8 @@ impl LLMClient {
             });
         }
 
-        // A read failure here is a transport error → MiniLLMError::Http via map_send_error.
-        let response_bytes = response.bytes().await.map_err(map_send_error)?;
+        // A read failure here is a transport error → MiniLLMError::Http.
+        let response_bytes = response.bytes().await.map_err(map_body_error)?;
 
         let raw: serde_json::Value = serde_json::from_slice(&response_bytes).map_err(|e| {
             let preview = preview_str(&String::from_utf8_lossy(&response_bytes));
@@ -202,10 +231,32 @@ impl LLMClient {
         // Note: deliberately NOT `.timeout()` on the request builder, which caps
         // total duration, which wrongly kills long legitimate streams. The idle
         // timeout is applied per-event by the stream task instead.
-        let request_builder = self.client.post(&url).headers(headers).json(&body);
-
-        let es = EventSource::new(request_builder)
-            .map_err(|e| MiniLLMError::Stream(format!("Failed to create event source: {}", e)))?;
+        //
+        // The request is sent ONCE, through the (possibly injected) client,
+        // and the SSE frames are parsed off the response's own byte stream.
+        // No reconnect-and-replay: a broken completion stream surfaces as a
+        // loud stream error, never a silently re-sent (re-billed) request.
+        let send = self.client.post(&url).headers(headers).json(&body).send();
+        // The idle timeout bounds the wait for the stream's START too:
+        // silence before the response headers is still silence, and a dead
+        // host must fail loudly, not park until the pool timeout.
+        let response = match idle_timeout {
+            Some(dur) => tokio::time::timeout(dur, send)
+                .await
+                .map_err(|_| MiniLLMError::Timeout)?,
+            None => send.await,
+        }
+        .map_err(map_send_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            tracing::error!(status = %status, error = %error_text, "streaming API request failed");
+            return Err(MiniLLMError::Api {
+                status: status.as_u16(),
+                message: error_text,
+            });
+        }
+        let events = response.bytes_stream().eventsource();
 
         // Wait for a trailing usage chunk only if the PROVIDER will actually send
         // one (not merely because the caller asked to track cost): a provider with
@@ -215,8 +266,8 @@ impl LLMClient {
         // The real generation id arrives on the SSE chunks (the provider's
         // `gen-...`); the stream starts with an empty id and adopts the first one
         // it sees, so out-of-band cost resolution targets the real generation.
-        Ok(StreamingCompletion::from_event_source(
-            es,
+        Ok(StreamingCompletion::from_sse_events(
+            events,
             generator.model.clone(),
             expect_usage,
             idle_timeout,
@@ -589,8 +640,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_streaming_idle_timeout_fires_on_silence() {
-        // A server that accepts but never sends an SSE event must trip the idle
-        // timeout (max silence between chunks), not hang to the pool timeout.
+        // A server that accepts but never answers must trip the idle
+        // timeout, not hang to the pool timeout. Silence before the
+        // response headers counts as silence, so the loud error surfaces
+        // at the send itself.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -606,7 +659,8 @@ mod tests {
         let messages = vec![Message::user("Hello")];
         let params = CompletionParameters::new();
 
-        let mut stream = client
+        let start = std::time::Instant::now();
+        let result = client
             .complete_streaming_with_usage(
                 &gen,
                 &messages,
@@ -614,17 +668,11 @@ mod tests {
                 false,
                 Some(Duration::from_secs(1)),
             )
-            .await
-            .expect("event source should be created");
-
-        let start = std::time::Instant::now();
-        // First chunk should be a loud error (timeout/connect), arriving fast.
-        let first = stream.next_chunk().await;
+            .await;
         let elapsed = start.elapsed();
         assert!(
-            matches!(first, Some(Err(_))),
-            "expected a loud error on idle silence, got {:?}",
-            first.map(|r| r.map(|c| c.delta))
+            matches!(result, Err(MiniLLMError::Timeout)),
+            "expected a loud Timeout on pre-response silence"
         );
         assert!(
             elapsed.as_secs() < 5,

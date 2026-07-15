@@ -72,6 +72,11 @@ pub struct GeneratorInfo {
     /// generator kept alive keeps its prices warm instead of refetching per call.
     pub(crate) prices: super::pricing::PriceCache,
 
+    /// A caller-supplied HTTP client. When set, every request made for this
+    /// generator (completions, streaming, out-of-band cost queries) goes
+    /// through it, so the caller's routing and middleware see the whole
+    /// conversation. `None` = the crate's shared pooled client.
+    pub http_client: Option<reqwest_middleware::ClientWithMiddleware>,
 }
 
 impl GeneratorInfo {
@@ -98,6 +103,7 @@ impl GeneratorInfo {
             app_attribution: None,
             default_params: super::CompletionParameters::default(),
             prices: super::pricing::PriceCache::default(),
+            http_client: None,
         }
     }
 
@@ -208,6 +214,26 @@ impl GeneratorInfo {
     pub fn with_default_params(mut self, params: super::CompletionParameters) -> Self {
         self.default_params = params;
         self
+    }
+
+    /// Supply the HTTP client every request for this generator rides
+    /// (completions, streaming, out-of-band cost queries). Accepts a plain
+    /// `reqwest::Client` or a `ClientWithMiddleware`.
+    pub fn with_http_client(
+        mut self,
+        client: impl Into<reqwest_middleware::ClientWithMiddleware>,
+    ) -> Self {
+        self.http_client = Some(client.into());
+        self
+    }
+
+    /// The `LLMClient` requests for this generator go through: the injected
+    /// one when set, else the crate's shared pooled client.
+    pub(crate) fn client(&self) -> crate::provider::LLMClient {
+        match &self.http_client {
+            Some(client) => crate::provider::LLMClient::with_client(client.clone()),
+            None => crate::provider::client::global_client().clone(),
+        }
     }
 
     /// Get the full completions endpoint URL (the provider owns the path suffix:

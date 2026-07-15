@@ -4,8 +4,7 @@ use super::response::{CompletionResponse, StreamChunk, Usage};
 use super::Provider;
 use crate::error::{MiniLLMError, Result};
 use crate::tools::ToolCallAccumulator;
-use futures::StreamExt;
-use reqwest_eventsource::{Event, EventSource};
+use futures::{Stream, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -50,41 +49,44 @@ pub struct StreamingCompletion {
 }
 
 impl StreamingCompletion {
-    /// Create a new streaming completion from an EventSource.
+    /// Create a new streaming completion from a stream of parsed SSE events
+    /// (the response body's byte stream through `eventsource_stream`).
     ///
     /// `idle_timeout` bounds the silence between SSE events (not total duration);
     /// if no event arrives within it, the stream fails loudly with `Timeout`
     /// rather than parking on a dead connection until the pool timeout.
-    pub fn from_event_source(
-        mut es: EventSource,
+    pub fn from_sse_events<S, E>(
+        events: S,
         model: String,
         expect_usage: bool,
         idle_timeout: Option<Duration>,
         provider: Arc<dyn Provider>,
-    ) -> Self {
+    ) -> Self
+    where
+        S: Stream<Item = std::result::Result<eventsource_stream::Event, E>> + Send + 'static,
+        E: std::fmt::Display + Send,
+    {
         let (tx, rx) = mpsc::channel(100);
 
         // Spawn task to process SSE events
         tokio::spawn(async move {
+            let mut events = std::pin::pin!(events);
             loop {
                 // Bound the wait for the next event by the idle timeout (if set).
                 let next = match idle_timeout {
-                    Some(dur) => match tokio::time::timeout(dur, es.next()).await {
+                    Some(dur) => match tokio::time::timeout(dur, events.next()).await {
                         Ok(next) => next,
                         Err(_) => {
                             let _ = tx.send(Err(MiniLLMError::Timeout)).await;
                             break;
                         }
                     },
-                    None => es.next().await,
+                    None => events.next().await,
                 };
                 let Some(event) = next else { break };
 
                 match event {
-                    Ok(Event::Open) => {
-                        tracing::debug!("SSE connection opened");
-                    }
-                    Ok(Event::Message(msg)) => {
+                    Ok(msg) => {
                         // `parse_chunk` returns None for an ignorable frame, Some(Ok)
                         // for a real chunk, and Some(Err) for an in-band PROVIDER
                         // ERROR (a 200 stream that then reports failure). Forward the
@@ -109,8 +111,6 @@ impl StreamingCompletion {
                     }
                 }
             }
-
-            es.close();
         });
 
         Self {
