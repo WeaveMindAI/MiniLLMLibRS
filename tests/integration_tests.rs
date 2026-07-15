@@ -529,7 +529,7 @@ fn test_content_part_json_serialization() {
 
     // Test full multimodal content
     let content = MessageContent::with_video("Describe this", &[video]);
-    let api_format = content.to_api_format();
+    let api_format = content.to_api_format(false);
     println!(
         "Full content JSON: {}",
         serde_json::to_string_pretty(&api_format).unwrap()
@@ -565,7 +565,7 @@ fn test_content_part_json_serialization() {
         tool_calls: None,
         cache_breakpoint: false,
     };
-    let payload = messages_to_payload(&[msg]);
+    let payload = messages_to_payload(&[msg], false);
     println!("\nFull message payload:");
     println!("{}", serde_json::to_string_pretty(&payload).unwrap());
 }

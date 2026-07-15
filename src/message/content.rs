@@ -30,6 +30,13 @@ pub struct ImageUrl {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Pixel dimensions, when the caller knows them. Estimation metadata,
+    /// like [`AudioInput::duration_secs`]: kept by serde, shed from the
+    /// wire unless the provider's wire tolerates it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 /// Audio input structure for API.
@@ -55,9 +62,16 @@ pub struct AudioInput {
 pub struct VideoUrl {
     pub url: String,
     /// Clip length in seconds. Estimation metadata, exactly like
-    /// [`AudioInput::duration_secs`]: kept by serde, stripped from the wire.
+    /// [`AudioInput::duration_secs`]: kept by serde, shed from the wire
+    /// unless the provider's wire tolerates it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_secs: Option<f64>,
+    /// Pixel dimensions, when the caller knows them. Same estimation-
+    /// metadata rules as the duration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 impl ContentPart {
@@ -72,6 +86,8 @@ impl ContentPart {
             image_url: ImageUrl {
                 url: image.to_data_url(),
                 detail: image.detail.clone(),
+                width: image.width,
+                height: image.height,
             },
         }
     }
@@ -102,6 +118,8 @@ impl ContentPart {
             video_url: VideoUrl {
                 url: video.to_data_url(),
                 duration_secs: video.duration_secs,
+                width: video.width,
+                height: video.height,
             },
         }
     }
@@ -211,21 +229,33 @@ impl MessageContent {
         }
     }
 
-    /// Convert to API format
-    pub fn to_api_format(&self) -> serde_json::Value {
+    /// Convert to API format.
+    ///
+    /// `keep_estimation_metadata` decides whether the media parts' estimation
+    /// metadata (`duration_secs`, `width`, `height`) rides the wire. A strict
+    /// provider schema would reject the unknown keys, so the provider impl
+    /// decides ([`Provider::wire_keeps_estimation_metadata`]): a wire that
+    /// tolerates them keeps them, so anything metering the request in flight
+    /// (a client-side estimator, a billing gateway) can price the media
+    /// exactly; everyone else sheds them here. Serde round trips (saved
+    /// trees) always keep the metadata regardless.
+    ///
+    /// [`Provider::wire_keeps_estimation_metadata`]: crate::Provider::wire_keeps_estimation_metadata
+    pub fn to_api_format(&self, keep_estimation_metadata: bool) -> serde_json::Value {
         match self {
             Self::Text(text) => serde_json::json!(text),
             Self::Parts(parts) => {
                 let mut value = serde_json::json!(parts);
-                // `duration_secs` is estimation metadata, not a wire field: a
-                // provider with a strict schema would reject the unknown key, so
-                // it never leaves the process. Serde round trips (saved trees)
-                // keep it; only the request payload sheds it.
-                for part in value.as_array_mut().expect("parts serialize to an array") {
-                    for media_key in ["input_audio", "video_url"] {
-                        if let Some(media) = part.get_mut(media_key).and_then(|v| v.as_object_mut())
-                        {
-                            media.remove("duration_secs");
+                if !keep_estimation_metadata {
+                    for part in value.as_array_mut().expect("parts serialize to an array") {
+                        for media_key in ["input_audio", "video_url", "image_url"] {
+                            if let Some(media) =
+                                part.get_mut(media_key).and_then(|v| v.as_object_mut())
+                            {
+                                media.remove("duration_secs");
+                                media.remove("width");
+                                media.remove("height");
+                            }
                         }
                     }
                 }
@@ -329,35 +359,47 @@ mod tests {
         assert!(json["video_url"].get("duration_secs").is_none(), "{json}");
     }
 
-    /// A declared duration is estimation metadata, never a wire field: a
-    /// provider with a strict schema would reject the unknown key. The request
-    /// payload (`to_api_format`) sheds it while the rest of the part survives.
+    /// Estimation metadata (durations, dimensions) follows the provider's
+    /// wire tolerance: a strict schema sheds it (the default), a tolerant
+    /// wire keeps it so an in-flight meter can price the media exactly from
+    /// the request bytes. The rest of the part survives either way.
     #[test]
-    fn a_duration_never_reaches_the_request_payload() {
-        use crate::message::{MessageContent, VideoData};
+    fn estimation_metadata_follows_the_wires_tolerance() {
+        use crate::message::{ImageData, MessageContent, VideoData};
 
         let content = MessageContent::parts(vec![
             ContentPart::text("what is in this?"),
             ContentPart::audio(&AudioData::from_bytes(&[0u8; 4], "mp3").with_duration(3.5)),
             ContentPart::video(&VideoData::from_url("https://x/y.mp4").with_duration(12.0)),
+            ContentPart::image(&ImageData::from_url("https://x/y.png").with_dimensions(800, 600)),
         ]);
-        let wire = content.to_api_format();
 
-        let parts = wire.as_array().expect("parts stay an array");
+        // Strict wire (the default): every metadata key is shed.
+        let strict = content.to_api_format(false);
+        let parts = strict.as_array().expect("parts stay an array");
         assert_eq!(parts[0]["text"], "what is in this?");
         assert!(
             parts[1]["input_audio"].get("duration_secs").is_none(),
-            "{wire}"
+            "{strict}"
         );
         assert_eq!(
             parts[1]["input_audio"]["format"], "mp3",
-            "only the duration is shed"
+            "only the metadata is shed"
         );
         assert!(
             parts[2]["video_url"].get("duration_secs").is_none(),
-            "{wire}"
+            "{strict}"
         );
         assert_eq!(parts[2]["video_url"]["url"], "https://x/y.mp4");
+        assert!(parts[3]["image_url"].get("width").is_none(), "{strict}");
+
+        // Tolerant wire: the metadata rides the payload.
+        let tolerant = content.to_api_format(true);
+        let parts = tolerant.as_array().expect("parts stay an array");
+        assert_eq!(parts[1]["input_audio"]["duration_secs"], 3.5);
+        assert_eq!(parts[2]["video_url"]["duration_secs"], 12.0);
+        assert_eq!(parts[3]["image_url"]["width"], 800);
+        assert_eq!(parts[3]["image_url"]["height"], 600);
     }
 
     #[test]

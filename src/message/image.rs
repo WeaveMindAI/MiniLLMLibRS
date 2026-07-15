@@ -22,6 +22,22 @@ pub struct ImageData {
     /// Optional detail level for vision models ("low", "high", "auto")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+
+    /// Pixel dimensions, when the caller knows them. Estimation metadata
+    /// (sharpens a pre-send cost estimate); never required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+impl ImageData {
+    /// Declare the image's pixel dimensions (estimation metadata).
+    pub fn with_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.width = Some(width);
+        self.height = Some(height);
+        self
+    }
 }
 
 impl MediaData for ImageData {
@@ -43,6 +59,8 @@ impl MediaData for ImageData {
             mime_type: mime_type.into(),
             is_url: false,
             detail: None,
+            width: None,
+            height: None,
         }
     }
 
@@ -74,6 +92,8 @@ impl ImageData {
             mime_type: String::new(),
             is_url: true,
             detail: None,
+            width: None,
+            height: None,
         }
     }
 

@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.7] - 2026-07-15
+
+### Added
+
+- Image and video parts carry pixel dimensions as estimation metadata
+  (`ImageData::with_dimensions`, `ImageUrl`/`VideoUrl` `width`/`height`),
+  alongside the existing clip durations.
+- `Provider::wire_keeps_estimation_metadata`: the provider impl decides
+  whether media estimation metadata (`duration_secs`, `width`, `height`)
+  rides the request payload. Default false (a strict schema like OpenAI's
+  rejects unknown keys, so the payload sheds them, as before). OpenRouter
+  keeps them: it normalizes requests before forwarding, so unknown part keys
+  never reach a strict upstream (verified empirically against OpenAI- and
+  Anthropic-served models), and keeping them lets anything metering the
+  request in flight price the media exactly from the bytes.
+
+### Changed
+
+- The pre-send estimator prices a still image by OpenAI-style tiling when
+  its dimensions are declared (capped well under the unknown-size flat
+  bound); unknown dimensions keep the flat bound.
+- `MessageContent::to_api_format` and `messages_to_payload` take the
+  keep-estimation-metadata flag (provider-impl-facing API).
+
 ## [0.5.6] - 2026-07-15
 
 ### Added

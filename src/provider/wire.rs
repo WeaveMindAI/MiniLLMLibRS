@@ -317,7 +317,7 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// (OpenRouter's Anthropic `cache_control` passthrough).
     fn openai_messages_value(&self, model: &str, messages: &[Message]) -> Vec<serde_json::Value> {
         let _ = model;
-        crate::message::messages_to_payload(messages)
+        crate::message::messages_to_payload(messages, self.wire_keeps_estimation_metadata())
     }
 
     /// (OpenAI-default helper) the wire value for the `tools` array. Only
@@ -377,6 +377,18 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// idle timeout. Default: `requested`.
     fn emits_stream_usage(&self, requested: bool) -> bool {
         requested
+    }
+
+    /// Whether this provider's wire tolerates the media parts' estimation
+    /// metadata (`duration_secs`, `width`, `height`) riding the request
+    /// payload. Default FALSE: a strict schema (OpenAI's) rejects unknown
+    /// keys, so the payload sheds them. A wire that provably ignores unknown
+    /// keys (OpenRouter normalizes requests before forwarding upstream)
+    /// keeps them, so anything metering the request in flight (a client-side
+    /// estimator, a billing gateway) can price the media exactly from the
+    /// bytes.
+    fn wire_keeps_estimation_metadata(&self) -> bool {
+        false
     }
 
     /// HTTP headers attributing the request to the calling app, if the provider

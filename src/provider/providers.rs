@@ -274,6 +274,16 @@ impl Provider for OpenRouterProvider {
         body["usage"] = serde_json::json!({ "include": true });
     }
 
+    /// OpenRouter normalizes requests before forwarding, so unknown keys in
+    /// message parts never reach a strict upstream (verified empirically:
+    /// extra keys inside text/image parts, inside `image_url`, and at the
+    /// top level all pass, on OpenAI- and Anthropic-served models alike).
+    /// Keeping the metadata is what lets an in-flight meter price media
+    /// exactly from the request bytes.
+    fn wire_keeps_estimation_metadata(&self) -> bool {
+        true
+    }
+
     /// OpenRouter fronts Anthropic endpoints, whose wire caps the markers.
     fn max_cache_breakpoints(&self) -> usize {
         4
@@ -287,7 +297,7 @@ impl Provider for OpenRouterProvider {
     /// auto-cache (OpenAI, Gemini, DeepSeek) or would lose routing candidates
     /// to the supporting-endpoints-only filter.
     fn openai_messages_value(&self, model: &str, messages: &[Message]) -> Vec<serde_json::Value> {
-        let mut payload = messages_to_payload(messages);
+        let mut payload = messages_to_payload(messages, self.wire_keeps_estimation_metadata());
         let lower = model.to_ascii_lowercase();
         if !lower.contains("claude") && !lower.contains("anthropic") {
             return payload;

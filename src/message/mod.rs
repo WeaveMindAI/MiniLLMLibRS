@@ -119,13 +119,18 @@ impl Message {
 /// Convert a list of messages to the OpenAI-wire payload format (assistant
 /// `tool_calls` as function entries, tool results as `role: tool` messages).
 /// Non-OpenAI wires (Anthropic) build their own payload in `build_request`.
-pub fn messages_to_payload(messages: &[Message]) -> Vec<serde_json::Value> {
+/// `keep_estimation_metadata` follows the provider's wire tolerance (see
+/// [`MessageContent::to_api_format`]).
+pub fn messages_to_payload(
+    messages: &[Message],
+    keep_estimation_metadata: bool,
+) -> Vec<serde_json::Value> {
     messages
         .iter()
         .map(|msg| {
             let mut obj = serde_json::json!({
                 "role": msg.role,
-                "content": msg.content.to_api_format(),
+                "content": msg.content.to_api_format(keep_estimation_metadata),
             });
 
             if let Some(name) = &msg.name {
@@ -219,7 +224,7 @@ mod tests {
             "get_weather",
             r#"{"city":"Paris"}"#,
         )]);
-        let payload = messages_to_payload(&[assistant, Message::tool("c1", "15 degrees")]);
+        let payload = messages_to_payload(&[assistant, Message::tool("c1", "15 degrees")], false);
 
         assert_eq!(payload[0]["tool_calls"][0]["id"], "c1");
         assert_eq!(payload[0]["tool_calls"][0]["type"], "function");

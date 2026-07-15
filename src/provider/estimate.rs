@@ -52,6 +52,38 @@ const TOKENS_PER_MESSAGE: u32 = 4;
 /// never an arbitrary-resolution still.
 const TOKENS_PER_STILL_IMAGE: u32 = 1_600;
 
+/// OpenAI-style tile pricing for a still whose dimensions are DECLARED: the
+/// image is scaled to fit 2048x2048, then its shortest side to 768, and each
+/// 512px tile costs `TOKENS_PER_IMAGE_TILE` on top of a flat
+/// `TOKENS_PER_IMAGE_BASE`. This is the dominant published vision-pricing
+/// model and, after the two resizes, tops out at 8 tiles (1445 tokens),
+/// safely under the unknown-size flat bound above; providers that price
+/// flatter (Gemini's 258/image) come in lower still, which is the safe
+/// direction for a ceiling.
+const TOKENS_PER_IMAGE_BASE: u32 = 85;
+const TOKENS_PER_IMAGE_TILE: u32 = 170;
+
+/// Tokens for a still image: tile-priced when its dimensions are declared,
+/// the flat unknown-size bound otherwise.
+fn still_image_tokens(width: Option<u32>, height: Option<u32>) -> u32 {
+    let (Some(w), Some(h)) = (width, height) else {
+        return TOKENS_PER_STILL_IMAGE;
+    };
+    if w == 0 || h == 0 {
+        return TOKENS_PER_STILL_IMAGE;
+    }
+    // Scale to fit 2048x2048, then shortest side to 768 (never upscaling).
+    let (mut w, mut h) = (f64::from(w), f64::from(h));
+    let fit = (2048.0 / w).min(2048.0 / h).min(1.0);
+    w *= fit;
+    h *= fit;
+    let shrink = (768.0 / w.min(h)).min(1.0);
+    w *= shrink;
+    h *= shrink;
+    let tiles = (w / 512.0).ceil() * (h / 512.0).ceil();
+    TOKENS_PER_IMAGE_BASE + TOKENS_PER_IMAGE_TILE * tiles as u32
+}
+
 /// What one frame sampled out of a video costs. Gemini's published figure at
 /// default media resolution.
 const TOKENS_PER_VIDEO_FRAME: u32 = 258;
@@ -139,8 +171,9 @@ pub fn estimate_prompt_tokens(messages: &[Message]) -> PromptEstimate {
                     // silently price as zero.
                     match part {
                         ContentPart::Text { text } => text_tokens += bpe::count_tokens(text) as u64,
-                        ContentPart::Image { .. } => {
-                            image_tokens += u64::from(TOKENS_PER_STILL_IMAGE)
+                        ContentPart::Image { image_url } => {
+                            image_tokens +=
+                                u64::from(still_image_tokens(image_url.width, image_url.height))
                         }
                         // A video bills as its frames plus its soundtrack. Assume it
                         // has sound: a silent video then over-reserves by an eighth
@@ -308,6 +341,66 @@ mod tests {
         }
     }
 
+    /// A declared resolution refines a still's price via tile pricing;
+    /// unknown (or nonsense) dimensions keep the flat unknown-size bound,
+    /// and no tiled figure ever exceeds it.
+    #[test]
+    fn a_declared_resolution_refines_a_stills_price_under_the_flat_bound() {
+        // Small image: one 512px tile.
+        assert_eq!(
+            still_image_tokens(Some(400), Some(300)),
+            TOKENS_PER_IMAGE_BASE + TOKENS_PER_IMAGE_TILE
+        );
+        // Large image: capped by the 2048-fit + 768-shortest-side resizes,
+        // so the tile count tops out and stays under the flat bound.
+        let huge = still_image_tokens(Some(8000), Some(6000));
+        assert!(huge < TOKENS_PER_STILL_IMAGE, "{huge}");
+        assert!(huge > still_image_tokens(Some(400), Some(300)));
+        // Unknown or nonsense dimensions: the flat bound.
+        assert_eq!(still_image_tokens(None, None), TOKENS_PER_STILL_IMAGE);
+        assert_eq!(
+            still_image_tokens(Some(0), Some(10)),
+            TOKENS_PER_STILL_IMAGE
+        );
+    }
+
+    /// THE property an in-flight meter relies on: messages serialized to a
+    /// metadata-keeping wire and deserialized back estimate EXACTLY like the
+    /// originals. Durations and dimensions survive the round trip, so the
+    /// meter prices the real media, not defaults.
+    #[test]
+    fn a_metadata_keeping_wire_round_trip_preserves_the_estimate() {
+        use crate::message::{messages_to_payload, ImageData, VideoData};
+
+        let originals = vec![parts(vec![
+            ContentPart::text("describe all of this"),
+            ContentPart::audio(
+                &crate::message::AudioData::from_bytes(&[0u8; 4], "mp3").with_duration(90.0),
+            ),
+            ContentPart::video(&VideoData::from_url("https://x/y.mp4").with_duration(30.0)),
+            ContentPart::image(&ImageData::from_url("https://x/y.png").with_dimensions(800, 600)),
+        ])];
+        let wire = serde_json::Value::Array(messages_to_payload(&originals, true));
+        let round_tripped: Vec<Message> = serde_json::from_value(wire).expect("wire parses back");
+
+        let r = rates(Some(1000), 200_000);
+        let params = CompletionParameters::new().with_max_tokens(500);
+        let direct = estimate_cost_usd(&originals, &params, &r);
+        let re_parsed = estimate_cost_usd(&round_tripped, &params, &r);
+        assert!(direct > 0.0);
+        assert_eq!(
+            direct, re_parsed,
+            "the wire bytes carry everything the estimator uses"
+        );
+
+        // The STRICT wire sheds the metadata, so its round trip estimates
+        // differently (defaults): pinning this proves the parity above
+        // really rides the kept metadata, not luck.
+        let strict = serde_json::Value::Array(messages_to_payload(&originals, false));
+        let strict_msgs: Vec<Message> = serde_json::from_value(strict).expect("parses");
+        assert_ne!(estimate_cost_usd(&strict_msgs, &params, &r), direct);
+    }
+
     /// The property that matters: the estimate must never fall below the truth.
     /// These are real token counts from Anthropic's `count_tokens` endpoint for
     /// the exact strings below, so a regression in the tokenizer or the
@@ -427,6 +520,8 @@ mod tests {
             video_url: crate::message::VideoUrl {
                 url: "https://x/y.mp4".into(),
                 duration_secs,
+                width: None,
+                height: None,
             },
         }])
     }
@@ -563,6 +658,8 @@ mod tests {
                 video_url: crate::message::VideoUrl {
                     url: "x".into(),
                     duration_secs: Some(f64::MAX),
+                    width: None,
+                    height: None,
                 },
             };
             64
@@ -719,6 +816,8 @@ mod tests {
             image_url: crate::message::ImageUrl {
                 url: "https://x/y.png".into(),
                 detail: None,
+                width: None,
+                height: None,
             },
         }]);
         let est = estimate_prompt_tokens(&[with_image]);
