@@ -229,41 +229,6 @@ impl MessageContent {
         }
     }
 
-    /// Convert to API format.
-    ///
-    /// `keep_estimation_metadata` decides whether the media parts' estimation
-    /// metadata (`duration_secs`, `width`, `height`) rides the wire. A strict
-    /// provider schema would reject the unknown keys, so the provider impl
-    /// decides ([`Provider::wire_keeps_estimation_metadata`]): a wire that
-    /// tolerates them keeps them, so anything metering the request in flight
-    /// (a client-side estimator, a billing gateway) can price the media
-    /// exactly; everyone else sheds them here. Serde round trips (saved
-    /// trees) always keep the metadata regardless.
-    ///
-    /// [`Provider::wire_keeps_estimation_metadata`]: crate::Provider::wire_keeps_estimation_metadata
-    pub fn to_api_format(&self, keep_estimation_metadata: bool) -> serde_json::Value {
-        match self {
-            Self::Text(text) => serde_json::json!(text),
-            Self::Parts(parts) => {
-                let mut value = serde_json::json!(parts);
-                if !keep_estimation_metadata {
-                    for part in value.as_array_mut().expect("parts serialize to an array") {
-                        for media_key in ["input_audio", "video_url", "image_url"] {
-                            if let Some(media) =
-                                part.get_mut(media_key).and_then(|v| v.as_object_mut())
-                            {
-                                media.remove("duration_secs");
-                                media.remove("width");
-                                media.remove("height");
-                            }
-                        }
-                    }
-                }
-                value
-            }
-        }
-    }
-
     /// Merge two contents together
     pub fn merge(&self, other: &MessageContent) -> MessageContent {
         match (self, other) {
@@ -357,49 +322,6 @@ mod tests {
         let untimed = ContentPart::video(&VideoData::from_url("https://x/y.mp4"));
         let json = serde_json::to_value(&untimed).unwrap();
         assert!(json["video_url"].get("duration_secs").is_none(), "{json}");
-    }
-
-    /// Estimation metadata (durations, dimensions) follows the provider's
-    /// wire tolerance: a strict schema sheds it (the default), a tolerant
-    /// wire keeps it so an in-flight meter can price the media exactly from
-    /// the request bytes. The rest of the part survives either way.
-    #[test]
-    fn estimation_metadata_follows_the_wires_tolerance() {
-        use crate::message::{ImageData, MessageContent, VideoData};
-
-        let content = MessageContent::parts(vec![
-            ContentPart::text("what is in this?"),
-            ContentPart::audio(&AudioData::from_bytes(&[0u8; 4], "mp3").with_duration(3.5)),
-            ContentPart::video(&VideoData::from_url("https://x/y.mp4").with_duration(12.0)),
-            ContentPart::image(&ImageData::from_url("https://x/y.png").with_dimensions(800, 600)),
-        ]);
-
-        // Strict wire (the default): every metadata key is shed.
-        let strict = content.to_api_format(false);
-        let parts = strict.as_array().expect("parts stay an array");
-        assert_eq!(parts[0]["text"], "what is in this?");
-        assert!(
-            parts[1]["input_audio"].get("duration_secs").is_none(),
-            "{strict}"
-        );
-        assert_eq!(
-            parts[1]["input_audio"]["format"], "mp3",
-            "only the metadata is shed"
-        );
-        assert!(
-            parts[2]["video_url"].get("duration_secs").is_none(),
-            "{strict}"
-        );
-        assert_eq!(parts[2]["video_url"]["url"], "https://x/y.mp4");
-        assert!(parts[3]["image_url"].get("width").is_none(), "{strict}");
-
-        // Tolerant wire: the metadata rides the payload.
-        let tolerant = content.to_api_format(true);
-        let parts = tolerant.as_array().expect("parts stay an array");
-        assert_eq!(parts[1]["input_audio"]["duration_secs"], 3.5);
-        assert_eq!(parts[2]["video_url"]["duration_secs"], 12.0);
-        assert_eq!(parts[3]["image_url"]["width"], 800);
-        assert_eq!(parts[3]["image_url"]["height"], 600);
     }
 
     #[test]

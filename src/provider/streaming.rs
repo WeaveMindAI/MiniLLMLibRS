@@ -212,6 +212,9 @@ impl StreamingCompletion {
             finish_reason: self.finish_reason.clone(),
             usage: self.usage.clone(),
             tool_calls: (!self.tool_calls.is_empty()).then(|| self.tool_calls.finish()),
+            // Streaming deltas carry no media entries on any wire we
+            // speak; a media-returning call is a non-streaming one.
+            media: Vec::new(),
             raw_response: None,
         }
     }

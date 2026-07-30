@@ -380,15 +380,6 @@ pub enum ResponseFormat {
     JsonObject,
 }
 
-impl ResponseFormat {
-    /// The OpenAI `response_format` value (`{"type": "json_object"}`).
-    pub fn to_openai_value(&self) -> serde_json::Value {
-        match self {
-            ResponseFormat::JsonObject => serde_json::json!({"type": "json_object"}),
-        }
-    }
-}
-
 use crate::provider::{CostCallback, TokenPrice};
 
 /// Per-request completion parameters (used when calling complete on a node)

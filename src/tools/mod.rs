@@ -29,9 +29,8 @@ use std::collections::BTreeMap;
 // =============================================================================
 
 /// A tool the model may call: a name, an optional description, and a JSON
-/// Schema for its arguments. Provider-agnostic; the provider emits its wire
-/// shape ([`to_openai_value`](Self::to_openai_value) /
-/// [`to_anthropic_value`](Self::to_anthropic_value)).
+/// Schema for its arguments. Provider-agnostic; each provider projects it
+/// into its own wire shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     /// The tool's name (what the model calls it by).
@@ -74,36 +73,6 @@ impl ToolDefinition {
         self.strict = Some(strict);
         self
     }
-
-    /// OpenAI-wire shape: `{"type":"function","function":{...}}`.
-    pub fn to_openai_value(&self) -> serde_json::Value {
-        let mut function = serde_json::json!({
-            "name": self.name,
-            "parameters": self.parameters,
-        });
-        if let Some(desc) = &self.description {
-            function["description"] = serde_json::json!(desc);
-        }
-        if let Some(strict) = self.strict {
-            function["strict"] = serde_json::json!(strict);
-        }
-        serde_json::json!({ "type": "function", "function": function })
-    }
-
-    /// Anthropic `/v1/messages` shape: `{name, description, input_schema}`.
-    pub fn to_anthropic_value(&self) -> serde_json::Value {
-        let mut tool = serde_json::json!({
-            "name": self.name,
-            "input_schema": self.parameters,
-        });
-        if let Some(desc) = &self.description {
-            tool["description"] = serde_json::json!(desc);
-        }
-        if let Some(strict) = self.strict {
-            tool["strict"] = serde_json::json!(strict);
-        }
-        tool
-    }
 }
 
 /// How the model must treat the provided tools.
@@ -119,33 +88,6 @@ pub enum ToolChoice {
     Required,
     /// The model must call this specific tool (by name).
     Tool(String),
-}
-
-impl ToolChoice {
-    /// OpenAI-wire `tool_choice` value.
-    pub fn to_openai_value(&self) -> serde_json::Value {
-        match self {
-            Self::Auto => serde_json::json!("auto"),
-            Self::None => serde_json::json!("none"),
-            Self::Required => serde_json::json!("required"),
-            Self::Tool(name) => serde_json::json!({
-                "type": "function",
-                "function": { "name": name },
-            }),
-        }
-    }
-
-    /// Anthropic `tool_choice` value. `disable_parallel_tool_use` is folded in
-    /// by the Anthropic request builder (it lives inside this object on that
-    /// wire), not here.
-    pub fn to_anthropic_value(&self) -> serde_json::Value {
-        match self {
-            Self::Auto => serde_json::json!({ "type": "auto" }),
-            Self::None => serde_json::json!({ "type": "none" }),
-            Self::Required => serde_json::json!({ "type": "any" }),
-            Self::Tool(name) => serde_json::json!({ "type": "tool", "name": name }),
-        }
-    }
 }
 
 // =============================================================================
@@ -209,32 +151,6 @@ impl ToolCall {
                 self.name, self.id, e, self.arguments
             ))
         })
-    }
-
-    /// OpenAI-wire assistant-message entry:
-    /// `{"id","type":"function","function":{"name","arguments"}}` (arguments as
-    /// a JSON string, which is what that wire expects).
-    pub fn to_openai_value(&self) -> serde_json::Value {
-        serde_json::json!({
-            "id": self.id,
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "arguments": self.arguments,
-            },
-        })
-    }
-
-    /// Anthropic assistant `tool_use` content block. Parses the raw argument
-    /// text (Anthropic's `input` is a JSON object, not a string), failing
-    /// loudly on invalid JSON.
-    pub fn to_anthropic_block(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({
-            "type": "tool_use",
-            "id": self.id,
-            "name": self.name,
-            "input": self.arguments_json()?,
-        }))
     }
 }
 
@@ -329,95 +245,12 @@ impl ToolCallAccumulator {
 mod tests {
     use super::*;
 
-    fn weather_tool() -> ToolDefinition {
-        ToolDefinition::new(
-            "get_weather",
-            "Get the current weather for a city",
-            serde_json::json!({
-                "type": "object",
-                "properties": { "city": { "type": "string" } },
-                "required": ["city"],
-            }),
-        )
-    }
-
-    #[test]
-    fn definition_openai_wire_shape() {
-        let v = weather_tool().with_strict(true).to_openai_value();
-        assert_eq!(v["type"], "function");
-        assert_eq!(v["function"]["name"], "get_weather");
-        assert_eq!(
-            v["function"]["description"],
-            "Get the current weather for a city"
-        );
-        assert_eq!(v["function"]["parameters"]["type"], "object");
-        assert_eq!(v["function"]["strict"], true);
-    }
-
-    #[test]
-    fn definition_anthropic_wire_shape() {
-        let v = weather_tool().to_anthropic_value();
-        assert_eq!(v["name"], "get_weather");
-        assert_eq!(v["input_schema"]["type"], "object");
-        assert!(v.get("strict").is_none(), "strict omitted when unset");
-        // OpenAI-only keys must not leak.
-        assert!(v.get("type").is_none());
-        assert!(v.get("parameters").is_none());
-    }
-
-    #[test]
-    fn choice_openai_wire_values() {
-        assert_eq!(ToolChoice::Auto.to_openai_value(), "auto");
-        assert_eq!(ToolChoice::None.to_openai_value(), "none");
-        assert_eq!(ToolChoice::Required.to_openai_value(), "required");
-        let forced = ToolChoice::Tool("get_weather".into()).to_openai_value();
-        assert_eq!(forced["type"], "function");
-        assert_eq!(forced["function"]["name"], "get_weather");
-    }
-
-    #[test]
-    fn choice_anthropic_wire_values() {
-        assert_eq!(ToolChoice::Auto.to_anthropic_value()["type"], "auto");
-        assert_eq!(ToolChoice::None.to_anthropic_value()["type"], "none");
-        // OpenAI "required" is Anthropic "any".
-        assert_eq!(ToolChoice::Required.to_anthropic_value()["type"], "any");
-        let forced = ToolChoice::Tool("get_weather".into()).to_anthropic_value();
-        assert_eq!(forced["type"], "tool");
-        assert_eq!(forced["name"], "get_weather");
-    }
-
     #[test]
     fn call_arguments_json_parses_or_fails_loudly() {
         let ok = ToolCall::new("c1", "get_weather", r#"{"city":"Paris"}"#);
         assert_eq!(ok.arguments_json().unwrap()["city"], "Paris");
         let bad = ToolCall::new("c2", "get_weather", "{not json");
         assert!(bad.arguments_json().is_err());
-    }
-
-    #[test]
-    fn call_openai_wire_keeps_arguments_as_string() {
-        let v = ToolCall::new("c1", "get_weather", r#"{"city":"Paris"}"#).to_openai_value();
-        assert_eq!(v["id"], "c1");
-        assert_eq!(v["type"], "function");
-        assert_eq!(v["function"]["name"], "get_weather");
-        assert_eq!(v["function"]["arguments"], r#"{"city":"Paris"}"#);
-        assert!(v["function"]["arguments"].is_string());
-    }
-
-    #[test]
-    fn call_anthropic_block_parses_arguments_to_object() {
-        let b = ToolCall::new("c1", "get_weather", r#"{"city":"Paris"}"#)
-            .to_anthropic_block()
-            .unwrap();
-        assert_eq!(b["type"], "tool_use");
-        assert_eq!(b["id"], "c1");
-        assert_eq!(b["name"], "get_weather");
-        assert_eq!(b["input"]["city"], "Paris");
-        assert!(b["input"].is_object(), "input is an object, not a string");
-        // Invalid argument text fails loudly instead of shipping garbage.
-        assert!(ToolCall::new("c2", "t", "{bad")
-            .to_anthropic_block()
-            .is_err());
     }
 
     #[test]

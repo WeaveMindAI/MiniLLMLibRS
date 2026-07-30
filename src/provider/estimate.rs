@@ -370,7 +370,8 @@ mod tests {
     /// meter prices the real media, not defaults.
     #[test]
     fn a_metadata_keeping_wire_round_trip_preserves_the_estimate() {
-        use crate::message::{messages_to_payload, ImageData, VideoData};
+        use crate::message::{ImageData, VideoData};
+        use crate::provider::openai_wire::messages_to_payload;
 
         let originals = vec![parts(vec![
             ContentPart::text("describe all of this"),

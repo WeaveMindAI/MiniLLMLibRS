@@ -151,6 +151,21 @@ let audio = AudioData::from_file("./audio.mp3")?;
 let content = MessageContent::with_audio("Transcribe this audio.", &[audio]);
 ```
 
+### Generated Media (image output)
+
+Media the model RETURNS (an image-generation model's output) lands on
+`CompletionResponse::media` as the same typed `Media` the request side uses,
+and `to_assistant_message()` is the canonical way to append the reply
+(text + returned media) to a conversation:
+
+```rust
+let response = user.complete(&generator, None).await?;
+for media in &response.media {
+    // e.g. Media::Image(img) where img.base64_data is a data: URL or an https URL
+}
+let assistant_message = response.to_assistant_message();
+```
+
 ### Tool / Function Calling
 
 Tools are normalized: define them once, and each provider emits its own wire
@@ -477,6 +492,7 @@ matters.
 | `Message` | A single message with role and content |
 | `MessageContent` | Text or multimodal content |
 | `ThreadData` | Serializable conversation thread with format kwargs |
+| `CompletionResponse` | A completion: text, usage, tool calls, and returned media |
 | `CostInfo` | Cost and token usage information from completions |
 | `CostResolution` | Whether a reported cost is `Resolved`, `Unpriced`, or `Unknown` |
 

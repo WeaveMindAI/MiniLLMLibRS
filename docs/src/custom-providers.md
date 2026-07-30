@@ -108,6 +108,7 @@ impl Provider for EchoAi {
             finish_reason: raw["stop"].as_str().map(String::from),
             usage: self.parse_usage(&raw),
             tool_calls: None,
+            media: Vec::new(),
             raw_response: Some(raw),
         })
     }
@@ -162,8 +163,19 @@ The trait defaults to the OpenAI dialect, so you override only what differs:
 | `parse_chunk` | streaming chunks aren't OpenAI deltas (return `None` if non-streaming) |
 | `parse_usage` | usage fields differ |
 | `emits_stream_usage` | the server may never send a trailing usage chunk (return `false`, or the stream waits for one that never comes) |
+| `parse_response_media` | the wire returns model-generated media somewhere other than `message.images` |
 | `cost_of` | cost is derived differently |
 | `resolve_post_stream` | there's an out-of-band cost endpoint |
+
+### Reusing the OpenAI dialect piecewise
+
+The shared dialect the defaults delegate to is public:
+`minillmlib::provider::openai_wire` holds the request builder, the
+envelope/usage/chunk parsers, and the wire projections of the normalized
+types (`messages_to_payload`, `tool_definition_value`, ...). A provider
+that is *mostly* OpenAI-shaped can override one method and still call
+these for everything it does not change, instead of copy-pasting the
+dialect.
 
 ### Two rules to copy from the example
 

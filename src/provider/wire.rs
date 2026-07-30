@@ -14,11 +14,13 @@
 //!
 //! All of it lives behind the [`Provider`] trait, owned by
 //! [`GeneratorInfo`](crate::GeneratorInfo). The rest of the crate deals only in
-//! the normalized [`Usage`] and [`CostOutcome`]; adding a provider that shares the
-//! OpenAI request/response *envelope* is one trait impl. (A provider with a
-//! different response envelope (Anthropic's `content[]` vs `choices[]`) also
-//! needs the envelope parse behind the trait; that is a clean future extension,
-//! not yet wired since no such provider ships.)
+//! the normalized [`Usage`] and [`CostOutcome`]. The trait itself is
+//! wire-agnostic; its DEFAULT method bodies implement the most common concrete
+//! wire (the OpenAI `/chat/completions` dialect, in `super::openai_wire`),
+//! parameterized by the `openai_*` hooks, so a provider sharing that envelope
+//! is a tiny impl. A provider on a different envelope overrides the shape
+//! methods wholesale (`AnthropicProvider` is the shipped example: its own
+//! request body, response parse, and event stream, all in its own file).
 
 use super::auth::Auth;
 use super::response::{CompletionResponse, StreamChunk, Usage};
@@ -272,7 +274,7 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// strategy. Default OpenAI-wire: a key or token becomes
     /// `Authorization: Bearer <secret>`. Anthropic maps `ApiKey` to `x-api-key`.
     fn auth_headers(&self, auth: &Auth) -> crate::error::Result<Vec<(String, String)>> {
-        super::providers::openai_auth_headers(auth)
+        super::openai_wire::openai_auth_headers(auth)
     }
 
     /// Build the request body from normalized inputs. `include_usage` asks the
@@ -287,7 +289,14 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
         stream: bool,
         include_usage: bool,
     ) -> crate::error::Result<serde_json::Value> {
-        super::providers::openai_build_request(model, messages, params, stream, include_usage, self)
+        super::openai_wire::openai_build_request(
+            model,
+            messages,
+            params,
+            stream,
+            include_usage,
+            self,
+        )
     }
 
     /// (OpenAI-default helper) the request-body key for the max-output-tokens
@@ -317,7 +326,7 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// (OpenRouter's Anthropic `cache_control` passthrough).
     fn openai_messages_value(&self, model: &str, messages: &[Message]) -> Vec<serde_json::Value> {
         let _ = model;
-        crate::message::messages_to_payload(messages, self.wire_keeps_estimation_metadata())
+        super::openai_wire::messages_to_payload(messages, self.wire_keeps_estimation_metadata())
     }
 
     /// (OpenAI-default helper) the wire value for the `tools` array. Only
@@ -327,7 +336,7 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
         serde_json::Value::Array(
             tools
                 .iter()
-                .map(crate::tools::ToolDefinition::to_openai_value)
+                .map(super::openai_wire::tool_definition_value)
                 .collect(),
         )
     }
@@ -336,14 +345,14 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// by the default [`build_request`](Self::build_request); override it for an
     /// OpenAI-envelope server whose tool-choice shape deviates.
     fn openai_tool_choice_value(&self, choice: &crate::tools::ToolChoice) -> serde_json::Value {
-        choice.to_openai_value()
+        super::openai_wire::tool_choice_value(choice)
     }
 
     /// Parse a completed (non-streaming) raw response into a normalized
     /// [`CompletionResponse`] (content, usage, tool calls, finish reason). Default
     /// parses the OpenAI `choices[]` envelope.
     fn parse_response(&self, raw: serde_json::Value) -> crate::error::Result<CompletionResponse> {
-        super::response::parse_openai_response(raw, self)
+        super::openai_wire::parse_openai_response(raw, self)
     }
 
     /// Parse one streaming SSE `data:` payload:
@@ -357,7 +366,7 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     ///
     /// Default parses OpenAI-wire deltas.
     fn parse_chunk(&self, data: &str) -> Option<crate::error::Result<StreamChunk>> {
-        super::response::parse_openai_chunk(data, self)
+        super::openai_wire::parse_openai_chunk(data, self)
     }
 
     /// Extract a normalized [`Usage`] from a raw object (a non-streaming response
@@ -365,7 +374,22 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// Consulted by the default `parse_response`/`parse_chunk`; a provider with a
     /// different envelope parses usage inside its own overrides instead.
     fn parse_usage(&self, raw: &serde_json::Value) -> Option<Usage> {
-        super::providers::parse_openai_usage_field(raw)
+        super::openai_wire::parse_openai_usage_field(raw)
+    }
+
+    /// Extract the media the model RETURNED from the completed `message`
+    /// object, as normalized typed [`Media`](crate::message::Media). The
+    /// GENERAL shape is [`CompletionResponse::media`]; HOW a wire carries
+    /// returned media is this hook's per-provider concern. The default
+    /// parses the OpenAI-wire `message.images` entries (OpenRouter's
+    /// normalized image-output field); a provider whose wire returns
+    /// media elsewhere (an `audio` object, content blocks) overrides
+    /// this without re-implementing the whole response parse.
+    fn parse_response_media(
+        &self,
+        message: &serde_json::Value,
+    ) -> crate::error::Result<Vec<crate::message::Media>> {
+        super::openai_wire::parse_openai_response_images(message)
     }
 
     // ---- cost + cross-cutting wire (no OpenAI envelope assumption) -------------
@@ -407,5 +431,95 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// reached when no usage was captured. Default: unresolvable → `Unknown`.
     fn resolve_post_stream<'a>(&'a self, _ctx: PostStreamCtx<'a>) -> CostFuture<'a> {
         Box::pin(async { CostOutcome::unknown() })
+    }
+}
+
+/// Indices of the messages that KEEP their cache breakpoint under the
+/// provider's [`Provider::max_cache_breakpoints`] cap: of all marked
+/// messages, the LAST `max` (the most-recent prefixes are the largest
+/// reusable spans). Warns when marks are dropped. Provider-agnostic:
+/// the cap and the marker's wire form are each provider's own.
+pub(crate) fn kept_cache_breakpoints(
+    messages: &[Message],
+    max: usize,
+) -> std::collections::HashSet<usize> {
+    let marked: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.cache_breakpoint)
+        .map(|(i, _)| i)
+        .collect();
+    if marked.len() > max {
+        tracing::warn!(
+            "this provider allows at most {} cache breakpoints per request; {} were marked, keeping the last {}",
+            max,
+            marked.len(),
+            max
+        );
+    }
+    marked.iter().rev().take(max).copied().collect()
+}
+
+/// Cost for a provider that returns no native USD: derive it from a configured
+/// `TokenPrice`, otherwise report `Unpriced` (real tokens, unknown price, never a
+/// fake $0). Shared by every token-only provider.
+pub(crate) fn price_or_unpriced(usage: Usage, price: Option<&TokenPrice>) -> CostOutcome {
+    match price {
+        Some(p) => CostOutcome::resolved(p.cost_of(&usage), usage),
+        None => CostOutcome::unpriced(usage),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fully-uncached usage (all input in the full-price bucket).
+    fn usage(prompt: u32, completion: u32) -> Usage {
+        Usage {
+            uncached_input_tokens: prompt,
+            completion_tokens: completion,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn token_price_costs_prompt_and_completion_per_mtok() {
+        let price = TokenPrice::new(3.0, 15.0); // $3/Mtok in, $15/Mtok out
+        let u = usage(1_000_000, 1_000_000);
+        assert!((price.cost_of(&u) - 18.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn token_price_bills_cache_read_and_write_at_their_own_rates() {
+        // read 0.3/Mtok, write 3.75/Mtok (1.25× the 3.0 input).
+        let price = TokenPrice::new(3.0, 15.0).with_cache_rates(0.3, 3.75);
+        // Disjoint: 200k uncached, 800k cache-read, 100k cache-write, 0 output.
+        let u = Usage {
+            uncached_input_tokens: 200_000,
+            cache_read_tokens: 800_000,
+            cache_write_tokens: 100_000,
+            ..Default::default()
+        };
+        // 200k×3.0 ($0.6) + 800k×0.3 ($0.24) + 100k×3.75 ($0.375) = $1.215
+        assert!(
+            (price.cost_of(&u) - 1.215).abs() < 1e-9,
+            "got {}",
+            price.cost_of(&u)
+        );
+    }
+
+    #[test]
+    fn cache_rates_fall_back_to_input_rate_when_unset() {
+        // No cache rates set → read and write both bill at the input rate.
+        let price = TokenPrice::new(2.0, 0.0);
+        let u = Usage {
+            uncached_input_tokens: 0,
+            cache_read_tokens: 1_000_000,
+            cache_write_tokens: 1_000_000,
+            ..Default::default()
+        };
+        // 1M×2.0 + 1M×2.0 = $4.0 (both at input rate)
+        assert!((price.cost_of(&u) - 4.0).abs() < 1e-9);
     }
 }

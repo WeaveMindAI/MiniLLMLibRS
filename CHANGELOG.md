@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.8] - 2026-07-30
+
+### Added
+
+- `CompletionResponse.media`: media the model RETURNED (image-generation
+  output), normalized to the same typed `Media` the request side uses.
+  The general shape is provider-agnostic; HOW a wire carries returned
+  media is the new `Provider::parse_response_media` hook, whose default
+  parses the OpenAI-wire `message.images` entries (OpenRouter's
+  normalized image-output field). A provider whose wire returns media
+  elsewhere overrides the hook without re-implementing the response
+  parse. A malformed entry fails loudly rather than silently dropping a
+  generated (and billed) image. Empty for text-only completions, for
+  wires with no media, and for streaming (deltas carry no media entries
+  on any wire we speak). Serde-skipped like `raw_response`.
+  (Note for custom `Provider` impls that build `CompletionResponse` as
+  a struct literal: add the one `media: Vec::new()` line.)
+- `provider::openai_wire`: the shared OpenAI `/chat/completions` dialect
+  as a PUBLIC module (request building, envelope/usage/chunk parsing,
+  and the wire projections of the normalized types), reusable by custom
+  OpenAI-compatible providers.
+
+### Changed
+
+- Internal restructure: one file per provider under
+  `provider/providers/` (each owning ALL of its provider's wire
+  knowledge and tests), the shared OpenAI dialect in
+  `provider::openai_wire`, and the `Provider` trait plus pricing types
+  alone in the wire module. The Claude subscription-token resolver
+  moved into the Anthropic provider's file (public name unchanged).
+- The per-wire projections moved OFF the normalized types into the
+  wire that owns them: `message::messages_to_payload` and
+  `MessageContent::to_api_format` are now
+  `provider::openai_wire::{messages_to_payload, content_value}`, and
+  the `to_openai_value` / `to_anthropic_value` / `to_anthropic_block`
+  methods on `ToolDefinition` / `ToolChoice` / `ToolCall` /
+  `ResponseFormat` are module functions of `openai_wire` and the
+  Anthropic provider. The normalized message/tool/param types now
+  carry no wire knowledge at all. `ResponseFormat` is re-exported from
+  `generator` (it was previously unnameable).
+- Audio wire normalization: an audio part whose `data` holds a
+  `data:<mime>;base64,<payload>` URL is split into raw base64 +
+  `format` at `to_api_format` time (the audio wire's shape), so callers
+  that hold media uniformly as data URLs need no audio special case.
+  Image and video parts take data URLs verbatim, as before.
+- `CompletionResponse::to_assistant_message()`: the canonical
+  response-to-history conversion (plain text content, or text + returned
+  media as parts, tool calls carried over), so callers never assemble
+  the assistant message by hand.
+
 ## [0.5.7] - 2026-07-15
 
 ### Added

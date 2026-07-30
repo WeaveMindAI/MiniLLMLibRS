@@ -8,7 +8,10 @@
 //! - **Conversation Trees**: `ChatNode` provides a tree-based conversation structure
 //!   supporting branching dialogues and conversation history
 //! - **Streaming Support**: First-class support for streaming completions via SSE
-//! - **Multimodal**: Support for images and audio in messages
+//! - **Multimodal**: Images, audio, and video in messages, and media the model
+//!   RETURNS (image-generation output) as typed [`Media`] on
+//!   [`CompletionResponse::media`], appended to a conversation via
+//!   [`CompletionResponse::to_assistant_message`]
 //! - **Multiple wires**: One [`Provider`] trait owns the full dialect (endpoint,
 //!   auth, request body, response/stream envelope). Ships OpenAI/OpenRouter,
 //!   native Anthropic (`/v1/messages`, `content[]`), and a generic compatible

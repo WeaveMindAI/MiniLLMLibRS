@@ -116,40 +116,6 @@ impl Message {
     }
 }
 
-/// Convert a list of messages to the OpenAI-wire payload format (assistant
-/// `tool_calls` as function entries, tool results as `role: tool` messages).
-/// Non-OpenAI wires (Anthropic) build their own payload in `build_request`.
-/// `keep_estimation_metadata` follows the provider's wire tolerance (see
-/// [`MessageContent::to_api_format`]).
-pub fn messages_to_payload(
-    messages: &[Message],
-    keep_estimation_metadata: bool,
-) -> Vec<serde_json::Value> {
-    messages
-        .iter()
-        .map(|msg| {
-            let mut obj = serde_json::json!({
-                "role": msg.role,
-                "content": msg.content.to_api_format(keep_estimation_metadata),
-            });
-
-            if let Some(name) = &msg.name {
-                obj["name"] = serde_json::json!(name);
-            }
-            if let Some(tool_call_id) = &msg.tool_call_id {
-                obj["tool_call_id"] = serde_json::json!(tool_call_id);
-            }
-            if let Some(tool_calls) = &msg.tool_calls {
-                obj["tool_calls"] = serde_json::Value::Array(
-                    tool_calls.iter().map(ToolCall::to_openai_value).collect(),
-                );
-            }
-
-            obj
-        })
-        .collect()
-}
-
 /// Merge contiguous messages with the same role.
 ///
 /// Only "plain" same-role messages are merged: a message carrying `tool_calls`,
@@ -212,33 +178,6 @@ mod tests {
         let merged = merge_contiguous_messages(vec![with_tools, Message::assistant("after")]);
         assert_eq!(merged.len(), 2, "tool-call message must stay separate");
         assert!(merged[0].tool_calls.is_some());
-    }
-
-    #[test]
-    fn payload_emits_openai_tool_wire_shapes() {
-        // Assistant tool_calls → OpenAI function entries (arguments as a JSON
-        // string); a tool result → role=tool with tool_call_id.
-        let mut assistant = Message::assistant("checking");
-        assistant.tool_calls = Some(vec![crate::tools::ToolCall::new(
-            "c1",
-            "get_weather",
-            r#"{"city":"Paris"}"#,
-        )]);
-        let payload = messages_to_payload(&[assistant, Message::tool("c1", "15 degrees")], false);
-
-        assert_eq!(payload[0]["tool_calls"][0]["id"], "c1");
-        assert_eq!(payload[0]["tool_calls"][0]["type"], "function");
-        assert_eq!(
-            payload[0]["tool_calls"][0]["function"]["name"],
-            "get_weather"
-        );
-        assert!(
-            payload[0]["tool_calls"][0]["function"]["arguments"].is_string(),
-            "OpenAI wire wants arguments as a JSON string"
-        );
-        assert_eq!(payload[1]["role"], "tool");
-        assert_eq!(payload[1]["tool_call_id"], "c1");
-        assert_eq!(payload[1]["content"], "15 degrees");
     }
 
     #[test]

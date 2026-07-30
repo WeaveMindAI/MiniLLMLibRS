@@ -529,7 +529,7 @@ fn test_content_part_json_serialization() {
 
     // Test full multimodal content
     let content = MessageContent::with_video("Describe this", &[video]);
-    let api_format = content.to_api_format(false);
+    let api_format = minillmlib::provider::openai_wire::content_value(&content, false);
     println!(
         "Full content JSON: {}",
         serde_json::to_string_pretty(&api_format).unwrap()
@@ -554,7 +554,7 @@ fn test_content_part_json_serialization() {
     }
 
     // Test full message payload format (what gets sent to API)
-    use minillmlib::message::messages_to_payload;
+    use minillmlib::provider::openai_wire::messages_to_payload;
     let image = ImageData::from_url("https://example.com/image.jpg");
     let content = MessageContent::with_images("Describe this image", &[image]);
     let msg = Message {
@@ -3373,6 +3373,7 @@ mod custom_provider {
                 finish_reason: raw["stop"].as_str().map(String::from),
                 usage: self.parse_usage(&raw),
                 tool_calls: None,
+                media: Vec::new(),
                 raw_response: Some(raw),
             })
         }
