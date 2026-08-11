@@ -1,6 +1,7 @@
 //! Unified media handling for multimodal messages
 //!
-//! This module provides a common abstraction for different media types (Image, Audio, Video).
+//! This module provides a common abstraction for different media types
+//! (Image, Audio, Video, Document).
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use std::path::Path;
@@ -16,7 +17,7 @@ fn undetermined_format_err(path: &Path) -> crate::error::MiniLLMError {
 
 /// Common trait for all media types.
 ///
-/// Defines the shared behavior across Image, Audio, and Video data. The
+/// Defines the shared behavior across Image, Audio, Video, and Document data. The
 /// data-URL conversion and byte decoding are provided here once as default
 /// methods, so the concrete types never re-implement them.
 pub trait MediaData: Sized {
@@ -93,7 +94,7 @@ pub trait MediaData: Sized {
 /// Generate the inherent forwarders shared by every concrete media type, so a
 /// caller can write `ImageData::from_bytes(..)` / `audio.to_data_url()` without
 /// importing [`MediaData`]. These are pure pass-throughs to the trait; the macro
-/// is the single source of truth so the three types can't drift (one gaining a
+/// is the single source of truth so the media types can't drift (one gaining a
 /// forwarder another lacks). Type-specific constructors (`from_url`, `with_*`)
 /// are written by hand per type. `$fmt_param` names the format/mime argument so
 /// each type's signature reads naturally (`mime_type` for images, `format` for
@@ -166,6 +167,8 @@ pub enum Media {
     Audio(super::AudioData),
     /// Video media
     Video(super::VideoData),
+    /// Document media (PDFs)
+    Document(super::DocumentData),
 }
 
 impl Media {
@@ -184,12 +187,18 @@ impl Media {
         Self::Video(data)
     }
 
+    /// Create a document media from DocumentData
+    pub fn document(data: super::DocumentData) -> Self {
+        Self::Document(data)
+    }
+
     /// Get the MIME type for this media
     pub fn mime_type(&self) -> String {
         match self {
             Self::Image(img) => MediaData::mime_type(img),
             Self::Audio(audio) => MediaData::mime_type(audio),
             Self::Video(video) => MediaData::mime_type(video),
+            Self::Document(document) => MediaData::mime_type(document),
         }
     }
 
@@ -231,6 +240,19 @@ impl Media {
             _ => None,
         }
     }
+
+    /// Check if this is a document
+    pub fn is_document(&self) -> bool {
+        matches!(self, Self::Document(_))
+    }
+
+    /// Get as DocumentData if this is a document
+    pub fn as_document(&self) -> Option<&super::DocumentData> {
+        match self {
+            Self::Document(document) => Some(document),
+            _ => None,
+        }
+    }
 }
 
 impl From<super::ImageData> for Media {
@@ -248,6 +270,12 @@ impl From<super::AudioData> for Media {
 impl From<super::VideoData> for Media {
     fn from(data: super::VideoData) -> Self {
         Self::Video(data)
+    }
+}
+
+impl From<super::DocumentData> for Media {
+    fn from(data: super::DocumentData) -> Self {
+        Self::Document(data)
     }
 }
 

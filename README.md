@@ -23,7 +23,7 @@ A minimalist, async-first Rust library for LLM interactions with streaming suppo
 - **Cost Tracking**: OpenRouter usage accounting with callbacks
 - **Cost Estimation**: what a call will cost *before* it is sent, so you can decide whether to allow it (opt-in `estimate` feature)
 - **Tool Calling**: Normalized `ToolDefinition`/`ToolChoice`/`ToolCall` types; each provider emits its own wire (OpenAI `tools`, Anthropic `tool_use`), streaming included
-- **Multimodal**: Support for images, audio and video in messages
+- **Multimodal**: Support for images, audio, video and documents (PDF) in messages
 - **JSON Repair**: Robust handling of malformed JSON from LLM outputs
 - **OpenRouter Compatible**: Works with OpenRouter, OpenAI, and any OpenAI-compatible API
 - **Retry with Backoff**: Built-in exponential backoff and retry logic
@@ -149,6 +149,18 @@ use minillmlib::{AudioData, MessageContent};
 
 let audio = AudioData::from_file("./audio.mp3")?;
 let content = MessageContent::with_audio("Transcribe this audio.", &[audio]);
+```
+
+### Document Input (PDF)
+
+The model reads the PDF natively (layout, tables, figures, scanned pages).
+Declare the page count when you know it: cost estimation prices PDFs per page.
+
+```rust
+use minillmlib::{DocumentData, MessageContent};
+
+let document = DocumentData::from_file("./report.pdf")?.with_page_count(12);
+let content = MessageContent::with_documents("Summarize this report.", &[document]);
 ```
 
 ### Generated Media (image output)
@@ -469,6 +481,9 @@ To sharpen the estimate:
 - Pass a clip's length with `AudioData::with_duration` / `VideoData::with_duration`
   and the estimate stops guessing. Audio is billed by the second, at up to a
   thousand times the text rate on some models, so this matters.
+- Same for documents: pass `DocumentData::with_page_count` and the estimate
+  prices the real page count instead of assuming a 20-page document (PDFs bill
+  per page: the page's text plus the page rendered as an image).
 
 **Keep your generators alive.** Each `GeneratorInfo` caches the prices it fetches
 for an hour, and clones share the cache, so reusing a generator means only the

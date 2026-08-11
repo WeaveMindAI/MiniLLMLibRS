@@ -38,7 +38,10 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-features -- -D warnings
+      # --all-targets lints tests too: a compile error inside a #[cfg(test)]
+      # module otherwise sails through clippy and cargo test --lib alike when
+      # the module sits behind a non-default feature.
+      - run: cargo clippy --all-features --all-targets -- -D warnings
 
   test:
     name: Test
@@ -48,7 +51,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run unit tests
-        run: cargo test --lib
+        # --all-features so feature-gated test modules (estimate) compile and
+        # run; the `live` feature only gates integration tests, never lib ones.
+        run: cargo test --lib --all-features
       - name: Run doc tests
         run: cargo test --doc
 

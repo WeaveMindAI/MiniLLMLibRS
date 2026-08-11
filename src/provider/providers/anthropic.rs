@@ -84,7 +84,7 @@ impl AnthropicProvider {
         if let MessageContent::Parts(parts) = &msg.content {
             if parts.iter().any(|p| p.as_text().is_none()) {
                 return Err(MiniLLMError::InvalidParameter(
-                    "the Anthropic provider does not yet support multimodal content (image/audio/video); send text-only messages or use an OpenAI-wire provider".to_string(),
+                    "the Anthropic provider does not yet support multimodal content (image/audio/video/document); send text-only messages or use an OpenAI-wire provider".to_string(),
                 ));
             }
         }

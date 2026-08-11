@@ -26,7 +26,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       
       - name: Run tests before publish
-        run: cargo test --lib
+        # --all-features so feature-gated test modules (estimate) compile too.
+        run: cargo test --lib --all-features
       
       - name: Check package
         run: cargo package --list

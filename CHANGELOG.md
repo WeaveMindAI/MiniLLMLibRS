@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.9] - 2026-08-10
+
+### Added
+
+- `DocumentData`: a fourth media type for documents (PDF), alongside
+  image/audio/video. Same `MediaData` surface (`from_file`, `from_bytes`,
+  `from_url`, data-URL projection); `guess_format` recognizes only `.pdf`
+  and `from_file` fails loudly on anything else (no provider wire accepts
+  other document formats today). Carries an optional `filename` (the
+  display name the model sees; when unset, a URL-backed document is named
+  after its URL's last path segment and inline bytes get the generic
+  `document.pdf`) and an optional `page_count`, estimation metadata like
+  an audio clip's `duration_secs`.
+- `ContentPart::File` / `FileData`: the OpenAI-compatible `type: "file"`
+  content part (`file.filename` + `file.file_data`), built via
+  `ContentPart::document`. OpenRouter translates it to each downstream
+  provider's native document shape (e.g. Anthropic `document` blocks), so
+  the model reads the PDF natively: layout, tables, figures, scanned
+  pages. `Media::Document` and `MessageContent::with_documents` round out
+  the plumbing.
+- Cost estimation prices a document per page (extracted text at the text
+  rate plus the page rendered as an image at the still-image bound,
+  Anthropic's published PDF pricing model), from the declared
+  `page_count` or a 20-page default (a declared zero is nonsense and
+  prices as undeclared, never as free). `page_count` follows the same
+  wire-tolerance rule as the other estimation metadata: shed on strict
+  wires, kept on tolerant ones, always survives serde round trips.
+
 ## [0.5.8] - 2026-07-30
 
 ### Added

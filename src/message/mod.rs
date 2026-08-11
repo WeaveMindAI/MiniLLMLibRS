@@ -2,13 +2,15 @@
 
 mod audio;
 mod content;
+mod document;
 mod image;
 mod media;
 mod role;
 mod video;
 
 pub use audio::AudioData;
-pub use content::{AudioInput, ContentPart, ImageUrl, MessageContent, VideoUrl};
+pub use content::{AudioInput, ContentPart, FileData, ImageUrl, MessageContent, VideoUrl};
+pub use document::DocumentData;
 pub use image::ImageData;
 pub use media::{Media, MediaData};
 pub use role::Role;

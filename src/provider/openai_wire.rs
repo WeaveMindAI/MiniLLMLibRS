@@ -460,12 +460,13 @@ pub fn content_value(
             let mut value = serde_json::json!(parts);
             for part in value.as_array_mut().expect("parts serialize to an array") {
                 if !keep_estimation_metadata {
-                    for media_key in ["input_audio", "video_url", "image_url"] {
+                    for media_key in ["input_audio", "video_url", "image_url", "file"] {
                         if let Some(media) = part.get_mut(media_key).and_then(|v| v.as_object_mut())
                         {
                             media.remove("duration_secs");
                             media.remove("width");
                             media.remove("height");
+                            media.remove("page_count");
                         }
                     }
                 }
@@ -671,13 +672,16 @@ mod tests {
     /// the request bytes. The rest of the part survives either way.
     #[test]
     fn estimation_metadata_follows_the_wires_tolerance() {
-        use crate::message::{ImageData, MessageContent, VideoData};
+        use crate::message::{DocumentData, ImageData, MessageContent, VideoData};
 
         let content = MessageContent::parts(vec![
             ContentPart::text("what is in this?"),
             ContentPart::audio(&AudioData::from_bytes(&[0u8; 4], "mp3").with_duration(3.5)),
             ContentPart::video(&VideoData::from_url("https://x/y.mp4").with_duration(12.0)),
             ContentPart::image(&ImageData::from_url("https://x/y.png").with_dimensions(800, 600)),
+            ContentPart::document(
+                &DocumentData::from_bytes(b"%PDF", "application/pdf").with_page_count(7),
+            ),
         ]);
 
         // Strict wire (the default): every metadata key is shed.
@@ -698,6 +702,14 @@ mod tests {
         );
         assert_eq!(parts[2]["video_url"]["url"], "https://x/y.mp4");
         assert!(parts[3]["image_url"].get("width").is_none(), "{strict}");
+        // Pin the part's identity first: without it the page_count assertion
+        // would also pass vacuously if the file part went missing or moved.
+        assert_eq!(parts[4]["type"], "file", "{strict}");
+        assert!(parts[4]["file"].get("page_count").is_none(), "{strict}");
+        assert_eq!(
+            parts[4]["file"]["filename"], "document.pdf",
+            "only the metadata is shed"
+        );
 
         // Tolerant wire: the metadata rides the payload.
         let tolerant = content_value(&content, true);
@@ -706,6 +718,7 @@ mod tests {
         assert_eq!(parts[2]["video_url"]["duration_secs"], 12.0);
         assert_eq!(parts[3]["image_url"]["width"], 800);
         assert_eq!(parts[3]["image_url"]["height"], 600);
+        assert_eq!(parts[4]["file"]["page_count"], 7);
     }
 
     /// A `data:` URL in an audio part's `data` splits into raw base64 +

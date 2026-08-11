@@ -1,6 +1,6 @@
 [package]
 name = "minillmlib"
-version = "0.5.8"
+version = "0.5.9"
 edition = "2021"
 rust-version = "1.86"
 description = "A minimalist, async-first Rust library for LLM interactions with streaming support"
@@ -14,6 +14,11 @@ categories = ["api-bindings", "asynchronous", "web-programming"]
 authors = ["qfeuilla"]
 exclude = [
     "data/*",
+    # test.pdf IS shipped (gitignore-style negation): unlike the other data/
+    # assets it is committed and tests hard-depend on it (no skip guard), so a
+    # packaged crate must carry it or `cargo test` on the published tarball
+    # fails. It is 606 bytes.
+    "!data/test.pdf",
     ".env",
     ".github/*",
 ]

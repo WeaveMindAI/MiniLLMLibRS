@@ -106,6 +106,31 @@ const VIDEO_FRAMES_PER_SECOND: f64 = 1.0;
 /// and the only one any provider states.
 const AUDIO_TOKENS_PER_SECOND: f64 = 32.0;
 
+/// What one PDF page costs in TEXT tokens. Anthropic (the only provider
+/// publishing a figure) states 1,500-3,000 tokens per page counting the
+/// extracted text plus the page rendered as an image; the image half is
+/// counted separately below at the still-image bound, so the text half's
+/// published ceiling is roughly half the total.
+const DOCUMENT_TEXT_TOKENS_PER_PAGE: u32 = 1_500;
+
+/// What to assume a document runs when the caller did not declare a page
+/// count. Same reasoning as [`DEFAULT_MEDIA_SECONDS`]: a caller that parsed
+/// the file knows and should pass it (`with_page_count`); absent that, twenty
+/// pages is a reasonable document and anything it understates is caught by
+/// the context-window clamp in pricing.
+const DEFAULT_DOCUMENT_PAGES: u32 = 20;
+
+/// The page count to price a document at: what the caller said, or the
+/// default. Zero is not a page count (a document part is always at least one
+/// page), so it falls back rather than pricing the document as free; same
+/// nonsense-value rule as [`media_seconds`].
+fn document_pages(declared: Option<u32>) -> u32 {
+    match declared {
+        Some(pages) if pages > 0 => pages,
+        _ => DEFAULT_DOCUMENT_PAGES,
+    }
+}
+
 /// What to assume a clip lasts when the caller did not say.
 ///
 /// Media carries its duration in a container header this library does not parse,
@@ -188,6 +213,19 @@ pub fn estimate_prompt_tokens(messages: &[Message]) -> PromptEstimate {
                             audio_tokens = audio_tokens.saturating_add(audio_tokens_for(
                                 media_seconds(input_audio.duration_secs),
                             ))
+                        }
+                        // A document bills per page: the page's extracted text at
+                        // the text rate plus the page rendered as an image at the
+                        // still-image bound (Anthropic's published PDF pricing
+                        // model, the only one stated).
+                        ContentPart::File { file } => {
+                            let pages = u64::from(document_pages(file.page_count));
+                            text_tokens = text_tokens.saturating_add(
+                                pages.saturating_mul(u64::from(DOCUMENT_TEXT_TOKENS_PER_PAGE)),
+                            );
+                            image_tokens = image_tokens.saturating_add(
+                                pages.saturating_mul(u64::from(TOKENS_PER_STILL_IMAGE)),
+                            );
                         }
                     }
                 }
@@ -364,6 +402,39 @@ mod tests {
         );
     }
 
+    /// A document bills per page (text + page-as-image), from the declared
+    /// page count or the default when undeclared. The expected values are
+    /// LITERALS on purpose: written in terms of the constants, the assertions
+    /// would move with them and a silent change to the published-pricing
+    /// figures (1,500 text/page, 1,600 image/page, 20-page default) would
+    /// never fail a test.
+    #[test]
+    fn a_document_bills_per_declared_page_or_the_default() {
+        use crate::message::DocumentData;
+
+        fn doc(page_count: Option<u32>) -> Message {
+            let mut d = DocumentData::from_bytes(b"%PDF", "application/pdf");
+            d.page_count = page_count;
+            parts(vec![ContentPart::document(&d)])
+        }
+
+        let e = estimate_prompt_tokens(&[doc(Some(3))]);
+        // 3 pages x 1,600 image tokens.
+        assert_eq!(e.image_tokens, 4_800);
+        // 3 pages x 1,500 text tokens + the 4-token message envelope, scaled
+        // once by the 1.6 safety multiplier: ceil(4504 * 1.6).
+        assert_eq!(e.text_tokens, 7_207);
+
+        // Undeclared page count → the 20-page default, never zero.
+        let e = estimate_prompt_tokens(&[doc(None)]);
+        assert_eq!(e.image_tokens, 20 * 1_600);
+
+        // A declared ZERO is nonsense, not a free document: it prices exactly
+        // like an undeclared count.
+        let zero = estimate_prompt_tokens(&[doc(Some(0))]);
+        assert_eq!(zero, e);
+    }
+
     /// THE property an in-flight meter relies on: messages serialized to a
     /// metadata-keeping wire and deserialized back estimate EXACTLY like the
     /// originals. Durations and dimensions survive the round trip, so the
@@ -380,6 +451,10 @@ mod tests {
             ),
             ContentPart::video(&VideoData::from_url("https://x/y.mp4").with_duration(30.0)),
             ContentPart::image(&ImageData::from_url("https://x/y.png").with_dimensions(800, 600)),
+            ContentPart::document(
+                &crate::message::DocumentData::from_bytes(b"%PDF", "application/pdf")
+                    .with_page_count(4),
+            ),
         ])];
         let wire = serde_json::Value::Array(messages_to_payload(&originals, true));
         let round_tripped: Vec<Message> = serde_json::from_value(wire).expect("wire parses back");

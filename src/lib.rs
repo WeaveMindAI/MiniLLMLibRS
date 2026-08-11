@@ -85,8 +85,8 @@ pub use generator::{
 };
 pub use json_repair::{loads, repair_json, JsonValue, RepairOptions};
 pub use message::{
-    AudioData, AudioInput, ContentPart, ImageData, ImageUrl, Media, MediaData, Message,
-    MessageContent, Role, VideoData, VideoUrl,
+    AudioData, AudioInput, ContentPart, DocumentData, FileData, ImageData, ImageUrl, Media,
+    MediaData, Message, MessageContent, Role, VideoData, VideoUrl,
 };
 pub use provider::{
     resolve_claude_subscription_auth, AnthropicProvider, AppIdentity, Auth, CompletionResponse,

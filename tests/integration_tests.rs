@@ -8,7 +8,9 @@
 use minillmlib::{
     chat_node::ChatNode,
     generator::{CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings},
-    message::{AudioData, ImageData, Media, Message, MessageContent, Role, VideoData},
+    message::{
+        AudioData, DocumentData, ImageData, Media, Message, MessageContent, Role, VideoData,
+    },
     provider::{CostInfo, LLMClient},
     tracking::{AsyncCostCallback, CompletionContext, CompletionMeta},
 };
@@ -632,6 +634,7 @@ fn test_media_from_image() {
     assert!(media.is_image());
     assert!(!media.is_audio());
     assert!(!media.is_video());
+    assert!(!media.is_document());
     assert!(media.as_image().is_some());
 }
 
@@ -643,6 +646,7 @@ fn test_media_from_audio() {
     assert!(!media.is_image());
     assert!(media.is_audio());
     assert!(!media.is_video());
+    assert!(!media.is_document());
     assert!(media.as_audio().is_some());
 }
 
@@ -654,7 +658,38 @@ fn test_media_from_video() {
     assert!(!media.is_image());
     assert!(!media.is_audio());
     assert!(media.is_video());
+    assert!(!media.is_document());
     assert!(media.as_video().is_some());
+}
+
+#[test]
+fn test_media_from_document() {
+    let document = DocumentData::from_bytes(&[0u8; 100], "application/pdf");
+    let media = Media::from(document.clone());
+
+    assert!(!media.is_image());
+    assert!(!media.is_audio());
+    assert!(!media.is_video());
+    assert!(media.is_document());
+    assert!(media.as_document().is_some());
+}
+
+#[test]
+fn test_message_content_with_documents() {
+    let document = DocumentData::from_bytes(&[0u8; 100], "application/pdf").with_page_count(5);
+    let content = MessageContent::with_documents("Summarize this document", &[document]);
+    assert!(content.has_multimodal());
+    assert_eq!(content.get_text(), Some("Summarize this document"));
+    // The document part must actually BE a file part carrying its metadata,
+    // not just "something non-text" (a degraded text part would still pass
+    // has_multimodal-style checks on a longer message).
+    let minillmlib::message::MessageContent::Parts(parts) = &content else {
+        panic!("with_documents builds Parts");
+    };
+    let minillmlib::message::ContentPart::File { file } = &parts[1] else {
+        panic!("the document must become a File part, got {:?}", parts[1]);
+    };
+    assert_eq!(file.page_count, Some(5));
 }
 
 #[test]
@@ -671,11 +706,44 @@ fn test_message_content_with_media() {
     let audio = AudioData::from_bytes(&[0u8; 100], "wav");
     let video = VideoData::from_url("https://example.com/video.mp4");
 
-    let media = vec![Media::from(image), Media::from(audio), Media::from(video)];
+    let document = DocumentData::from_bytes(&[0u8; 100], "application/pdf");
+
+    let media = vec![
+        Media::from(image),
+        Media::from(audio),
+        Media::from(video),
+        Media::from(document),
+    ];
 
     let content = MessageContent::with_media("Describe all this media", &media);
     assert!(content.has_multimodal());
     assert_eq!(content.get_text(), Some("Describe all this media"));
+    // Each media kind must arrive as ITS part kind (from_media dispatched
+    // right), not merely as "something non-text".
+    let minillmlib::message::MessageContent::Parts(parts) = &content else {
+        panic!("with_media builds Parts");
+    };
+    use minillmlib::message::ContentPart;
+    assert!(
+        matches!(parts[1], ContentPart::Image { .. }),
+        "{:?}",
+        parts[1]
+    );
+    assert!(
+        matches!(parts[2], ContentPart::Audio { .. }),
+        "{:?}",
+        parts[2]
+    );
+    assert!(
+        matches!(parts[3], ContentPart::Video { .. }),
+        "{:?}",
+        parts[3]
+    );
+    assert!(
+        matches!(parts[4], ContentPart::File { .. }),
+        "{:?}",
+        parts[4]
+    );
 }
 
 // =============================================================================
@@ -1863,6 +1931,79 @@ async fn test_image_completion() {
             panic!("Image completion failed: {:?}", e);
         }
     }
+}
+
+#[tokio::test]
+async fn test_pdf_completion() {
+    dotenvy::dotenv().ok();
+
+    require_live!("OPENROUTER_API_KEY");
+
+    // data/test.pdf is a committed one-page PDF whose text says
+    // "The secret codeword is PELICAN.": distinctive content, so the
+    // assertion proves the model actually READ the document rather than
+    // politely acknowledging an attachment it couldn't open. No existence
+    // guard, unlike the image/audio/video siblings: their assets are NOT
+    // committed, this one is, so a missing file is a real failure that
+    // `from_file` reports loudly.
+    let pdf_path = "./data/test.pdf";
+
+    let generator = get_test_generator();
+    let document = DocumentData::from_file(pdf_path)
+        .unwrap()
+        .with_page_count(1);
+
+    let content = MessageContent::with_documents(
+        "What is the secret codeword in this PDF? Answer with just the codeword.",
+        &[document],
+    );
+
+    let root = ChatNode::root("You are a helpful assistant.");
+    let user_node = root
+        .add_child(ChatNode::new(Message {
+            role: Role::User,
+            content,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            cache_breakpoint: false,
+        }))
+        .unwrap();
+
+    let result = user_node.complete(&generator, None).await;
+
+    match result {
+        Ok(response) => {
+            println!("PDF answer: {:?}", response.text());
+            let text = response.text().expect("a text answer");
+            assert!(
+                text.to_uppercase().contains("PELICAN"),
+                "the model did not read the PDF's content: {text:?}"
+            );
+        }
+        Err(e) => {
+            panic!("PDF completion failed: {:?}", e);
+        }
+    }
+}
+
+#[test]
+fn test_document_data_from_file() {
+    let document = DocumentData::from_file("./data/test.pdf").unwrap();
+    assert_eq!(document.mime_type, "application/pdf");
+    assert!(!document.base64_data.is_empty());
+    assert!(document
+        .to_data_url()
+        .starts_with("data:application/pdf;base64,"));
+    // The decoded bytes are the real file, magic number intact.
+    assert!(document.to_bytes().unwrap().starts_with(b"%PDF-"));
+}
+
+#[test]
+fn test_document_data_from_url() {
+    let document = DocumentData::from_url("https://example.com/paper.pdf");
+    assert_eq!(document.to_data_url(), "https://example.com/paper.pdf");
+    assert!(document.is_url());
 }
 
 #[tokio::test]

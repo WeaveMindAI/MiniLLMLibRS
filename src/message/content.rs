@@ -1,6 +1,6 @@
 //! Message content types
 
-use super::{AudioData, ImageData, Media, VideoData};
+use super::{AudioData, DocumentData, ImageData, Media, VideoData};
 use serde::{Deserialize, Serialize};
 
 /// A single part of message content
@@ -22,6 +22,10 @@ pub enum ContentPart {
     /// Video content (for models that support it)
     #[serde(rename = "video_url")]
     Video { video_url: VideoUrl },
+
+    /// Document content (PDFs, for models that support them)
+    #[serde(rename = "file")]
+    File { file: FileData },
 }
 
 /// Image URL structure for API
@@ -74,6 +78,67 @@ pub struct VideoUrl {
     pub height: Option<u32>,
 }
 
+/// File (document) structure for API.
+///
+/// The OpenAI-compatible `file` part: `file_data` carries a
+/// `data:<mime>;base64,<payload>` URL for inline documents, or the URL verbatim
+/// for URL-backed ones; `filename` is the display name the model sees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileData {
+    pub filename: String,
+    pub file_data: String,
+    /// Page count, when the caller knows it. Estimation metadata, like
+    /// [`AudioInput::duration_secs`]: kept by serde, shed from the wire
+    /// unless the provider's wire tolerates it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_count: Option<u32>,
+}
+
+/// The display filename a URL-backed document derives from its URL: the last
+/// PATH segment. The query (`?`) and fragment (`#`) are cut FIRST, so nothing
+/// after them (even a stray "://") influences the result. `None` when the URL
+/// yields no honest name, so the caller falls back to the generic one:
+/// a `data:` URL in any case (its "segment" would be base64 noise; schemes are
+/// case-insensitive), a URL with a host but no path in either spelling
+/// ("https://example.com" or the protocol-relative "//example.com": the
+/// hostname is not a filename), a segment containing a backslash (a Windows
+/// path is not a URL and cannot be split reliably) or a colon ("mailto:a@b" is
+/// an address, not a file; colons are illegal in filenames anyway), or an
+/// empty segment (trailing slash).
+fn derived_url_filename(url: &str) -> Option<String> {
+    if url
+        .get(..5)
+        .is_some_and(|s| s.eq_ignore_ascii_case("data:"))
+    {
+        return None;
+    }
+    let path = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+    // Skip the authority when one is present, in EITHER spelling:
+    // "<scheme>://host" or the protocol-relative "//host". The path starts at
+    // the first '/' after the host; a URL with a host but no path has no
+    // filename. The detection is STRUCTURAL on purpose, no scheme validation:
+    // validating the scheme was tried and it made rejected-scheme URLs
+    // ("my_app://host") fall into the bare-path branch and leak the hostname
+    // as a filename, the exact outcome this block exists to prevent. The
+    // protocol-relative check comes first so a "://" inside such a URL's path
+    // is never mistaken for the authority marker.
+    let host_start = if path.starts_with("//") {
+        Some(2)
+    } else {
+        path.find("://").map(|pos| pos + 3)
+    };
+    let path = match host_start {
+        Some(host_start) => {
+            let authority_and_path = &path[host_start..];
+            let slash = authority_and_path.find('/')?;
+            &authority_and_path[slash + 1..]
+        }
+        None => path,
+    };
+    let segment = path.rsplit('/').next().unwrap_or("");
+    (!segment.is_empty() && !segment.contains(['\\', ':'])).then(|| segment.to_string())
+}
+
 impl ContentPart {
     /// Create a text content part
     pub fn text(text: impl Into<String>) -> Self {
@@ -124,12 +189,51 @@ impl ContentPart {
         }
     }
 
+    /// Create a document content part from DocumentData.
+    ///
+    /// Some wires require a filename, so a missing one is derived: for a
+    /// URL-backed document, from the URL's last path segment (the name the
+    /// model would reasonably be told, and distinct across several
+    /// attachments); for inline bytes, the fixed "document.pdf", since PDF is
+    /// the only format the wires accept ([`MediaData::guess_format`](super::MediaData::guess_format) is the
+    /// one place that decides which formats exist). No name is ever derived
+    /// from the MIME string: string surgery on a caller-supplied MIME produced
+    /// garbage names for anything unexpected.
+    pub fn document(document: &DocumentData) -> Self {
+        // A blank explicit filename (empty or whitespace-only) is a caller bug
+        // (an unfilled variable), not a choice: it falls through to derivation
+        // instead of shipping a blank name to a wire that requires one. A real
+        // name is shipped trimmed.
+        let named = document
+            .filename
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string);
+        let filename = named
+            .or_else(|| {
+                document
+                    .is_url
+                    .then(|| derived_url_filename(&document.base64_data))
+                    .flatten()
+            })
+            .unwrap_or_else(|| "document.pdf".to_string());
+        Self::File {
+            file: FileData {
+                filename,
+                file_data: document.to_data_url(),
+                page_count: document.page_count,
+            },
+        }
+    }
+
     /// Create a content part from any Media type
     pub fn from_media(media: &Media) -> Self {
         match media {
             Media::Image(img) => Self::image(img),
             Media::Audio(audio) => Self::audio(audio),
             Media::Video(video) => Self::video(video),
+            Media::Document(document) => Self::document(document),
         }
     }
 
@@ -154,7 +258,7 @@ pub enum MessageContent {
     /// Simple text content
     Text(String),
 
-    /// Multimodal content (text + images + audio)
+    /// Multimodal content (text plus any media parts)
     Parts(Vec<ContentPart>),
 }
 
@@ -187,6 +291,13 @@ impl MessageContent {
     pub fn with_video(text: impl Into<String>, video: &[VideoData]) -> Self {
         let mut parts = vec![ContentPart::text(text)];
         parts.extend(video.iter().map(ContentPart::video));
+        Self::Parts(parts)
+    }
+
+    /// Create content with text and documents
+    pub fn with_documents(text: impl Into<String>, documents: &[DocumentData]) -> Self {
+        let mut parts = vec![ContentPart::text(text)];
+        parts.extend(documents.iter().map(ContentPart::document));
         Self::Parts(parts)
     }
 
@@ -322,6 +433,178 @@ mod tests {
         let untimed = ContentPart::video(&VideoData::from_url("https://x/y.mp4"));
         let json = serde_json::to_value(&untimed).unwrap();
         assert!(json["video_url"].get("duration_secs").is_none(), "{json}");
+    }
+
+    #[test]
+    fn document_content_part_emits_openai_file_shape() {
+        use crate::message::DocumentData;
+        let doc = DocumentData::from_bytes(b"%PDF-1.7", "application/pdf")
+            .with_filename("report.pdf")
+            .with_page_count(3);
+        let part = ContentPart::document(&doc);
+        let json = serde_json::to_value(&part).unwrap();
+        assert_eq!(json["type"], "file");
+        assert_eq!(json["file"]["filename"], "report.pdf");
+        assert!(json["file"]["file_data"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:application/pdf;base64,"));
+        assert_eq!(json["file"]["page_count"], 3);
+
+        // Round trip: the page count (estimation metadata) survives serde.
+        let ContentPart::File { file } = serde_json::from_value(json).unwrap() else {
+            panic!("a file part must deserialize as one");
+        };
+        assert_eq!(file.page_count, Some(3));
+    }
+
+    #[test]
+    fn document_without_filename_gets_a_generic_one_and_url_ships_verbatim() {
+        use crate::message::DocumentData;
+        let inline = ContentPart::document(&DocumentData::from_bytes(b"x", "application/pdf"));
+        let json = serde_json::to_value(&inline).unwrap();
+        assert_eq!(json["file"]["filename"], "document.pdf");
+        assert!(json["file"].get("page_count").is_none(), "{json}");
+
+        // A weird MIME never leaks into the derived name (the name is NOT
+        // derived from the MIME string; a caller-supplied subtype once
+        // produced "document.vnd.openxmlformats-...").
+        let weird = ContentPart::document(&DocumentData::from_bytes(b"x", "application/weird"));
+        let json = serde_json::to_value(&weird).unwrap();
+        assert_eq!(json["file"]["filename"], "document.pdf");
+    }
+
+    #[test]
+    fn a_url_backed_document_is_named_after_its_url() {
+        use crate::message::DocumentData;
+        let url = ContentPart::document(&DocumentData::from_url(
+            "https://x/reports/2024-annual.pdf?dl=1#page=2",
+        ));
+        let json = serde_json::to_value(&url).unwrap();
+        // The URL rides verbatim; the model is told the file's REAL name
+        // (query and fragment cut), not a generic placeholder that would
+        // collide across several attachments.
+        assert_eq!(
+            json["file"]["file_data"],
+            "https://x/reports/2024-annual.pdf?dl=1#page=2"
+        );
+        assert_eq!(json["file"]["filename"], "2024-annual.pdf");
+
+        // A URL with no usable last segment falls back to the generic name.
+        let bare = ContentPart::document(&DocumentData::from_url("https://example.com/"));
+        let json = serde_json::to_value(&bare).unwrap();
+        assert_eq!(json["file"]["filename"], "document.pdf");
+
+        // An explicit filename always wins over derivation.
+        let named = ContentPart::document(
+            &DocumentData::from_url("https://x/paper.pdf").with_filename("the-good-one.pdf"),
+        );
+        let json = serde_json::to_value(&named).unwrap();
+        assert_eq!(json["file"]["filename"], "the-good-one.pdf");
+
+        // A BLANK explicit filename (empty or whitespace-only) is a caller bug
+        // (an unfilled variable), never shipped: it falls through to
+        // derivation like a missing one. A real name ships trimmed.
+        for blank in ["", "   "] {
+            let part = ContentPart::document(
+                &DocumentData::from_url("https://x/paper.pdf").with_filename(blank),
+            );
+            let json = serde_json::to_value(&part).unwrap();
+            assert_eq!(json["file"]["filename"], "paper.pdf", "blank {blank:?}");
+        }
+        let padded = ContentPart::document(
+            &DocumentData::from_url("https://x/paper.pdf").with_filename("  report.pdf "),
+        );
+        let json = serde_json::to_value(&padded).unwrap();
+        assert_eq!(json["file"]["filename"], "report.pdf");
+    }
+
+    /// Each cut and each no-honest-name case is pinned SEPARATELY: a single
+    /// query-and-fragment URL would pass with either cut broken (the `?`
+    /// comes first, so the `#` never decides).
+    #[test]
+    fn a_urls_query_and_fragment_are_each_cut_on_their_own() {
+        use crate::message::DocumentData;
+        let name_of = |url: &str| {
+            let part = ContentPart::document(&DocumentData::from_url(url));
+            serde_json::to_value(&part).unwrap()["file"]["filename"].clone()
+        };
+        // Query only, fragment only.
+        assert_eq!(name_of("https://x/paper.pdf?dl=1"), "paper.pdf");
+        assert_eq!(name_of("https://x/paper.pdf#page=2"), "paper.pdf");
+
+        // A pathless URL never hands the HOSTNAME out as a filename, in ANY
+        // spelling: with a scheme, protocol-relative, with or without the
+        // trailing slash. All forms agree on the generic fallback, and the
+        // protocol-relative spelling WITH a path still derives normally.
+        assert_eq!(name_of("https://example.com"), "document.pdf");
+        assert_eq!(name_of("https://example.com/"), "document.pdf");
+        assert_eq!(name_of("//example.com"), "document.pdf");
+        assert_eq!(name_of("//example.com/"), "document.pdf");
+        assert_eq!(name_of("//example.com/paper.pdf"), "paper.pdf");
+        // A "://" sitting INSIDE a protocol-relative URL's path must not be
+        // mistaken for the authority marker: the "//" branch wins.
+        assert_eq!(name_of("//example.com/x://y/c.pdf"), "c.pdf");
+        // A NON-STANDARD scheme still counts as an authority (detection is
+        // structural, no scheme validation): the hostname must not leak as a
+        // filename just because the scheme has an unusual character.
+        assert_eq!(name_of("my_app://example.com"), "document.pdf");
+        assert_eq!(name_of("my_app://example.com/paper.pdf"), "paper.pdf");
+
+        // A non-path URL (no slashes at all) is an address, not a file.
+        assert_eq!(name_of("mailto:someone@example.com"), "document.pdf");
+
+        // No honest name → the generic fallback, never a misleading one:
+        // a data: URL's "segment" is base64 noise, a backslashed Windows
+        // path is not a URL, a trailing slash names a directory-ish thing.
+        assert_eq!(
+            name_of("data:application/pdf;base64,JVBERi0="),
+            "document.pdf"
+        );
+        // Schemes are case-insensitive, so the data: guard must be too.
+        assert_eq!(
+            name_of("DATA:application/pdf;base64,JVBERi0="),
+            "document.pdf"
+        );
+        assert_eq!(name_of(r"C:\Users\me\report.pdf"), "document.pdf");
+        assert_eq!(name_of("https://x/report.pdf/"), "document.pdf");
+    }
+
+    /// The from_media dispatch must route a document to a File part; pinned
+    /// at unit level so the fast suite catches it, not only the integration
+    /// binary.
+    #[test]
+    fn from_media_routes_a_document_to_a_file_part() {
+        use crate::message::DocumentData;
+        let media = Media::Document(
+            DocumentData::from_bytes(b"%PDF", "application/pdf").with_page_count(2),
+        );
+        let ContentPart::File { file } = ContentPart::from_media(&media) else {
+            panic!("a Media::Document must become a File part");
+        };
+        assert_eq!(file.page_count, Some(2));
+    }
+
+    /// The untagged `MessageContent` enum must resolve a message carrying a
+    /// file part back to `Parts` with the `File` variant intact; a wrong serde
+    /// tag would silently misparse the whole multimodal message.
+    #[test]
+    fn a_message_with_a_document_survives_a_serde_round_trip() {
+        use crate::message::DocumentData;
+        let content = MessageContent::with_documents(
+            "read this",
+            &[DocumentData::from_bytes(b"%PDF", "application/pdf").with_page_count(9)],
+        );
+        let json = serde_json::to_value(&content).unwrap();
+        let back: MessageContent = serde_json::from_value(json).unwrap();
+        let MessageContent::Parts(parts) = back else {
+            panic!("a parts message must deserialize as Parts, not collapse to Text");
+        };
+        assert_eq!(parts[0].as_text(), Some("read this"));
+        let ContentPart::File { file } = &parts[1] else {
+            panic!("the file part must come back as File, got {:?}", parts[1]);
+        };
+        assert_eq!(file.page_count, Some(9));
     }
 
     #[test]

@@ -85,6 +85,12 @@ and replace it with the tracked real cost once the call returns. It assumes:
   (the video token model matched Gemini's real billing within 1%). Audio bills
   by the second, at up to 1000x the text rate on some models, so this is where
   the money is.
+- a 20-page document for a PDF whose page count you did not state. **Set the
+  real count** with `DocumentData::with_page_count`: PDFs bill per page (the
+  page's extracted text plus the page rendered as an image, roughly 1,500-3,000
+  tokens a page), so an undeclared count overshoots short documents and
+  undershoots long ones exactly like an undeclared clip length does. A declared
+  zero is treated as undeclared, never as a free document.
 
 There is no error case beyond an uncatalogued model: a prompt counted larger
 than the model accepts is priced as the largest input the model *does* accept,
