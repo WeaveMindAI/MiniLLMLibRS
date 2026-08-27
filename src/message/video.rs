@@ -31,9 +31,11 @@ pub struct VideoData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
 
-    /// Frame rate (if known)
+    /// Frame rate (if known). `f64` like the sampling params: this
+    /// serializes to a JSON number, and an f32 29.97 would emit as
+    /// `29.969999313354492`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub frame_rate: Option<f32>,
+    pub frame_rate: Option<f64>,
 }
 
 impl MediaData for VideoData {
@@ -114,7 +116,7 @@ impl VideoData {
     }
 
     /// Set frame rate
-    pub fn with_frame_rate(mut self, frame_rate: f32) -> Self {
+    pub fn with_frame_rate(mut self, frame_rate: f64) -> Self {
         self.frame_rate = Some(frame_rate);
         self
     }

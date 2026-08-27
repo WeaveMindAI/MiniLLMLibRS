@@ -23,23 +23,28 @@ pub struct CompletionParameters {
     /// (`max_completion_tokens`, `max_tokens`, Anthropic's required `max_tokens`).
     pub max_tokens: Option<u32>,
 
-    /// Temperature for sampling (0.0 = deterministic, 2.0 = very random)
-    pub temperature: Option<f32>,
+    /// Temperature for sampling (0.0 = deterministic, 2.0 = very random).
+    /// `f64` on purpose, like every sampling knob here: these values reach
+    /// the wire as JSON numbers, and squeezing 0.9 through an f32 emits
+    /// `0.8999999761581421` (the shortest text that round-trips the widened
+    /// float). Strict providers reject that many decimals (Z.AI caps
+    /// temperature at two).
+    pub temperature: Option<f64>,
 
     /// Top-p (nucleus) sampling
-    pub top_p: Option<f32>,
+    pub top_p: Option<f64>,
 
     /// Top-k sampling
     pub top_k: Option<u32>,
 
     /// Frequency penalty (-2.0 to 2.0)
-    pub frequency_penalty: Option<f32>,
+    pub frequency_penalty: Option<f64>,
 
     /// Presence penalty (-2.0 to 2.0)
-    pub presence_penalty: Option<f32>,
+    pub presence_penalty: Option<f64>,
 
     /// Repetition penalty (1.0 = no penalty)
-    pub repetition_penalty: Option<f32>,
+    pub repetition_penalty: Option<f64>,
 
     /// Stop sequences (OpenAI `stop`, Anthropic `stop_sequences`).
     pub stop: Option<Vec<String>>,
@@ -240,13 +245,13 @@ impl CompletionParameters {
     }
 
     /// Set temperature
-    pub fn with_temperature(mut self, temp: f32) -> Self {
+    pub fn with_temperature(mut self, temp: f64) -> Self {
         self.temperature = Some(temp);
         self
     }
 
     /// Set top_p
-    pub fn with_top_p(mut self, top_p: f32) -> Self {
+    pub fn with_top_p(mut self, top_p: f64) -> Self {
         self.top_p = Some(top_p);
         self
     }

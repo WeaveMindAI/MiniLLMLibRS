@@ -419,20 +419,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(body["max_completion_tokens"], 512);
-        let temp = body["temperature"].as_f64().unwrap();
-        assert!((temp - 0.9).abs() < 1e-6, "temperature: {}", temp);
-        let top_p = body["top_p"].as_f64().unwrap();
-        assert!((top_p - 0.95).abs() < 1e-6, "top_p: {}", top_p);
+        // EXACT equality, not approximate: these reach the wire as JSON
+        // text, and the one historical bug here was f32 fields widening
+        // 0.9 into "0.8999999761581421" on the wire (rejected by
+        // providers that cap the decimals, e.g. Z.AI at two).
+        assert_eq!(body["temperature"], serde_json::json!(0.9));
+        assert_eq!(body["top_p"], serde_json::json!(0.95));
         assert_eq!(body["top_k"], 40);
-        assert_eq!(body["frequency_penalty"], 0.5);
-        let presence = body["presence_penalty"].as_f64().unwrap();
-        assert!(
-            (presence - 0.3).abs() < 1e-6,
-            "presence_penalty: {}",
-            presence
-        );
-        let rep = body["repetition_penalty"].as_f64().unwrap();
-        assert!((rep - 1.2).abs() < 1e-6, "repetition_penalty: {}", rep);
+        assert_eq!(body["frequency_penalty"], serde_json::json!(0.5));
+        assert_eq!(body["presence_penalty"], serde_json::json!(0.3));
+        assert_eq!(body["repetition_penalty"], serde_json::json!(1.2));
         assert_eq!(body["stop"][0], "END");
         assert_eq!(body["seed"], 42);
     }

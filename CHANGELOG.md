@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.10] - 2026-08-27
+
+### Fixed
+
+- Sampling parameters (`temperature`, `top_p`, `frequency_penalty`,
+  `presence_penalty`, `repetition_penalty`) and `VideoData.frame_rate` are
+  now `f64` instead of `f32`. These values reach the wire as JSON numbers,
+  and an f32 0.9 widens to `0.8999999761581421` on serialization; providers
+  that cap the number of decimals (Z.AI allows two on temperature) rejected
+  the request with a 400. `f64` carries the value the caller wrote,
+  verbatim.
+
 ## [0.5.9] - 2026-08-10
 
 ### Added
