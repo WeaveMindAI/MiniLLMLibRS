@@ -581,7 +581,7 @@ let response = root.chat("Hello!", &generator).await?;
 | `stop` | `Option<Vec<String>>` | `None` | Stop sequences |
 | `seed` | `Option<u64>` | `None` | Random seed |
 | `response_format` | `Option<ResponseFormat>` | `None` | Force JSON output |
-| `reasoning` | `Option<ReasoningConfig>` | `None` | Extended-thinking effort/budget |
+| `reasoning` | `Option<ReasoningConfig>` | `None` | Reasoning on or off and how hard; translated per wire (`reasoning` object on OpenRouter, `reasoning_effort` on OpenAI, `thinking` on Anthropic). `effort: "none"` is off and never fails a request |
 | `extra` | `Option<HashMap>` | `None` | Provider-specific keys (incl. OpenRouter routing) |
 
 ### NodeCompletionParameters

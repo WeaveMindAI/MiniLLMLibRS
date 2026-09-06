@@ -310,6 +310,27 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// consulted by the default [`build_request`](Self::build_request).
     fn openai_request_usage(&self, _body: &mut serde_json::Value, _stream: bool) {}
 
+    /// (OpenAI-default helper) write the normalized [`ReasoningConfig`] onto the
+    /// request body in this wire's dialect. Only consulted by the default
+    /// [`build_request`](Self::build_request); a provider with its own envelope
+    /// translates reasoning inside its own `build_request`.
+    ///
+    /// The contract every wire honours: "off" (`effort: "none"`) never fails a
+    /// request. A wire whose models are off unless asked, and whose plain
+    /// models refuse the key in any value (OpenAI's `reasoning_effort`), writes
+    /// nothing for off. The default is OpenAI's dialect: `reasoning_effort:
+    /// <effort>` for an effort other than `none`, nothing for `none`; a budget
+    /// (`max_tokens`) is refused, since this wire has no budget knob and
+    /// dropping it would silently change what the caller asked for; `exclude`
+    /// is a no-op, since a chat completion never returns the reasoning text.
+    fn openai_reasoning_value(
+        &self,
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        reasoning: &crate::generator::ReasoningConfig,
+    ) -> crate::error::Result<()> {
+        super::openai_wire::openai_reasoning_effort(obj, reasoning)
+    }
+
     /// How many cache breakpoints this provider's wire accepts per request.
     /// Consulted by the wires that emit `cache_control` markers (Anthropic's
     /// native wire and OpenRouter's passthrough, both capped at Anthropic's 4);

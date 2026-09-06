@@ -31,7 +31,7 @@ let params = CompletionParameters::new()
 | `stop` | Stop sequences (Anthropic `stop_sequences`) |
 | `seed` | Reproducibility |
 | `response_format` | Force JSON output (`with_json_response()`) |
-| `reasoning` | Extended-thinking effort/budget |
+| `reasoning` | Reasoning on or off, and how hard. Translated per wire: OpenRouter takes the object as it is; OpenAI gets `reasoning_effort`; Anthropic gets `thinking` (a budget on Claude 4.5 and earlier, adaptive plus `output_config.effort` from 4.6 on). `effort: "none"` is off and never fails a request: where the wire has no spelling for off, nothing is written |
 | `tools`, `tool_choice`, `parallel_tool_calls` | Normalized tool calling; the provider emits its wire shape (see [Tool Calling](./tool-calling.md)) |
 | `extra` | Provider-specific keys (the honest escape hatch, e.g. OpenRouter routing) |
 

@@ -5,7 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.10] - 2026-08-27
+## [0.5.11] - 2026-09-06
+
+### Changed
+
+- `ReasoningConfig` is now translated per wire instead of written as
+  OpenRouter's `reasoning` object everywhere. The contract every wire
+  honours: "off" (`effort: "none"`) never fails a request, and "on" is the
+  wire's own spelling of the effort.
+  - OpenRouter: the normalized object goes through verbatim, as before;
+    `none` is its spelling of off, which mandatory-reasoning models refuse
+    loudly.
+  - OpenAI (and any generic OpenAI-compatible server): `reasoning_effort:
+    <effort>`; `none` writes nothing (a plain model refuses the key in any
+    value, and off is its state anyway); a budget with no effort is refused,
+    since the wire has no budget knob.
+  - Anthropic: translated at last, in the dialect the model speaks. Claude
+    4.5 and earlier get `thinking: {type: "enabled", budget_tokens}` (an
+    explicit budget, or the effort's share of `max_tokens`, floored at 1024
+    and refused when `max_tokens` leaves no room); 4.6 onward get
+    `thinking: {type: "adaptive"}` plus `output_config.effort` (`minimal`
+    rounds to `low`). Off writes nothing on every model, always-on ones
+    included. `reasoning.exclude` stays untranslated and is refused.
+  - New `Provider::openai_reasoning_value` hook for OpenAI-wire providers
+    with their own dialect.
+
+
 
 ### Fixed
 

@@ -65,6 +65,30 @@ pub(crate) fn openai_auth_headers(auth: &Auth) -> Result<Vec<(String, String)>> 
 /// already set. The provider's `openai_*` hooks supply the dialect points that
 /// vary across OpenAI-compatible wires (token-limit key, usage opt-in, tool
 /// shapes).
+/// OpenAI's own reasoning dialect, the default for every OpenAI-wire provider
+/// (see [`Provider::openai_reasoning_value`]): `reasoning_effort: <effort>`,
+/// nothing at all for `none` (off is the model's own state, and a plain model
+/// refuses the key in any value), a loud error for a budget with no effort.
+pub(crate) fn openai_reasoning_effort(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    reasoning: &crate::generator::ReasoningConfig,
+) -> Result<()> {
+    match reasoning.effort.as_deref() {
+        Some("none") | None if reasoning.max_tokens.is_some() && reasoning.effort.is_none() => {
+            Err(MiniLLMError::InvalidParameter(
+                "this wire steers reasoning by effort (`reasoning.effort`), not by a token \
+                 budget; set an effort or use OpenRouter, which takes a budget"
+                    .into(),
+            ))
+        }
+        Some("none") | None => Ok(()),
+        Some(effort) => {
+            obj.insert("reasoning_effort".into(), serde_json::json!(effort));
+            Ok(())
+        }
+    }
+}
+
 pub(crate) fn openai_build_request<P: Provider + ?Sized>(
     model: &str,
     messages: &[Message],
@@ -124,7 +148,7 @@ pub(crate) fn openai_build_request<P: Provider + ?Sized>(
         obj.insert("parallel_tool_calls".into(), serde_json::json!(v));
     }
     if let Some(v) = &params.reasoning {
-        obj.insert("reasoning".into(), serde_json::to_value(v)?);
+        provider.openai_reasoning_value(obj, v)?;
     }
 
     if include_usage {

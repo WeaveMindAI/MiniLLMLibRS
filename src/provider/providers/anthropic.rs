@@ -148,6 +148,135 @@ impl AnthropicProvider {
     }
 }
 
+/// How a Claude model takes its thinking configuration. Claude 4.5 and every
+/// earlier generation speak extended thinking only (`thinking: {type:
+/// "enabled", budget_tokens}`); the 4.6 generation takes both, and 4.7 onward
+/// (Opus 4.7, 4.8, 5, Sonnet 5, Fable, Mythos) reject `enabled` and steer
+/// depth with `output_config.effort` under `thinking: {type: "adaptive"}`.
+/// Read off the model id; anything not recognisably 4.5-or-earlier is taken
+/// as adaptive, the direction every newer model goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingMode {
+    /// `thinking: {type: "enabled", budget_tokens: N}`.
+    Extended,
+    /// `thinking: {type: "adaptive"}` plus `output_config.effort`.
+    Adaptive,
+}
+
+fn thinking_mode(model: &str) -> ThinkingMode {
+    let m = model.to_ascii_lowercase();
+    let extended_only = ["-4-5", "-4-1", "-3-7", "-3-5", "-3-", "-4-20", "-4@"];
+    if extended_only.iter().any(|tag| m.contains(tag)) || m.ends_with("-4") {
+        ThinkingMode::Extended
+    } else {
+        ThinkingMode::Adaptive
+    }
+}
+
+/// The share of `max_tokens` an effort level hands to thinking on a model
+/// that takes a budget rather than an effort: OpenRouter's convention, so a
+/// config reads the same through both wires.
+fn budget_share(effort: &str) -> Result<f64> {
+    Ok(match effort {
+        "minimal" => 0.10,
+        "low" => 0.20,
+        "medium" => 0.50,
+        "high" => 0.80,
+        "xhigh" | "max" => 0.95,
+        other => {
+            return Err(MiniLLMError::InvalidParameter(format!(
+                "unknown reasoning effort `{other}`; one of none, minimal, low, medium, high, xhigh, max"
+            )))
+        }
+    })
+}
+
+/// Anthropic's `output_config.effort` vocabulary: `low`, `medium`, `high`,
+/// `xhigh`, `max`. `minimal` has no Anthropic spelling and rounds to `low`.
+fn adaptive_effort(effort: &str) -> Result<&'static str> {
+    Ok(match effort {
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        other => {
+            return Err(MiniLLMError::InvalidParameter(format!(
+                "unknown reasoning effort `{other}`; one of none, minimal, low, medium, high, xhigh, max"
+            )))
+        }
+    })
+}
+
+/// Anthropic's smallest legal thinking budget.
+const MIN_BUDGET_TOKENS: u32 = 1024;
+
+/// The request keys a [`ReasoningConfig`] becomes on the `/v1/messages` wire.
+///
+/// Off (`effort: "none"`, or nothing set) writes nothing: a Claude model that
+/// can be off is off unless asked, and the models that always think (Fable,
+/// Mythos) reject every spelling of "disabled", so silence is the one answer
+/// that never fails. On, the model's mode decides: an extended-thinking model
+/// gets `thinking: {type: "enabled", budget_tokens}` (an explicit budget, or
+/// the effort's share of `max_tokens`, never under Anthropic's 1024 floor and
+/// always under `max_tokens`, which thinking counts against); an adaptive
+/// model gets `thinking: {type: "adaptive"}` and `output_config.effort`, and
+/// has no budget knob, so a budget with no effort is refused rather than
+/// dropped. `exclude` has no translation here (the response's `display`
+/// setting is a different thing) and is refused too.
+fn thinking_request(
+    model: &str,
+    reasoning: &crate::generator::ReasoningConfig,
+    max_tokens: u32,
+) -> Result<Vec<(&'static str, serde_json::Value)>> {
+    if reasoning.exclude == Some(true) {
+        return Err(MiniLLMError::InvalidParameter(
+            "the Anthropic provider does not translate `reasoning.exclude`; omit it".into(),
+        ));
+    }
+    let effort = reasoning.effort.as_deref();
+    let off =
+        matches!(effort, Some("none")) || (effort.is_none() && reasoning.max_tokens.is_none());
+    if off {
+        return Ok(Vec::new());
+    }
+    match thinking_mode(model) {
+        ThinkingMode::Extended => {
+            let budget = match (reasoning.max_tokens, effort) {
+                (Some(budget), _) => budget,
+                (None, Some(effort)) => (max_tokens as f64 * budget_share(effort)?) as u32,
+                (None, None) => unreachable!("off was handled above"),
+            };
+            let budget = budget.max(MIN_BUDGET_TOKENS);
+            if budget >= max_tokens {
+                return Err(MiniLLMError::InvalidParameter(format!(
+                    "a thinking budget of {budget} tokens needs `max_tokens` above it (thinking \
+                     counts against max_tokens, which is {max_tokens}); raise max_tokens"
+                )));
+            }
+            Ok(vec![(
+                "thinking",
+                serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
+            )])
+        }
+        ThinkingMode::Adaptive => {
+            let Some(effort) = effort else {
+                return Err(MiniLLMError::InvalidParameter(format!(
+                    "`{model}` steers thinking by effort, not by a token budget; set \
+                     `reasoning.effort` (low, medium, high, xhigh, max)"
+                )));
+            };
+            Ok(vec![
+                ("thinking", serde_json::json!({ "type": "adaptive" })),
+                (
+                    "output_config",
+                    serde_json::json!({ "effort": adaptive_effort(effort)? }),
+                ),
+            ])
+        }
+    }
+}
+
 impl Provider for AnthropicProvider {
     fn openrouter_slug(&self) -> Option<&'static str> {
         Some("anthropic")
@@ -209,10 +338,7 @@ impl Provider for AnthropicProvider {
         // Fail loudly on normalized fields with no Anthropic mapping wired yet,
         // rather than silently dropping them. Each is a clean future translation,
         // not a silent "for now" omission.
-        for (present, field) in [
-            (params.response_format.is_some(), "response_format"),
-            (params.reasoning.is_some(), "reasoning"),
-        ] {
+        for (present, field) in [(params.response_format.is_some(), "response_format")] {
             if present {
                 return Err(MiniLLMError::InvalidParameter(format!(
                     "the Anthropic provider does not yet translate `{field}`; omit it or use an OpenAI-wire provider"
@@ -328,6 +454,14 @@ impl Provider for AnthropicProvider {
                 value["disable_parallel_tool_use"] = serde_json::json!(true);
             }
             body["tool_choice"] = value;
+        }
+
+        // Thinking, in the dialect the model speaks (see `thinking_request`).
+        if let Some(reasoning) = &params.reasoning {
+            let max_tokens = body["max_tokens"].as_u64().unwrap_or(4096) as u32;
+            for (key, value) in thinking_request(model, reasoning, max_tokens)? {
+                body[key] = value;
+            }
         }
 
         // Merge `extra`, rejecting collisions with a reserved key loudly.
@@ -771,11 +905,11 @@ mod tests {
                 CompletionParameters::new().with_json_response(),
             ),
             (
-                "reasoning",
+                "reasoning.exclude",
                 CompletionParameters::new().with_reasoning(ReasoningConfig {
                     effort: Some("high".into()),
                     max_tokens: None,
-                    exclude: None,
+                    exclude: Some(true),
                 }),
             ),
         ];
@@ -785,6 +919,170 @@ mod tests {
                     .is_err(),
                 "{field} must fail loudly, not vanish"
             );
+        }
+    }
+
+    fn reasoning(effort: Option<&str>, budget: Option<u32>) -> CompletionParameters {
+        CompletionParameters::new().with_reasoning(crate::generator::ReasoningConfig {
+            effort: effort.map(str::to_string),
+            max_tokens: budget,
+            exclude: None,
+        })
+    }
+
+    /// Off never fails and never writes: a model that can be off is off
+    /// unless asked, and the always-on models reject every "disabled".
+    #[test]
+    fn anthropic_reasoning_off_writes_nothing_on_every_model() {
+        let p = AnthropicProvider;
+        let messages = vec![Message::user("Hi")];
+        for model in [
+            "claude-sonnet-4-5",
+            "claude-opus-4-6",
+            "claude-opus-5",
+            "claude-fable-5-1",
+        ] {
+            let body = p
+                .build_request(
+                    model,
+                    &messages,
+                    &reasoning(Some("none"), None),
+                    false,
+                    true,
+                )
+                .unwrap();
+            assert!(body.get("thinking").is_none(), "{model}: {body}");
+            assert!(body.get("output_config").is_none(), "{model}: {body}");
+        }
+    }
+
+    /// An extended-thinking model takes a budget: the effort's share of
+    /// max_tokens, floored at 1024, or the explicit budget verbatim.
+    #[test]
+    fn anthropic_extended_models_take_a_budget_from_the_effort() {
+        let p = AnthropicProvider;
+        let messages = vec![Message::user("Hi")];
+        // 20% of the 4096 default is 819, under the floor: 1024.
+        let body = p
+            .build_request(
+                "claude-sonnet-4-5",
+                &messages,
+                &reasoning(Some("low"), None),
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            body["thinking"],
+            serde_json::json!({ "type": "enabled", "budget_tokens": 1024 })
+        );
+        assert!(body.get("output_config").is_none());
+        // 50% of 16000.
+        let params = reasoning(Some("medium"), None).with_max_tokens(16000);
+        let body = p
+            .build_request("claude-haiku-4-5", &messages, &params, false, true)
+            .unwrap();
+        assert_eq!(body["thinking"]["budget_tokens"], 8000);
+        // An explicit budget wins.
+        let body = p
+            .build_request(
+                "claude-opus-4-1",
+                &messages,
+                &reasoning(Some("high"), Some(2000)),
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(body["thinking"]["budget_tokens"], 2000);
+        // A budget with no room under max_tokens is refused, not sent to fail.
+        let err = p
+            .build_request(
+                "claude-sonnet-4-5",
+                &messages,
+                &reasoning(None, Some(5000)),
+                false,
+                true,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("raise max_tokens"), "{err}");
+    }
+
+    /// An adaptive model takes an effort, `minimal` rounded to `low`, and
+    /// refuses a bare budget rather than dropping it.
+    #[test]
+    fn anthropic_adaptive_models_take_an_effort() {
+        let p = AnthropicProvider;
+        let messages = vec![Message::user("Hi")];
+        for (model, effort, wire) in [
+            ("claude-opus-4-6", "low", "low"),
+            ("claude-opus-4-7", "minimal", "low"),
+            ("claude-sonnet-5", "high", "high"),
+            ("claude-fable-5-1", "max", "max"),
+        ] {
+            let body = p
+                .build_request(
+                    model,
+                    &messages,
+                    &reasoning(Some(effort), None),
+                    false,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(
+                body["thinking"],
+                serde_json::json!({ "type": "adaptive" }),
+                "{model}"
+            );
+            assert_eq!(body["output_config"]["effort"], wire, "{model}");
+        }
+        let err = p
+            .build_request(
+                "claude-opus-5",
+                &messages,
+                &reasoning(None, Some(2000)),
+                false,
+                true,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("by effort"), "{err}");
+        let err = p
+            .build_request(
+                "claude-opus-5",
+                &messages,
+                &reasoning(Some("loud"), None),
+                false,
+                true,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown reasoning effort"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn anthropic_thinking_mode_follows_the_generation() {
+        for m in [
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5-20251001",
+            "claude-opus-4-1",
+            "claude-3-7-sonnet",
+            "claude-sonnet-4-20250514",
+            "claude-opus-4",
+        ] {
+            assert_eq!(thinking_mode(m), ThinkingMode::Extended, "{m}");
+        }
+        for m in [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-fable-5-1",
+            "claude-mythos-5",
+        ] {
+            assert_eq!(thinking_mode(m), ThinkingMode::Adaptive, "{m}");
         }
     }
 

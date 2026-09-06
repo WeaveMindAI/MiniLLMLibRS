@@ -51,6 +51,43 @@ mod tests {
         }
     }
 
+    /// OpenAI's own dialect: `reasoning_effort: <effort>`; off writes
+    /// nothing (a plain model refuses the key in any value, and off is what
+    /// it does anyway); a budget has no key here and is refused.
+    #[test]
+    fn openai_reasoning_is_an_effort_string_and_off_is_silence() {
+        use crate::generator::{CompletionParameters, ReasoningConfig};
+        use crate::message::Message;
+        let p = OpenAiProvider;
+        let messages = vec![Message::user("Hi")];
+        let with = |effort: Option<&str>, budget: Option<u32>| {
+            CompletionParameters::new().with_reasoning(ReasoningConfig {
+                effort: effort.map(str::to_string),
+                max_tokens: budget,
+                exclude: None,
+            })
+        };
+        let body = p
+            .build_request("gpt-5", &messages, &with(Some("low"), None), false, true)
+            .unwrap();
+        assert_eq!(body["reasoning_effort"], "low");
+        assert!(
+            body.get("reasoning").is_none(),
+            "no OpenRouter object on OpenAI's wire: {body}"
+        );
+        let body = p
+            .build_request("gpt-4o", &messages, &with(Some("none"), None), false, true)
+            .unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none() && body.get("reasoning").is_none(),
+            "{body}"
+        );
+        let err = p
+            .build_request("gpt-5", &messages, &with(None, Some(2000)), false, true)
+            .unwrap_err();
+        assert!(err.to_string().contains("by effort"), "{err}");
+    }
+
     #[test]
     fn openai_is_unpriced_without_a_price_and_resolved_with_one() {
         let acct = OpenAiProvider;

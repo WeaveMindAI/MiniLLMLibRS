@@ -39,6 +39,19 @@ impl Provider for OpenRouterProvider {
         body["usage"] = serde_json::json!({ "include": true });
     }
 
+    /// OpenRouter's `reasoning` object IS the normalized config (effort,
+    /// budget, exclude), and it translates it per upstream model itself;
+    /// `effort: "none"` is its spelling of off, which the models that cannot
+    /// switch reasoning off refuse loudly. The object goes through verbatim.
+    fn openai_reasoning_value(
+        &self,
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        reasoning: &crate::generator::ReasoningConfig,
+    ) -> crate::error::Result<()> {
+        obj.insert("reasoning".into(), serde_json::to_value(reasoning)?);
+        Ok(())
+    }
+
     /// OpenRouter normalizes requests before forwarding, so unknown keys in
     /// message parts never reach a strict upstream (verified empirically:
     /// extra keys inside text/image parts, inside `image_url`, and at the
@@ -224,6 +237,35 @@ mod tests {
     use crate::provider::CostResolution;
 
     use crate::generator::CompletionParameters;
+
+    /// OpenRouter takes the normalized object as it is, `none` included: it
+    /// is the wire that translates per model, and the wire whose models say
+    /// loudly when off is not on offer.
+    #[test]
+    fn openrouter_sends_the_reasoning_object_verbatim() {
+        use crate::generator::ReasoningConfig;
+        let p = OpenRouterProvider;
+        let messages = vec![Message::user("Hi")];
+        for (effort, budget) in [
+            (Some("none"), None),
+            (Some("low"), None),
+            (None, Some(2000)),
+        ] {
+            let params = CompletionParameters::new().with_reasoning(ReasoningConfig {
+                effort: effort.map(str::to_string),
+                max_tokens: budget,
+                exclude: None,
+            });
+            let body = p
+                .build_request("z-ai/glm-5.3-flash", &messages, &params, false, true)
+                .unwrap();
+            assert_eq!(
+                body["reasoning"],
+                serde_json::to_value(params.reasoning.as_ref().unwrap()).unwrap()
+            );
+            assert!(body.get("reasoning_effort").is_none());
+        }
+    }
 
     /// A message with its cache breakpoint set (the builder input the
     /// marker tests exercise).
