@@ -57,6 +57,21 @@ pub(crate) fn openai_auth_headers(auth: &Auth) -> Result<Vec<(String, String)>> 
     }
 }
 
+/// OpenAI's own reasoning dialect, the default for every OpenAI-wire provider
+/// (see [`Provider::openai_reasoning_field`]). Nothing is checked: a model that
+/// does not take the value refuses it at the API.
+pub fn openai_reasoning_field(
+    reasoning: &crate::generator::Reasoning,
+) -> (&'static str, serde_json::Value) {
+    use crate::generator::Reasoning;
+    let effort = match reasoning {
+        Reasoning::Off => "none",
+        Reasoning::On(None) => "low",
+        Reasoning::On(Some(effort)) => effort,
+    };
+    ("reasoning_effort", serde_json::json!(effort))
+}
+
 /// Build the OpenAI `/chat/completions` request body by EXPLICITLY mapping each
 /// normalized [`CompletionParameters`] field to its OpenAI wire key (the params
 /// struct is normalized intent, not a wire shape). The request-owned keys
@@ -65,31 +80,7 @@ pub(crate) fn openai_auth_headers(auth: &Auth) -> Result<Vec<(String, String)>> 
 /// already set. The provider's `openai_*` hooks supply the dialect points that
 /// vary across OpenAI-compatible wires (token-limit key, usage opt-in, tool
 /// shapes).
-/// OpenAI's own reasoning dialect, the default for every OpenAI-wire provider
-/// (see [`Provider::openai_reasoning_value`]): `reasoning_effort: <effort>`,
-/// nothing at all for `none` (off is the model's own state, and a plain model
-/// refuses the key in any value), a loud error for a budget with no effort.
-pub(crate) fn openai_reasoning_effort(
-    obj: &mut serde_json::Map<String, serde_json::Value>,
-    reasoning: &crate::generator::ReasoningConfig,
-) -> Result<()> {
-    match reasoning.effort.as_deref() {
-        Some("none") | None if reasoning.max_tokens.is_some() && reasoning.effort.is_none() => {
-            Err(MiniLLMError::InvalidParameter(
-                "this wire steers reasoning by effort (`reasoning.effort`), not by a token \
-                 budget; set an effort or use OpenRouter, which takes a budget"
-                    .into(),
-            ))
-        }
-        Some("none") | None => Ok(()),
-        Some(effort) => {
-            obj.insert("reasoning_effort".into(), serde_json::json!(effort));
-            Ok(())
-        }
-    }
-}
-
-pub(crate) fn openai_build_request<P: Provider + ?Sized>(
+pub fn openai_build_request<P: Provider + ?Sized>(
     model: &str,
     messages: &[Message],
     params: &CompletionParameters,
@@ -147,8 +138,9 @@ pub(crate) fn openai_build_request<P: Provider + ?Sized>(
     if let Some(v) = params.parallel_tool_calls {
         obj.insert("parallel_tool_calls".into(), serde_json::json!(v));
     }
-    if let Some(v) = &params.reasoning {
-        provider.openai_reasoning_value(obj, v)?;
+    if let Some(reasoning) = &params.reasoning {
+        let (key, value) = provider.openai_reasoning_field(reasoning);
+        obj.insert(key.into(), value);
     }
 
     if include_usage {
@@ -187,7 +179,7 @@ pub(crate) fn openai_build_request<P: Provider + ?Sized>(
 ///
 /// Shared by every OpenAI-wire provider; cost fields are read separately by the
 /// providers that report them.
-pub(crate) fn parse_openai_usage(u: &serde_json::Value) -> Option<Usage> {
+pub fn parse_openai_usage(u: &serde_json::Value) -> Option<Usage> {
     if u.is_null() {
         return None;
     }
@@ -229,13 +221,13 @@ pub(crate) fn parse_openai_usage(u: &serde_json::Value) -> Option<Usage> {
 
 /// Locate the `usage` object on a non-streaming response or a streaming chunk
 /// (both OpenAI-wire put it under a top-level `usage` key).
-pub(crate) fn usage_field(value: &serde_json::Value) -> Option<&serde_json::Value> {
+pub fn usage_field(value: &serde_json::Value) -> Option<&serde_json::Value> {
     value.get("usage").filter(|u| !u.is_null())
 }
 
 /// Parse the OpenAI-wire usage out of a raw response/chunk (finds the `usage`
 /// field, then parses it). Backs the default `Provider::parse_usage`.
-pub(crate) fn parse_openai_usage_field(raw: &serde_json::Value) -> Option<Usage> {
+pub fn parse_openai_usage_field(raw: &serde_json::Value) -> Option<Usage> {
     parse_openai_usage(usage_field(raw)?)
 }
 

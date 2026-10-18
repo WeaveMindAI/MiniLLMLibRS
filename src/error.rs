@@ -63,6 +63,16 @@ pub enum MiniLLMError {
     /// A thread had no messages to load.
     #[error("Thread has no messages")]
     EmptyThread,
+
+    /// A side request ended without an answer: it panicked (a bug in the
+    /// library or a provider it runs), or its runtime shut down under it.
+    #[error("internal error: {0}")]
+    Internal(String),
+
+    /// A side request (a model lookup, a price read) failed. Every caller that
+    /// asked for the same thing at the same time gets this same error.
+    #[error("side request failed: {0}")]
+    SideRequest(std::sync::Arc<MiniLLMError>),
 }
 
 /// Result type alias for MiniLLMLib operations

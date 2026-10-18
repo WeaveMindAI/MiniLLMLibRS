@@ -21,82 +21,18 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Resolved per-request completion settings, extracted from
-/// [`NodeCompletionParameters`] once so the completion pipeline reads typed
-/// fields instead of repeatedly unwrapping `Option<&params>` at every step.
-struct CompletionSettings {
-    params: Option<crate::generator::CompletionParameters>,
-    system_prompt: Option<String>,
-    force_prepend: Option<String>,
-    format_kwargs: std::collections::HashMap<String, String>,
-    add_child: bool,
-    parse_json: bool,
-    use_cache: bool,
-    crash_on_refusal: bool,
-    crash_on_empty: bool,
-    retry: u32,
-    exp_back_off: bool,
-    back_off_time: f64,
-    max_back_off: f64,
-    timeout: Option<Duration>,
-    track_cost: bool,
-    token_price: Option<crate::provider::TokenPrice>,
-    cost_callback: Option<crate::provider::CostCallback>,
+/// The per-request parameters a completion runs with: the caller's, or the
+/// defaults.
+fn params_or_default(params: Option<&NodeCompletionParameters>) -> NodeCompletionParameters {
+    params.cloned().unwrap_or_default()
 }
 
-impl CompletionSettings {
-    fn from_params(params: Option<&NodeCompletionParameters>) -> Self {
-        let defaults = NodeCompletionParameters::default();
-        let p = params.unwrap_or(&defaults);
-        Self {
-            params: p.params.clone(),
-            system_prompt: p.system_prompt.clone(),
-            force_prepend: p.force_prepend.clone(),
-            format_kwargs: p.format_kwargs.clone(),
-            add_child: p.add_child,
-            parse_json: p.parse_json,
-            use_cache: p.use_cache,
-            crash_on_refusal: p.crash_on_refusal,
-            crash_on_empty: p.crash_on_empty_response,
-            retry: p.retry,
-            exp_back_off: p.exp_back_off,
-            back_off_time: p.back_off_time,
-            max_back_off: p.max_back_off,
-            // 0 means "no timeout", not an instantly-firing 0s deadline.
-            timeout: p.timeout_secs.filter(|&s| s > 0).map(Duration::from_secs),
-            track_cost: p.track_cost,
-            token_price: p.token_price.clone(),
-            cost_callback: p.cost_callback.clone(),
-        }
-    }
-
-    /// Merge per-request params over the generator's defaults.
-    fn merged_params(&self, generator: &GeneratorInfo) -> crate::generator::CompletionParameters {
-        match &self.params {
-            Some(p) => generator.default_params.merge(p),
-            None => generator.default_params.clone(),
-        }
-    }
-
-    /// Effective per-token price: per-request override wins over the generator's.
-    fn price<'a>(
-        &'a self,
-        generator: &'a GeneratorInfo,
-    ) -> Option<&'a crate::provider::TokenPrice> {
-        self.token_price.as_ref().or(generator.token_price.as_ref())
-    }
-
-    /// Fire the user-supplied (non-enforced) cost callback. Costs the usage via
-    /// the provider's accounting; best-effort, so it only fires when usage is
-    /// present (no out-of-band resolution on this path).
-    fn fire_cost_callback(&self, generator: &GeneratorInfo, response: &CompletionResponse) {
-        if let (Some(callback), Some(usage)) = (&self.cost_callback, &response.usage) {
-            let outcome = generator
-                .provider
-                .cost_of(usage.clone(), self.price(generator));
-            callback(outcome.into_cost_info(response.model.clone(), response.id.clone()));
-        }
-    }
+/// What one completion run produced: its outcome, and the responses it was
+/// billed for but rejected (`crash_on_empty_response` / `crash_on_refusal`),
+/// whose cost still has to be reported.
+struct Run {
+    outcome: Result<(ChatNode, CompletionResponse)>,
+    rejected: Vec<CompletionResponse>,
 }
 
 /// How a completion's raw response is obtained. The only axis on which the
@@ -152,13 +88,73 @@ fn json_value_is_empty(value: &JsonValue) -> bool {
     }
 }
 
-/// Force usage/cost tracking on and clear any user callback (the tracked path
-/// reports cost itself via the CompletionContext's enforced callback).
-fn tracked_params(params: Option<&NodeCompletionParameters>) -> NodeCompletionParameters {
-    let mut p = params.cloned().unwrap_or_default();
+impl Run {
+    /// What the run cost, one entry per billed response (the rejected ones,
+    /// then the accepted one), firing `params`' cost callback for each. Every
+    /// response is figured at once, after the run, through the one shared
+    /// decision ([`crate::tracking::cost_for_response`]).
+    async fn settle(
+        &self,
+        generator: &GeneratorInfo,
+        params: &NodeCompletionParameters,
+    ) -> Vec<crate::CostInfo> {
+        let accepted = self.outcome.as_ref().ok().map(|(_, response)| response);
+        let costs = futures::future::join_all(
+            self.rejected
+                .iter()
+                .chain(accepted)
+                .map(|response| crate::tracking::cost_for_response(generator, response)),
+        )
+        .await;
+        if let Some(callback) = &params.cost_callback {
+            for cost in &costs {
+                callback(cost.clone());
+            }
+        }
+        costs
+    }
+
+    /// The outcome after the run is settled, for a caller that only wants the
+    /// cost callback fired.
+    async fn settled(
+        self,
+        generator: &GeneratorInfo,
+        params: &NodeCompletionParameters,
+    ) -> Result<(ChatNode, CompletionResponse)> {
+        if params.cost_callback.is_some() {
+            self.settle(generator, params).await;
+        }
+        self.outcome
+    }
+}
+
+/// Report what a tracked run cost through the context's sink, one report per
+/// billed response, then hand back its outcome.
+async fn report_run(
+    ctx: &crate::tracking::CompletionContext,
+    params: &NodeCompletionParameters,
+    run: Run,
+) -> Result<ChatNode> {
+    for cost in run.settle(&ctx.generator, params).await {
+        ctx.report_cost(cost).await;
+    }
+    run.outcome.map(|(node, _)| node)
+}
+
+/// Force usage/cost tracking on. A tracked path reports every cost to its
+/// CompletionContext, so it refuses a callback of the caller's own, which it
+/// would otherwise never fire.
+fn tracked_params(params: Option<&NodeCompletionParameters>) -> Result<NodeCompletionParameters> {
+    let mut p = params_or_default(params);
+    if p.cost_callback.is_some() {
+        return Err(MiniLLMError::InvalidParameter(
+            "a tracked completion reports its cost to its CompletionContext, so it cannot \
+             also fire a cost callback; drop the callback, or use the untracked method"
+                .into(),
+        ));
+    }
     p.track_cost = true;
-    p.cost_callback = None;
-    p
+    Ok(p)
 }
 
 /// Default max silence between streamed chunks for a tracked stream. A live
@@ -173,13 +169,15 @@ fn tracked_params(params: Option<&NodeCompletionParameters>) -> NodeCompletionPa
 /// (the "no timeout" escape hatch) are overridden, because the tracked path's
 /// reason for being is the cost-settle backstop, which a dead connection with no
 /// idle bound would starve.
-fn tracked_streaming_params(params: Option<&NodeCompletionParameters>) -> NodeCompletionParameters {
+fn tracked_streaming_params(
+    params: Option<&NodeCompletionParameters>,
+) -> Result<NodeCompletionParameters> {
     const DEFAULT_TRACKED_IDLE_TIMEOUT_SECS: u64 = 120;
-    let mut p = tracked_params(params);
+    let mut p = tracked_params(params)?;
     if p.timeout_secs.is_none_or(|s| s == 0) {
         p.timeout_secs = Some(DEFAULT_TRACKED_IDLE_TIMEOUT_SECS);
     }
-    p
+    Ok(p)
 }
 
 /// Substitute every `{key}` placeholder in `template` with its kwarg value.
@@ -1116,8 +1114,10 @@ impl ChatNode {
         generator: &GeneratorInfo,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<(ChatNode, CompletionResponse)> {
-        let settings = CompletionSettings::from_params(params);
+        let settings = params_or_default(params);
         self.run_with_retry(generator, &settings, ResponseMode::NonStreaming)
+            .await
+            .settled(generator, &settings)
             .await
     }
 
@@ -1137,45 +1137,31 @@ impl ChatNode {
     /// never pay it twice.
     ///
     /// `params` is honored for cache-relevant settings (system prompt, format
-    /// kwargs, token price, cost tracking); `max_tokens`/`use_cache` are forced.
+    /// kwargs, cost callback); `max_tokens: 0`, `use_cache` and usage tracking
+    /// are forced. On Anthropic, a generator whose default parameters turn
+    /// reasoning on makes the warm request carry it too, and Anthropic decides
+    /// whether thinking fits a zero-token reply.
     pub async fn ensure_cached(
         &self,
         generator: &GeneratorInfo,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<crate::provider::CostInfo> {
-        // Force the cache mark on the prefix and a zero-output warm request.
-        let mut warm = params.cloned().unwrap_or_default();
+        // Force the cache mark on the prefix, a zero-output warm request, and
+        // usage tracking, so we get real cache_write/cache_read counts back.
+        let mut warm = params_or_default(params);
         warm.use_cache = true;
-        let mut completion_params = warm.params.unwrap_or_default();
-        completion_params.max_tokens = Some(0);
-        warm.params = Some(completion_params);
+        warm.track_cost = true;
+        warm.params.max_tokens = Some(0);
 
-        let settings = CompletionSettings::from_params(Some(&warm));
-        let messages = self.prepare_messages(&settings);
-        let completion_params = settings.merged_params(generator);
-
-        // Track usage so we get real cache_write/cache_read counts back.
-        let response = generator
-            .client()
-            .complete_with_usage_tracking(
-                generator,
-                &messages,
-                &completion_params,
-                true,
-                settings.timeout,
-            )
+        let response = self
+            .fetch_response(generator, &warm, ResponseMode::NonStreaming)
             .await?;
 
         // Price the warm request through the shared cost decision, and fire the
         // user callback if one was set (so warming cost is accounted like any other).
-        let price = settings.price(generator);
-        let outcome = match &response.usage {
-            Some(usage) => generator.provider.cost_of(usage.clone(), price),
-            None => crate::provider::CostOutcome::unknown(),
-        };
-        let info = outcome.into_cost_info(response.model.clone(), response.id.clone());
-        if let Some(cb) = &settings.cost_callback {
-            cb(info.clone());
+        let info = crate::tracking::cost_for_response(generator, &response).await;
+        if let Some(callback) = &warm.cost_callback {
+            callback(info.clone());
         }
         Ok(info)
     }
@@ -1186,21 +1172,20 @@ impl ChatNode {
     async fn fetch_response(
         &self,
         generator: &GeneratorInfo,
-        settings: &CompletionSettings,
+        settings: &NodeCompletionParameters,
         mode: ResponseMode,
     ) -> Result<CompletionResponse> {
         match mode {
             ResponseMode::NonStreaming => {
                 let messages = self.prepare_messages(settings);
-                let completion_params = settings.merged_params(generator);
                 generator
                     .client()
                     .complete_with_usage_tracking(
                         generator,
                         &messages,
-                        &completion_params,
-                        settings.track_cost,
-                        settings.timeout,
+                        &settings.params,
+                        settings.tracks_usage(),
+                        settings.timeout(),
                     )
                     .await
             }
@@ -1215,69 +1200,106 @@ impl ChatNode {
 
     /// The single completion retry loop, shared by streaming and non-streaming.
     ///
-    /// Applies backoff between attempts and retries on transient transport errors
-    /// (per [`is_retryable`]) and on content rejection (`crash_on_empty` /
-    /// `crash_on_refusal`, the user-opted-in "retry until the model complies"
-    /// behavior). Non-retryable provider errors (4xx auth/validation) fail
-    /// immediately so paid calls are never re-issued pointlessly.
+    /// Retries only when `retry > 0`: on transient transport errors (per
+    /// [`is_retryable`]) and on content rejection (`crash_on_empty_response` /
+    /// `crash_on_refusal`), with backoff between attempts. Non-retryable
+    /// provider errors (4xx auth/validation) fail at once, so a paid call is
+    /// never re-issued pointlessly. With no retries the attempt's own error is
+    /// returned; after retries, [`MiniLLMError::MaxRetriesExceeded`] wraps the
+    /// last one.
+    ///
+    /// Every response received was billed, so the rejected ones come back
+    /// beside the outcome, for [`Run::settle`] to cost with the accepted one.
     async fn run_with_retry(
         &self,
         generator: &GeneratorInfo,
-        settings: &CompletionSettings,
+        settings: &NodeCompletionParameters,
         mode: ResponseMode,
-    ) -> Result<(ChatNode, CompletionResponse)> {
-        let mut last_error: Option<MiniLLMError> = None;
-        let mut current_back_off = settings.back_off_time;
-
-        for attempt in 0..=settings.retry {
+    ) -> Run {
+        let mut rejected = Vec::new();
+        let wait = |name: &str, secs: f64| {
+            Duration::try_from_secs_f64(secs).map_err(|_| {
+                MiniLLMError::InvalidParameter(format!(
+                    "`{name}` is {secs}; a wait between retries is a number of seconds, 0 or \
+                     more, that fits a duration"
+                ))
+            })
+        };
+        let (back_off, max_back_off) = if settings.retry > 0 {
+            match (
+                wait("back_off_time", settings.back_off_time),
+                wait("max_back_off", settings.max_back_off),
+            ) {
+                (Ok(back_off), Ok(max_back_off)) => (back_off, max_back_off),
+                (Err(e), _) | (_, Err(e)) => {
+                    return Run {
+                        outcome: Err(e),
+                        rejected,
+                    }
+                }
+            }
+        } else {
+            (Duration::ZERO, Duration::ZERO)
+        };
+        let mut current_back_off = back_off;
+        let mut attempt = 0;
+        loop {
             if attempt > 0 {
                 let sleep_time = if settings.exp_back_off {
-                    current_back_off.min(settings.max_back_off)
+                    current_back_off.min(max_back_off)
                 } else {
-                    settings.back_off_time
+                    back_off
                 };
-                tokio::time::sleep(Duration::from_secs_f64(sleep_time)).await;
+                tokio::time::sleep(sleep_time).await;
                 if settings.exp_back_off {
-                    current_back_off *= 2.0;
+                    current_back_off = current_back_off.saturating_mul(2);
                 }
                 tracing::debug!(attempt = attempt, "Retrying completion request");
             }
 
-            let response = match self.fetch_response(generator, settings, mode).await {
-                Ok(r) => r,
-                Err(e) => {
-                    // Non-retryable provider errors (4xx auth/validation) will never
-                    // succeed on retry, so fail immediately rather than burn paid calls.
-                    if !is_retryable(&e) {
-                        return Err(e);
+            let error = match self.fetch_response(generator, settings, mode).await {
+                Err(e) if !is_retryable(&e) => {
+                    return Run {
+                        outcome: Err(e),
+                        rejected,
                     }
-                    last_error = Some(e);
-                    continue;
                 }
+                Err(e) => e,
+                Ok(response) => match self.postprocess_content(&response.content, settings) {
+                    Ok(content) => {
+                        let node =
+                            self.build_assistant_node(content, &response, settings.add_child);
+                        return Run {
+                            outcome: Ok((node, response)),
+                            rejected,
+                        };
+                    }
+                    Err(e) => {
+                        rejected.push(response);
+                        e
+                    }
+                },
             };
 
-            let content = match self.postprocess_content(&response.content, settings) {
-                Ok(c) => c,
-                Err(e) => {
-                    last_error = Some(e);
-                    continue;
-                }
-            };
-
-            let node = self.build_assistant_node(content, &response, settings.add_child);
-            settings.fire_cost_callback(generator, &response);
-            return Ok((node, response));
+            if attempt == settings.retry {
+                let error = if settings.retry == 0 {
+                    error
+                } else {
+                    MiniLLMError::MaxRetriesExceeded(Box::new(error))
+                };
+                return Run {
+                    outcome: Err(error),
+                    rejected,
+                };
+            }
+            attempt += 1;
         }
-
-        Err(MiniLLMError::MaxRetriesExceeded(Box::new(
-            last_error.unwrap_or(MiniLLMError::EmptyResponse),
-        )))
     }
 
     /// Build the outgoing message list: formatted thread, contiguous merge,
     /// optional system-prompt prepend, optional force_prepend continuation.
     /// Shared by every completion path so message construction lives in one place.
-    fn prepare_messages(&self, settings: &CompletionSettings) -> Vec<Message> {
+    fn prepare_messages(&self, settings: &NodeCompletionParameters) -> Vec<Message> {
         let mut messages =
             merge_contiguous_messages(self.formatted_thread_with_base(&settings.format_kwargs));
 
@@ -1307,7 +1329,11 @@ impl ChatNode {
     /// Post-process raw response content: re-attach force_prepend, enforce
     /// crash_on_empty, and repair/validate JSON. The single place these rules
     /// live, so streaming and non-streaming behave identically.
-    fn postprocess_content(&self, raw: &str, settings: &CompletionSettings) -> Result<String> {
+    fn postprocess_content(
+        &self,
+        raw: &str,
+        settings: &NodeCompletionParameters,
+    ) -> Result<String> {
         let mut content = raw.to_string();
 
         // OpenAI-wire providers return only the continuation, not the prefill we
@@ -1319,7 +1345,7 @@ impl ChatNode {
             }
         }
 
-        if settings.crash_on_empty && content.trim().is_empty() {
+        if settings.crash_on_empty_response && content.trim().is_empty() {
             return Err(MiniLLMError::EmptyResponse);
         }
 
@@ -1396,34 +1422,43 @@ impl ChatNode {
     /// post-processing params (force_prepend, parse_json, crash_on_*); those
     /// require the full response and are applied by [`Self::complete_streaming_collect`].
     /// Use this only when consuming chunks directly.
+    ///
+    /// The raw stream reports no cost, so a cost callback is refused here: use
+    /// [`complete_streaming_tracked`](Self::complete_streaming_tracked) or
+    /// [`complete_streaming_collect`](Self::complete_streaming_collect).
     pub async fn complete_streaming(
         &self,
         generator: &GeneratorInfo,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<StreamingCompletion> {
-        let settings = CompletionSettings::from_params(params);
+        let settings = params_or_default(params);
+        if settings.cost_callback.is_some() {
+            return Err(MiniLLMError::InvalidParameter(
+                "a raw stream reports no cost, so it cannot fire a cost callback; use \
+                 complete_streaming_collect, or drop the callback and use \
+                 complete_streaming_tracked"
+                    .into(),
+            ));
+        }
         self.start_streaming(generator, &settings).await
     }
 
-    /// Start a stream from already-derived settings. Lets the collect wrappers
-    /// build `CompletionSettings` once and reuse it for both the request and the
-    /// post-processing, instead of re-deriving (and re-cloning) it per hop.
+    /// Start a stream from already-resolved parameters, so the collect wrappers
+    /// resolve them once for both the request and the post-processing.
     async fn start_streaming(
         &self,
         generator: &GeneratorInfo,
-        settings: &CompletionSettings,
+        settings: &NodeCompletionParameters,
     ) -> Result<StreamingCompletion> {
         let messages = self.prepare_messages(settings);
-        let completion_params = settings.merged_params(generator);
-
         generator
             .client()
             .complete_streaming_with_usage(
                 generator,
                 &messages,
-                &completion_params,
-                settings.track_cost,
-                settings.timeout,
+                &settings.params,
+                settings.tracks_usage(),
+                settings.timeout(),
             )
             .await
     }
@@ -1441,15 +1476,18 @@ impl ChatNode {
     ///
     /// Shares the retry/post-processing/cost pipeline with the non-streaming
     /// path, so `crash_on_empty`/`crash_on_refusal` + `retry` behave identically
-    /// in both (a rejected streamed completion is retried the same way).
+    /// in both (a rejected streamed completion is retried the same way, when
+    /// `retry > 0`).
     pub async fn complete_streaming_collect(
         &self,
         generator: &GeneratorInfo,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<ChatNode> {
-        let settings = CompletionSettings::from_params(params);
+        let settings = params_or_default(params);
         let (node, _response) = self
             .run_with_retry(generator, &settings, ResponseMode::Streaming)
+            .await
+            .settled(generator, &settings)
             .await?;
         Ok(node)
     }
@@ -1477,18 +1515,11 @@ impl ChatNode {
         ctx: &crate::tracking::CompletionContext,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<ChatNode> {
-        let tracked_params = tracked_params(params);
-        let (node, response) = self
-            .complete_collect(&ctx.generator, Some(&tracked_params))
-            .await?;
-
-        // Cost flows from the typed response via the one shared decision: the
-        // provider's `cost_of` aggregates native cost (or prices tokens), and the
-        // backoff out-of-band query covers absent usage, reporting Unknown rather
-        // than a fake $0 if unresolvable.
-        ctx.report_cost(ctx.cost_for_response(&response).await)
+        let tracked_params = tracked_params(params)?;
+        let run = self
+            .run_with_retry(&ctx.generator, &tracked_params, ResponseMode::NonStreaming)
             .await;
-        Ok(node)
+        report_run(ctx, &tracked_params, run).await
     }
 
     /// Complete and hand back what it cost, no callback ceremony.
@@ -1500,24 +1531,26 @@ impl ChatNode {
     /// sites should feed one central sink instead, use
     /// [`complete_tracked`](Self::complete_tracked); streaming always goes
     /// through the tracked shape, since a stream's cost resolves only after it
-    /// ends. An errored completion carries no cost info: the request failed
-    /// before a billable response existed.
+    /// ends.
+    ///
+    /// The costs are one per billed request: a response rejected by
+    /// `crash_on_empty_response` / `crash_on_refusal` was billed too, so it is
+    /// listed even when the completion errors in the end. An error with nothing
+    /// listed failed before any response was billed.
     pub async fn complete_costed(
         &self,
         generator: &GeneratorInfo,
         params: Option<&NodeCompletionParameters>,
-    ) -> (Result<ChatNode>, Option<crate::CostInfo>) {
-        let tracked_params = tracked_params(params);
-        match self
-            .complete_collect(generator, Some(&tracked_params))
-            .await
-        {
-            Ok((node, response)) => {
-                let info = crate::tracking::cost_for_response(generator, &response).await;
-                (Ok(node), Some(info))
-            }
-            Err(e) => (Err(e), None),
-        }
+    ) -> (Result<ChatNode>, Vec<crate::CostInfo>) {
+        // Usage is asked for, so every cost can be figured; the caller's own
+        // callback, if any, still fires for each.
+        let mut costed = params_or_default(params);
+        costed.track_cost = true;
+        let run = self
+            .run_with_retry(generator, &costed, ResponseMode::NonStreaming)
+            .await;
+        let costs = run.settle(generator, &costed).await;
+        (run.outcome.map(|(node, _)| node), costs)
     }
 
     /// Complete streaming with enforced cost tracking.
@@ -1529,7 +1562,7 @@ impl ChatNode {
         ctx: &crate::tracking::CompletionContext,
         params: Option<&NodeCompletionParameters>,
     ) -> Result<crate::tracking::TrackedStream> {
-        let tracked_params = tracked_streaming_params(params);
+        let tracked_params = tracked_streaming_params(params)?;
         let stream = self
             .complete_streaming(&ctx.generator, Some(&tracked_params))
             .await?;
@@ -1544,19 +1577,12 @@ impl ChatNode {
         params: Option<&NodeCompletionParameters>,
     ) -> Result<ChatNode> {
         // Mirror complete_tracked exactly, only the transport differs: the shared
-        // retry loop drains the stream, post-processes, and builds the node;
-        // run_with_retry returns Ok only for an accepted completion, so cost is
-        // never booked for a rejected one. Then report cost from the typed
-        // response (same enforced path as the non-streaming tracked variant).
-        let tracked_params = tracked_streaming_params(params);
-        let settings = CompletionSettings::from_params(Some(&tracked_params));
-        let (node, response) = self
-            .run_with_retry(&ctx.generator, &settings, ResponseMode::Streaming)
-            .await?;
-
-        ctx.report_cost(ctx.cost_for_response(&response).await)
+        // retry loop drains the stream, post-processes, and builds the node.
+        let tracked_params = tracked_streaming_params(params)?;
+        let run = self
+            .run_with_retry(&ctx.generator, &tracked_params, ResponseMode::Streaming)
             .await;
-        Ok(node)
+        report_run(ctx, &tracked_params, run).await
     }
 
     // =========================================================================
@@ -1942,7 +1968,7 @@ mod completion_pipeline_tests {
     fn postprocess_reattaches_force_prepend_once() {
         let node = ChatNode::root("sys");
         let params = NodeCompletionParameters::new().with_force_prepend("Score: ");
-        let settings = CompletionSettings::from_params(Some(&params));
+        let settings = params_or_default(Some(&params));
         // Provider returned only the continuation.
         assert_eq!(
             node.postprocess_content("8/10", &settings).unwrap(),
@@ -1959,7 +1985,7 @@ mod completion_pipeline_tests {
     fn postprocess_crash_on_empty() {
         let node = ChatNode::root("sys");
         let params = NodeCompletionParameters::new().with_crash_on_empty(true);
-        let settings = CompletionSettings::from_params(Some(&params));
+        let settings = params_or_default(Some(&params));
         assert!(matches!(
             node.postprocess_content("   \n ", &settings).unwrap_err(),
             MiniLLMError::EmptyResponse
@@ -1972,7 +1998,7 @@ mod completion_pipeline_tests {
     fn postprocess_parse_json_repairs() {
         let node = ChatNode::root("sys");
         let params = NodeCompletionParameters::new().with_parse_json(true);
-        let settings = CompletionSettings::from_params(Some(&params));
+        let settings = params_or_default(Some(&params));
         assert_eq!(
             node.postprocess_content("{'a': 1,}", &settings).unwrap(),
             r#"{"a": 1}"#
@@ -1982,7 +2008,7 @@ mod completion_pipeline_tests {
     #[test]
     fn postprocess_default_is_passthrough() {
         let node = ChatNode::root("sys");
-        let settings = CompletionSettings::from_params(None);
+        let settings = params_or_default(None);
         assert_eq!(
             node.postprocess_content("plain text", &settings).unwrap(),
             "plain text"
@@ -2505,14 +2531,14 @@ mod completion_pipeline_tests {
         let user = root.add_user("hello");
         // No system prompt override: keep existing system message.
         let p1 = NodeCompletionParameters::new();
-        let s1 = CompletionSettings::from_params(Some(&p1));
+        let s1 = params_or_default(Some(&p1));
         let m1 = user.prepare_messages(&s1);
         assert_eq!(m1.first().unwrap().role, Role::System);
         assert_eq!(m1.first().unwrap().text(), Some("base sys"));
 
         // force_prepend pushes a trailing assistant primer.
         let p2 = NodeCompletionParameters::new().with_force_prepend("Answer: ");
-        let s2 = CompletionSettings::from_params(Some(&p2));
+        let s2 = params_or_default(Some(&p2));
         let m2 = user.prepare_messages(&s2);
         let last = m2.last().unwrap();
         assert_eq!(last.role, Role::Assistant);
@@ -2524,7 +2550,7 @@ mod completion_pipeline_tests {
         let root = ChatNode::root("I am {bot}");
         let user = root.add_user("hi");
         let params = NodeCompletionParameters::new().with_format_kwarg("bot", "Claude");
-        let settings = CompletionSettings::from_params(Some(&params));
+        let settings = params_or_default(Some(&params));
         let msgs = user.prepare_messages(&settings);
         assert_eq!(msgs.first().unwrap().text(), Some("I am Claude"));
     }
@@ -2539,7 +2565,7 @@ mod completion_pipeline_tests {
         root.cache_breakpoint();
         assert!(root.is_cache_breakpoint());
 
-        let settings = CompletionSettings::from_params(None);
+        let settings = params_or_default(None);
         let msgs = user.prepare_messages(&settings);
         // The system message carries the breakpoint; the user message does not.
         assert!(msgs[0].cache_breakpoint, "system marked");
@@ -2551,7 +2577,7 @@ mod completion_pipeline_tests {
         let root = ChatNode::root("sys");
         let user = root.add_user("hi");
         let params = NodeCompletionParameters::new().with_cache(true);
-        let settings = CompletionSettings::from_params(Some(&params));
+        let settings = params_or_default(Some(&params));
         let msgs = user.prepare_messages(&settings);
         // The last message of the prefix is auto-marked (caches everything before).
         assert!(msgs.last().unwrap().cache_breakpoint);
@@ -2590,7 +2616,7 @@ mod completion_pipeline_tests {
         assert!(cloned.get_root().is_cache_breakpoint());
 
         // The mark rides on the serialized message (so saved threads keep it).
-        let msgs = user.prepare_messages(&CompletionSettings::from_params(None));
+        let msgs = user.prepare_messages(&params_or_default(None));
         let json = serde_json::to_value(&msgs[0]).unwrap();
         assert_eq!(json["cache_breakpoint"], true);
     }

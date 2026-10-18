@@ -8,7 +8,7 @@ use crate::message::Message;
 use eventsource_stream::Eventsource;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest_middleware::ClientWithMiddleware;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Map a transport error from `send()` into a typed error, surfacing timeouts
 /// as the distinct `Timeout` variant (consumers and retry logic discriminate on
@@ -34,6 +34,58 @@ fn map_body_error(e: reqwest::Error) -> MiniLLMError {
     } else {
         MiniLLMError::Http(e)
     }
+}
+
+/// What is left of `timeout` since `started`: a request's one deadline covers
+/// both the lookup its body may wait on and the send.
+fn time_left(timeout: Option<Duration>, started: Instant) -> Option<Duration> {
+    timeout.map(|t| t.saturating_sub(started.elapsed()))
+}
+
+/// GET `url` with `headers`, within `timeout`: the status and the body text.
+/// Every side call the crate makes (model lookups, price reads, cost queries)
+/// goes through here, so its failures map the way a request's do.
+pub(crate) async fn get_text(
+    client: &ClientWithMiddleware,
+    url: &str,
+    headers: HeaderMap,
+    timeout: Duration,
+) -> Result<(reqwest::StatusCode, String)> {
+    let response = client
+        .get(url)
+        .headers(headers)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(map_send_error)?;
+    let status = response.status();
+    let body = response.text().await.map_err(map_body_error)?;
+    Ok((status, body))
+}
+
+/// The headers a request for `generator` carries, besides its content type:
+/// the provider's auth and attribution headers, then the generator's custom
+/// headers, which win on a key collision.
+pub(crate) fn generator_headers(generator: &GeneratorInfo) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    let auth = generator.provider.auth_headers(&generator.auth)?;
+    let attribution = generator
+        .provider
+        .attribution_headers(generator.app_attribution.as_ref());
+    for (name, value) in auth
+        .iter()
+        .chain(attribution.iter())
+        .chain(generator.custom_headers.iter())
+    {
+        let header_name = HeaderName::try_from(name.as_str()).map_err(|e| {
+            MiniLLMError::InvalidParameter(format!("Invalid header name '{}': {}", name, e))
+        })?;
+        let header_value = HeaderValue::from_str(value).map_err(|e| {
+            MiniLLMError::InvalidParameter(format!("Invalid header value for '{}': {}", name, e))
+        })?;
+        headers.insert(header_name, header_value);
+    }
+    Ok(headers)
 }
 
 /// HTTP client for making LLM API requests.
@@ -64,12 +116,12 @@ impl LLMClient {
 
     /// Create a new LLM client with default settings.
     ///
-    /// The 600s timeout is a connection-pool-wide backstop; individual requests
-    /// override it via the per-request timeout argument, so a single pooled
-    /// client serves both default and custom-timeout requests.
+    /// The backstop is 600s of SILENCE on a connection, never a total
+    /// duration, so a long live stream is not cut off while a dead connection
+    /// still fails. A request's own timeout (`with_timeout`) applies on top.
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
+            .read_timeout(Duration::from_secs(600))
             .build()
             .expect("Failed to create HTTP client");
         Self::with_client(client)
@@ -93,46 +145,35 @@ impl LLMClient {
     /// win on a key collision.
     fn build_headers(&self, generator: &GeneratorInfo) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        let auth = generator.provider.auth_headers(&generator.auth)?;
-        let attribution = generator
-            .provider
-            .attribution_headers(generator.app_attribution.as_ref());
-        for (name, value) in auth
-            .iter()
-            .chain(attribution.iter())
-            .chain(generator.custom_headers.iter())
-        {
-            let header_name = HeaderName::try_from(name.as_str()).map_err(|e| {
-                MiniLLMError::InvalidParameter(format!("Invalid header name '{}': {}", name, e))
-            })?;
-            let header_value = HeaderValue::from_str(value).map_err(|e| {
-                MiniLLMError::InvalidParameter(format!(
-                    "Invalid header value for '{}': {}",
-                    name, e
-                ))
-            })?;
-            headers.insert(header_name, header_value);
-        }
-
+        // Added after the content type, so a custom header may override it.
+        headers.extend(generator_headers(generator)?);
         Ok(headers)
     }
 
     /// Build the request body via the generator's provider (the provider owns the
     /// wire shape: OpenAI `/chat/completions` vs Anthropic `/v1/messages`).
-    pub(crate) fn build_body_with_usage(
+    /// Every request passes here, so this is where the caller's `params` become
+    /// [`GeneratorInfo::request_params`]: the same parameters a cost estimate
+    /// prices. Any lookup it takes (a required cap the caller left unset)
+    /// rides this client and waits at most half of the request's `timeout`,
+    /// after which the request goes out with 4096: a lookup never fails a
+    /// request, and the request keeps the other half (see [`time_left`]).
+    pub(crate) async fn build_body_with_usage(
         &self,
         generator: &GeneratorInfo,
         messages: &[Message],
         params: &CompletionParameters,
         stream: bool,
         include_usage: bool,
+        timeout: Option<Duration>,
     ) -> Result<serde_json::Value> {
+        let sent = generator
+            .request_params_over(&self.client, params, timeout.map(|t| t / 2))
+            .await;
         generator
             .provider
-            .build_request(&generator.model, messages, params, stream, include_usage)
+            .build_request(&generator.model, messages, &sent, stream, include_usage)
     }
 
     /// Make a non-streaming completion request
@@ -159,15 +200,18 @@ impl LLMClient {
         include_usage: bool,
         timeout: Option<Duration>,
     ) -> Result<CompletionResponse> {
+        let started = Instant::now();
         let url = generator.completions_url();
         let headers = self.build_headers(generator)?;
-        let body = self.build_body_with_usage(generator, messages, params, false, include_usage)?;
+        let body = self
+            .build_body_with_usage(generator, messages, params, false, include_usage, timeout)
+            .await?;
 
         tracing::debug!(url = %url, model = %generator.model, include_usage = %include_usage, "Making completion request");
 
         let mut request = self.client.post(&url).headers(headers).json(&body);
-        if let Some(timeout) = timeout {
-            request = request.timeout(timeout);
+        if let Some(left) = time_left(timeout, started) {
+            request = request.timeout(left);
         }
         let response = request.send().await.map_err(map_send_error)?;
 
@@ -224,9 +268,19 @@ impl LLMClient {
         include_usage: bool,
         idle_timeout: Option<Duration>,
     ) -> Result<StreamingCompletion> {
+        let started = Instant::now();
         let url = generator.completions_url();
         let headers = self.build_headers(generator)?;
-        let body = self.build_body_with_usage(generator, messages, params, true, include_usage)?;
+        let body = self
+            .build_body_with_usage(
+                generator,
+                messages,
+                params,
+                true,
+                include_usage,
+                idle_timeout,
+            )
+            .await?;
 
         tracing::debug!(url = %url, model = %generator.model, include_usage = %include_usage, "Starting streaming completion");
 
@@ -242,7 +296,7 @@ impl LLMClient {
         // The idle timeout bounds the wait for the stream's START too:
         // silence before the response headers is still silence, and a dead
         // host must fail loudly, not park until the pool timeout.
-        let response = match idle_timeout {
+        let response = match time_left(idle_timeout, started) {
             Some(dur) => tokio::time::timeout(dur, send)
                 .await
                 .map_err(|_| MiniLLMError::Timeout)?,
@@ -281,7 +335,11 @@ impl LLMClient {
 /// Global shared client instance
 static GLOBAL_CLIENT: std::sync::OnceLock<LLMClient> = std::sync::OnceLock::new();
 
-/// Get the global shared client
+/// The client a generator uses when nobody gave it one with
+/// [`GeneratorInfo::with_http_client`](crate::GeneratorInfo::with_http_client):
+/// one per program, its connections reused across calls. It suits a program
+/// with one tokio runtime. A connection belongs to the runtime that opened
+/// it, so with several runtimes, give each its own client.
 pub fn global_client() -> &'static LLMClient {
     GLOBAL_CLIENT.get_or_init(LLMClient::new)
 }
@@ -289,8 +347,28 @@ pub fn global_client() -> &'static LLMClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generator::{CompletionParameters, GeneratorInfo, ProviderSettings};
+    use crate::generator::{CompletionParameters, GeneratorInfo};
     use crate::message::Message;
+    use crate::provider::OpenRouterRouting;
+
+    /// The body a request with these inputs would carry.
+    fn request_body(
+        client: &LLMClient,
+        generator: &GeneratorInfo,
+        messages: &[Message],
+        params: &CompletionParameters,
+        stream: bool,
+        include_usage: bool,
+    ) -> Result<serde_json::Value> {
+        futures::executor::block_on(client.build_body_with_usage(
+            generator,
+            messages,
+            params,
+            stream,
+            include_usage,
+            None,
+        ))
+    }
 
     fn test_generator() -> GeneratorInfo {
         GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model")
@@ -307,9 +385,7 @@ mod tests {
         let params = CompletionParameters::new()
             .with_temperature(0.5)
             .with_max_tokens(1024);
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["stream"], false);
@@ -329,9 +405,7 @@ mod tests {
             legacy_token_limit: true,
         }));
         let params = CompletionParameters::new().with_max_tokens(1024);
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         // Legacy generator uses max_tokens and never emits max_completion_tokens.
         assert_eq!(body["max_tokens"], 1024);
@@ -346,9 +420,7 @@ mod tests {
         // The usage opt-in is provider-specific; OpenRouter uses usage:{include:true}.
         let gen = test_generator().with_provider(Arc::new(OpenRouterProvider));
         let params = CompletionParameters::new();
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, true)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, true).unwrap();
 
         assert_eq!(body["usage"]["include"], true);
     }
@@ -361,15 +433,27 @@ mod tests {
         let gen = test_generator().with_provider(Arc::new(OpenAiProvider));
         let params = CompletionParameters::new();
         // OpenAI opts into streaming usage via stream_options, only when streaming.
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, true, true)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, true, true).unwrap();
         assert_eq!(body["stream_options"]["include_usage"], true);
         // Non-streaming: no opt-in needed (usage always present).
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, true)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, true).unwrap();
         assert!(body.get("stream_options").is_none());
+    }
+
+    /// Every request carries the generator's defaults under the caller's
+    /// params, also when it is made straight through the client.
+    #[test]
+    fn a_request_carries_the_generator_defaults_under_the_callers_params() {
+        let client = LLMClient::new();
+        let gen = test_generator().with_default_params(
+            CompletionParameters::new()
+                .with_temperature(0.2)
+                .with_max_tokens(50),
+        );
+        let params = CompletionParameters::new().with_temperature(0.9);
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
+        assert_eq!(body["temperature"], 0.9);
+        assert_eq!(body["max_completion_tokens"], 50);
     }
 
     #[test]
@@ -377,20 +461,16 @@ mod tests {
         let client = LLMClient::new();
         let gen = test_generator();
         // An `extra` key colliding with a typed param must error, not silently clobber.
-        let params = CompletionParameters::new().with_extra("temperature", serde_json::json!(2.0));
-        assert!(client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .is_err());
+        let params = CompletionParameters::new()
+            .with_temperature(0.5)
+            .with_extra("temperature", serde_json::json!(2.0));
+        assert!(request_body(&client, &gen, &test_messages(), &params, false, false).is_err());
         // ...and one colliding with a request-owned key.
         let params = CompletionParameters::new().with_extra("model", serde_json::json!("x"));
-        assert!(client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .is_err());
+        assert!(request_body(&client, &gen, &test_messages(), &params, false, false).is_err());
         // A genuinely-extra key is fine.
         let params = CompletionParameters::new().with_extra("logit_bias", serde_json::json!({}));
-        assert!(client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .is_ok());
+        assert!(request_body(&client, &gen, &test_messages(), &params, false, false).is_ok());
     }
 
     #[test]
@@ -414,9 +494,7 @@ mod tests {
             reasoning: None,
             extra: None,
         };
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         assert_eq!(body["max_completion_tokens"], 512);
         // EXACT equality, not approximate: these reach the wire as JSON
@@ -438,10 +516,8 @@ mod tests {
         let client = LLMClient::new();
         let gen = test_generator();
         let params = CompletionParameters::new()
-            .with_openrouter_routing(ProviderSettings::new().deny_data_collection());
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+            .with_openrouter_routing(OpenRouterRouting::new().deny_data_collection());
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         assert_eq!(body["provider"]["data_collection"], "deny");
     }
@@ -451,14 +527,12 @@ mod tests {
         let client = LLMClient::new();
         let gen = test_generator();
         let params = CompletionParameters::new().with_openrouter_routing(
-            ProviderSettings::new()
+            OpenRouterRouting::new()
                 .with_order(vec!["Anthropic".to_string(), "OpenAI".to_string()])
                 .sort_by_latency()
                 .with_fallbacks(false),
         );
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         assert_eq!(body["provider"]["order"][0], "Anthropic");
         assert_eq!(body["provider"]["order"][1], "OpenAI");
@@ -473,9 +547,7 @@ mod tests {
         let params = CompletionParameters::new()
             .with_extra("custom_field", serde_json::json!("custom_value"))
             .with_extra("custom_number", serde_json::json!(42));
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         assert_eq!(body["custom_field"], "custom_value");
         assert_eq!(body["custom_number"], 42);
@@ -494,9 +566,7 @@ mod tests {
             ))
             .with_tool_choice(ToolChoice::Auto)
             .with_parallel_tool_calls(false);
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "get_weather");
@@ -509,9 +579,7 @@ mod tests {
         let client = LLMClient::new();
         let gen = test_generator();
         let params = CompletionParameters::new().with_json_response();
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         assert_eq!(body["response_format"]["type"], "json_object");
     }
@@ -537,9 +605,7 @@ mod tests {
             reasoning: None,
             extra: None,
         };
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         // Only model, messages, stream should be present
         assert!(body.get("max_tokens").is_none());
@@ -564,14 +630,12 @@ mod tests {
         let gen = test_generator();
         let params = CompletionParameters::new();
 
-        let body_no_stream = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body_no_stream =
+            request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
         assert_eq!(body_no_stream["stream"], false);
 
-        let body_stream = client
-            .build_body_with_usage(&gen, &test_messages(), &params, true, false)
-            .unwrap();
+        let body_stream =
+            request_body(&client, &gen, &test_messages(), &params, true, false).unwrap();
         assert_eq!(body_stream["stream"], true);
     }
 
@@ -580,9 +644,7 @@ mod tests {
         let client = LLMClient::new();
         let gen = test_generator();
         let params = CompletionParameters::new();
-        let body = client
-            .build_body_with_usage(&gen, &test_messages(), &params, false, false)
-            .unwrap();
+        let body = request_body(&client, &gen, &test_messages(), &params, false, false).unwrap();
 
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
@@ -607,7 +669,7 @@ mod tests {
             }
         });
 
-        // The pooled client has a 600s default; the per-request timeout overrides it.
+        // The pooled client only fails a connection after 600s of silence; the per-request timeout is the deadline here.
         let client = LLMClient::new();
         let gen = GeneratorInfo::new("Test", format!("http://{}", addr), "test-model")
             .with_api_key("fake-key");

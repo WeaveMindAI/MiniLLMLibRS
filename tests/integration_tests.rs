@@ -7,12 +7,14 @@
 
 use minillmlib::{
     chat_node::ChatNode,
-    generator::{CompletionParameters, GeneratorInfo, NodeCompletionParameters, ProviderSettings},
+    generator::{CompletionParameters, GeneratorInfo, NodeCompletionParameters},
     message::{
         AudioData, DocumentData, ImageData, Media, Message, MessageContent, Role, VideoData,
     },
+    provider::OpenRouterRouting,
     provider::{CostInfo, LLMClient},
     tracking::{AsyncCostCallback, CompletionContext, CompletionMeta},
+    Auth,
 };
 use std::sync::{Arc, Mutex};
 
@@ -45,36 +47,22 @@ macro_rules! require_live {
     };
 }
 
-/// Skip a live subscription test unless the `live` feature is on AND a Claude
-/// subscription token actually resolves (from `ANTHROPIC_AUTH_TOKEN` OR the
-/// Claude Code credential at `~/.claude/.credentials.json`). Gating on the real
-/// resolver (not just the env var) means the test runs whenever the library could
-/// actually authenticate, instead of silently passing-by-skip on a machine that
-/// has the file credential but no env var set.
-macro_rules! require_subscription {
-    () => {
-        dotenvy::dotenv().ok();
-        if !cfg!(feature = "live") {
-            eprintln!("Skipping live test (enable with `cargo test --features live`)");
-            return;
-        }
-        if !minillmlib::resolve_claude_subscription_auth().is_some() {
-            eprintln!(
-                "Skipping subscription test: no token (set ANTHROPIC_AUTH_TOKEN or log into Claude Code)"
-            );
-            return;
-        }
-    };
+/// A live generator with its own HTTP client. Every `#[tokio::test]` runs its
+/// own runtime, and a connection belongs to the runtime that opened it, so live
+/// tests sharing the crate's client would hand each other dead connections
+/// when run in parallel.
+fn own_client(generator: GeneratorInfo) -> GeneratorInfo {
+    generator.with_http_client(reqwest::Client::new())
 }
 
 fn get_test_generator() -> GeneratorInfo {
     dotenvy::dotenv().ok();
-    GeneratorInfo::openrouter(TEST_MODEL)
+    own_client(GeneratorInfo::openrouter(TEST_MODEL))
 }
 
 fn get_text_generator() -> GeneratorInfo {
     dotenvy::dotenv().ok();
-    GeneratorInfo::openrouter(TEXT_ONLY_MODEL)
+    own_client(GeneratorInfo::openrouter(TEXT_ONLY_MODEL))
 }
 
 // =============================================================================
@@ -87,14 +75,14 @@ fn test_generator_info_creation() {
     assert_eq!(gen.name, "Test");
     assert_eq!(gen.base_url, "https://api.example.com/v1");
     assert_eq!(gen.model, "test-model");
-    assert!(!gen.auth.is_some());
+    assert!(matches!(gen.auth, Auth::None));
 }
 
 #[test]
 fn test_generator_info_with_api_key() {
     let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model")
         .with_api_key("test-key-123");
-    assert!(gen.auth.is_some());
+    assert!(matches!(gen.auth, Auth::ApiKey(_)));
 }
 
 #[test]
@@ -128,14 +116,8 @@ fn test_generator_info_completions_url() {
 #[test]
 fn test_generator_info_with_options() {
     let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model")
-        .with_vision()
-        .with_audio()
-        .with_max_context(128000)
         .with_header("X-Custom", "value");
 
-    assert!(gen.supports_vision);
-    assert!(gen.supports_audio);
-    assert_eq!(gen.max_context_length, Some(128000));
     assert!(gen
         .custom_headers
         .iter()
@@ -149,8 +131,8 @@ fn test_generator_info_with_options() {
 #[test]
 fn test_completion_parameters_default() {
     let params = CompletionParameters::default();
-    assert_eq!(params.max_tokens, Some(4096));
-    assert_eq!(params.temperature, Some(0.7));
+    assert!(params.max_tokens.is_none());
+    assert!(params.temperature.is_none());
     assert!(params.top_p.is_none());
     assert!(params.stop.is_none());
 }
@@ -183,9 +165,8 @@ fn test_completion_parameters_merge() {
 
     let merged = base.merge(&override_params);
 
-    // Note: merge takes other's value if present, else falls back to self
-    // Since override_params has default max_tokens (4096), it takes that
-    assert_eq!(merged.max_tokens, Some(4096)); // From override (default)
+    // merge takes other's value where other set one, else keeps self's.
+    assert_eq!(merged.max_tokens, Some(1024)); // Kept from base
     assert_eq!(merged.temperature, Some(0.3)); // Overridden
     assert_eq!(merged.top_p, Some(0.9)); // From override
 }
@@ -245,9 +226,9 @@ fn test_node_completion_parameters_force_prepend() {
 
 #[test]
 fn test_provider_settings() {
-    use minillmlib::ProviderSettings;
+    use minillmlib::OpenRouterRouting;
 
-    let provider = ProviderSettings::new()
+    let provider = OpenRouterRouting::new()
         .sort_by_throughput()
         .deny_data_collection()
         .with_ignore(vec!["SambaNova".to_string()]);
@@ -259,9 +240,9 @@ fn test_provider_settings() {
 
 #[test]
 fn test_completion_parameters_openrouter_routing_goes_to_extra() {
-    use minillmlib::{CompletionParameters, ProviderSettings};
+    use minillmlib::{CompletionParameters, OpenRouterRouting};
 
-    let provider = ProviderSettings::new()
+    let provider = OpenRouterRouting::new()
         .sort_by_throughput()
         .deny_data_collection();
 
@@ -2212,7 +2193,8 @@ async fn test_llm_client_streaming_direct() {
 #[tokio::test]
 async fn test_invalid_api_key() {
     require_live!("OPENROUTER_API_KEY");
-    let generator = GeneratorInfo::openrouter(TEXT_ONLY_MODEL).with_api_key("invalid-key-12345");
+    let generator =
+        own_client(GeneratorInfo::openrouter(TEXT_ONLY_MODEL)).with_api_key("invalid-key-12345");
 
     let root = ChatNode::root("Test");
     let user = root.add_user("Hello");
@@ -2228,7 +2210,11 @@ async fn test_invalid_api_key() {
 async fn test_missing_api_key() {
     require_live!("OPENROUTER_API_KEY");
     // Create generator without API key
-    let generator = GeneratorInfo::new("Test", "https://openrouter.ai/api/v1", TEXT_ONLY_MODEL);
+    let generator = own_client(GeneratorInfo::new(
+        "Test",
+        "https://openrouter.ai/api/v1",
+        TEXT_ONLY_MODEL,
+    ));
 
     let root = ChatNode::root("Test");
     let user = root.add_user("Hello");
@@ -2333,8 +2319,8 @@ const CHEAP_MODEL: &str = "openai/gpt-oss-20b";
 
 fn get_cheap_generator() -> GeneratorInfo {
     dotenvy::dotenv().ok();
-    let provider = ProviderSettings::new().sort_by_price();
-    GeneratorInfo::openrouter(CHEAP_MODEL)
+    let provider = OpenRouterRouting::new().sort_by_price();
+    own_client(GeneratorInfo::openrouter(CHEAP_MODEL))
         .with_default_params(CompletionParameters::default().with_openrouter_routing(provider))
 }
 
@@ -2344,8 +2330,9 @@ fn get_cheap_generator() -> GeneratorInfo {
 async fn test_multi_threaded_completions() {
     require_live!("OPENROUTER_API_KEY");
     let gi = get_cheap_generator();
+    // gpt-oss reasons before it answers, and the cap counts both.
     let params = NodeCompletionParameters::default()
-        .with_params(CompletionParameters::default().with_max_tokens(20));
+        .with_params(CompletionParameters::default().with_max_tokens(200));
 
     // Create a shared root node
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
@@ -2354,7 +2341,10 @@ async fn test_multi_threaded_completions() {
     let mut handles = vec![];
 
     for i in 0..10 {
-        let gi_clone = gi.clone();
+        // Each thread runs its own runtime, so each gets its own HTTP client:
+        // a connection belongs to the runtime that opened it, and the shared
+        // client would hand one thread's dead connections to another.
+        let gi_clone = gi.clone().with_http_client(reqwest::Client::new());
         let params_clone = params.clone();
         let root_clone = root.clone();
 
@@ -2368,7 +2358,7 @@ async fn test_multi_threaded_completions() {
                 let result = user_node.complete(&gi_clone, Some(&params_clone)).await;
                 // Return the branch handle so the caller keeps it alive (an unheld
                 // branch is reclaimed once its last handle drops).
-                (i, result.is_ok(), user_node)
+                (i, result.map(|_| ()), user_node)
             })
         });
 
@@ -2379,9 +2369,12 @@ async fn test_multi_threaded_completions() {
     let mut successes = 0;
     let mut branches = Vec::new();
     for handle in handles {
-        let (i, ok, user_node) = handle.join().expect("Thread panicked");
-        println!("Thread {}: {}", i, if ok { "OK" } else { "FAILED" });
-        if ok {
+        let (i, result, user_node) = handle.join().expect("Thread panicked");
+        match &result {
+            Ok(()) => println!("Thread {i}: OK"),
+            Err(e) => println!("Thread {i}: FAILED - {e:?}"),
+        }
+        if result.is_ok() {
             successes += 1;
         }
         branches.push(user_node);
@@ -2405,8 +2398,9 @@ async fn test_multi_threaded_completions() {
 async fn test_async_concurrent_completions() {
     require_live!("OPENROUTER_API_KEY");
     let gi = get_cheap_generator();
+    // gpt-oss reasons before it answers, and the cap counts both.
     let params = NodeCompletionParameters::default()
-        .with_params(CompletionParameters::default().with_max_tokens(20));
+        .with_params(CompletionParameters::default().with_max_tokens(200));
 
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
 
@@ -2432,8 +2426,10 @@ async fn test_async_concurrent_completions() {
     // Execute all futures concurrently (like asyncio.gather)
     let results = futures::future::join_all(futures).await;
 
-    // Check results
+    // Check results, holding each reply's handle: an unheld branch is
+    // reclaimed once its last handle drops.
     let mut successes = 0;
+    let mut branches = Vec::new();
     for (i, result) in results {
         match result {
             Ok(response_node) => {
@@ -2444,6 +2440,7 @@ async fn test_async_concurrent_completions() {
                     content.chars().take(50).collect::<String>()
                 );
                 successes += 1;
+                branches.push(response_node);
             }
             Err(e) => {
                 println!("Request {}: FAILED - {}", i, e);
@@ -2468,10 +2465,7 @@ async fn test_async_concurrent_completions() {
 // =============================================================================
 
 /// Helper: build a CompletionContext with a mock callback that captures CostInfo
-fn make_test_context(
-    generator: GeneratorInfo,
-    is_byok: bool,
-) -> (CompletionContext, Arc<Mutex<Vec<CostInfo>>>) {
+fn make_test_context(generator: GeneratorInfo) -> (CompletionContext, Arc<Mutex<Vec<CostInfo>>>) {
     let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_clone = captured.clone();
 
@@ -2487,7 +2481,6 @@ fn make_test_context(
         "workflowId": "wf-123",
         "executionId": "exec-456",
         "nodeId": "node-789",
-        "isByok": is_byok,
     });
 
     let ctx = CompletionContext::new(
@@ -2503,22 +2496,12 @@ fn make_test_context(
 #[test]
 fn test_completion_context_creation() {
     let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model");
-    let (ctx, _captured) = make_test_context(gen, false);
+    let (ctx, _captured) = make_test_context(gen);
 
     assert_eq!(ctx.meta["userId"], "test-user");
     assert_eq!(ctx.meta["workflowId"], "wf-123");
     assert_eq!(ctx.meta["executionId"], "exec-456");
     assert_eq!(ctx.meta["nodeId"], "node-789");
-    assert!(!ctx.is_byok());
-}
-
-#[test]
-fn test_completion_context_byok() {
-    let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model")
-        .with_api_key("user-provided-key");
-    let (ctx, _captured) = make_test_context(gen, true);
-
-    assert!(ctx.is_byok());
 }
 
 #[test]
@@ -2528,7 +2511,7 @@ fn test_completion_context_injects_app_headers() {
     let default_attr = gen.app_attribution.as_ref().expect("default attribution");
     assert_eq!(default_attr.title, "MiniLLMLib");
 
-    let (ctx, _captured) = make_test_context(gen, false);
+    let (ctx, _captured) = make_test_context(gen);
 
     // CompletionContext replaces the app identity with the caller's. Attribution
     // now lives on the generator (the provider turns it into headers at request
@@ -2545,7 +2528,7 @@ fn test_completion_context_injects_app_headers() {
 #[tokio::test]
 async fn test_completion_context_report_cost() {
     let gen = GeneratorInfo::new("Test", "https://api.example.com/v1", "test-model");
-    let (ctx, captured) = make_test_context(gen, false);
+    let (ctx, captured) = make_test_context(gen);
 
     let cost_info = CostInfo {
         cost: 0.00042,
@@ -2609,7 +2592,7 @@ async fn test_completion_context_callback_receives_meta() {
 #[test]
 fn test_completion_context_debug() {
     let gen = GeneratorInfo::new("TestProvider", "https://api.example.com/v1", "test-model");
-    let (ctx, _) = make_test_context(gen, false);
+    let (ctx, _) = make_test_context(gen);
 
     let debug_str = format!("{:?}", ctx);
     assert!(debug_str.contains("CompletionContext"));
@@ -2627,7 +2610,7 @@ async fn test_complete_tracked_fires_callback() {
     require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
-    let (ctx, captured) = make_test_context(gen, false);
+    let (ctx, captured) = make_test_context(gen);
 
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
     let user_node = root.add_user("Say hello in exactly 3 words.");
@@ -2691,7 +2674,9 @@ async fn test_complete_costed_returns_the_bill_with_the_reply() {
     let reply = result.expect("live completion");
     assert!(!reply.text().unwrap_or_default().is_empty());
 
-    let cost = cost.expect("a successful completion always carries cost info");
+    let [cost] = cost.as_slice() else {
+        panic!("one accepted request, one cost: {cost:?}");
+    };
     assert!(
         cost.cost > 0.0,
         "a real completion cost something: {}",
@@ -2704,7 +2689,7 @@ async fn test_complete_costed_returns_the_bill_with_the_reply() {
     let no_retry = NodeCompletionParameters::new().with_retry(0);
     let (result, cost) = user.complete_costed(&dead, Some(&no_retry)).await;
     assert!(result.is_err(), "an unreachable endpoint fails loudly");
-    assert!(cost.is_none(), "and carries no cost info");
+    assert!(cost.is_empty(), "and carries no cost info");
 }
 
 #[tokio::test]
@@ -2713,7 +2698,7 @@ async fn test_complete_tracked_with_params() {
     require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
-    let (ctx, captured) = make_test_context(gen, false);
+    let (ctx, captured) = make_test_context(gen);
 
     let params = NodeCompletionParameters::new().with_params(
         CompletionParameters::new()
@@ -2747,7 +2732,7 @@ async fn test_complete_streaming_collect_tracked() {
     require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
-    let (ctx, captured) = make_test_context(gen, false);
+    let (ctx, captured) = make_test_context(gen);
 
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
     let user_node = root.add_user("Count from 1 to 5.");
@@ -2792,7 +2777,7 @@ async fn test_complete_streaming_tracked_manual_consume() {
     require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
-    let (ctx, captured) = make_test_context(gen, false);
+    let (ctx, captured) = make_test_context(gen);
 
     let root = ChatNode::root("You are a helpful assistant. Be very brief.");
     let user_node = root.add_user("Say 'hello world'.");
@@ -2842,7 +2827,7 @@ async fn test_tracked_stream_drop_reports_cost() {
     require_live!("OPENROUTER_API_KEY");
 
     let gen = get_text_generator();
-    let (ctx, captured) = make_test_context(gen, false);
+    let (ctx, captured) = make_test_context(gen);
 
     let root = ChatNode::root("You are a helpful assistant.");
     let user_node = root.add_user("Write a long essay about the history of computing.");
@@ -2867,9 +2852,13 @@ async fn test_tracked_stream_drop_reports_cost() {
         // stream is dropped here; Drop impl should spawn background cost reporting
     }
 
-    // Give the background task time to query OpenRouter and report.
-    // Drop retry schedule is 1s + 2s + 4s = 7s worst case, plus query time.
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    // Wait for the background task to report. OpenRouter's record of a
+    // cancelled generation appears only after the generation runs to its end
+    // plus ~9s, and the task polls for up to 25s, so allow 30s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while captured.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 
     let costs = captured.lock().unwrap();
     println!("[drop_test] Captured {} cost report(s)", costs.len());
@@ -2922,19 +2911,17 @@ async fn test_complete_tracked_byok_flag() {
 }
 
 // =============================================================================
-// Anthropic native + Claude subscription (live, gated behind `--features live`)
+// Anthropic native (live, gated behind `--features live`)
 // =============================================================================
 //
-// API-key path needs ANTHROPIC_API_KEY; subscription path needs
-// ANTHROPIC_AUTH_TOKEN (a Pro/Max OAuth token, e.g. from
-// `ant auth print-credentials --env`). Both hit the real `/v1/messages`.
+// Needs ANTHROPIC_API_KEY; hits the real `/v1/messages`.
 
 use minillmlib::{CostResolution, TokenPrice};
 
 #[tokio::test]
 async fn test_anthropic_api_key_completion() {
     require_live!("ANTHROPIC_API_KEY");
-    let generator = GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL);
+    let generator = own_client(GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL));
     let root = ChatNode::root("You are terse. Reply in one word.");
     let user = root.add_user("Say OK");
     let params = NodeCompletionParameters::new()
@@ -2953,7 +2940,7 @@ async fn test_anthropic_api_key_completion() {
 #[tokio::test]
 async fn test_anthropic_streaming_collect() {
     require_live!("ANTHROPIC_API_KEY");
-    let generator = GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL);
+    let generator = own_client(GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL));
     let root = ChatNode::root("You are terse.");
     let user = root.add_user("Count: one two three");
     let params = NodeCompletionParameters::new()
@@ -2971,8 +2958,8 @@ async fn test_anthropic_cost_estimate_resolved_with_price() {
     require_live!("ANTHROPIC_API_KEY");
     // Anthropic returns token counts but no dollar cost. With a TokenPrice set,
     // the cost callback must report a Resolved (non-zero) USD ESTIMATE.
-    let generator =
-        GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL).with_token_price(TokenPrice::new(1.0, 5.0));
+    let generator = own_client(GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL))
+        .with_token_price(TokenPrice::new(1.0, 5.0));
 
     let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = captured.clone();
@@ -2994,15 +2981,27 @@ async fn test_anthropic_cost_estimate_resolved_with_price() {
         CostResolution::Resolved,
         "a TokenPrice makes the estimate Resolved"
     );
-    assert!(costs[0].cost > 0.0, "estimate should be non-zero");
-    assert!(costs[0].prompt_tokens > 0, "real token counts present");
+    // Real input AND output token counts come back, and the cost is exactly
+    // tokens × price (Anthropic returns no dollar amount; it is derived).
+    let c = &costs[0];
+    assert!(c.prompt_tokens > 0, "input tokens present");
+    assert!(c.completion_tokens > 0, "output tokens present");
+    assert_eq!(c.total_tokens, c.prompt_tokens + c.completion_tokens);
+    let expected = (c.prompt_tokens as f64 * 1.0 + c.completion_tokens as f64 * 5.0) / 1_000_000.0;
+    assert!(
+        (c.cost - expected).abs() < 1e-12,
+        "cost {} must equal tokens×price {expected}",
+        c.cost
+    );
 }
 
 #[tokio::test]
-async fn test_anthropic_unpriced_without_token_price() {
+async fn test_anthropic_unpriced_when_no_price_is_known() {
     require_live!("ANTHROPIC_API_KEY");
-    // No TokenPrice → cost is Unpriced (real tokens, unknown $), never a fake $0.
-    let generator = GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL);
+    // No price given and a catalog id the catalog does not list → cost is
+    // Unpriced (real tokens, unknown $), never a fake $0.
+    let generator = own_client(GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL))
+        .with_openrouter_name("anthropic/not-a-listed-model");
     let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = captured.clone();
     let params = NodeCompletionParameters::new()
@@ -3025,62 +3024,6 @@ async fn test_anthropic_unpriced_without_token_price() {
     );
 }
 
-#[tokio::test]
-async fn test_claude_subscription_completion() {
-    require_subscription!();
-    // Subscription OAuth token: same Anthropic wire, bearer auth, draws on the
-    // subscription quota. With a TokenPrice it yields a Resolved cost estimate.
-    let generator = GeneratorInfo::claude_subscription(ANTHROPIC_TEST_MODEL)
-        .with_token_price(TokenPrice::new(1.0, 5.0));
-
-    let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = captured.clone();
-    let params = NodeCompletionParameters::new()
-        .with_params(CompletionParameters::new().with_max_tokens(10))
-        .with_cost_tracking(true)
-        .with_cost_callback(move |info: CostInfo| sink.lock().unwrap().push(info));
-
-    let root = ChatNode::root("You are terse. Reply in one word.");
-    let user = root.add_user("Say OK");
-    let node = user
-        .complete(&generator, Some(&params))
-        .await
-        .expect("claude subscription completion");
-    assert!(!node.text().unwrap_or_default().is_empty());
-
-    // Real input AND output token counts come back, and the cost ESTIMATE is
-    // exactly tokens × price (Anthropic returns no dollar amount; we derive it).
-    let costs = captured.lock().unwrap();
-    let c = &costs[0];
-    assert_eq!(c.resolution, CostResolution::Resolved);
-    assert!(c.prompt_tokens > 0, "input tokens present");
-    assert!(c.completion_tokens > 0, "output tokens present");
-    assert_eq!(c.total_tokens, c.prompt_tokens + c.completion_tokens);
-    let expected = (c.prompt_tokens as f64 * 1.0 + c.completion_tokens as f64 * 5.0) / 1_000_000.0;
-    assert!(
-        (c.cost - expected).abs() < 1e-12,
-        "cost {} must equal tokens×price {}",
-        c.cost,
-        expected
-    );
-}
-
-#[tokio::test]
-async fn test_claude_subscription_streaming() {
-    require_subscription!();
-    let generator = GeneratorInfo::claude_subscription(ANTHROPIC_TEST_MODEL);
-    let root = ChatNode::root("You are terse.");
-    let user = root.add_user("Count: one two three");
-    let params = NodeCompletionParameters::new()
-        .with_params(CompletionParameters::new().with_max_tokens(20));
-
-    let node = user
-        .complete_streaming_collect(&generator, Some(&params))
-        .await
-        .expect("claude subscription streaming");
-    assert!(!node.text().unwrap_or_default().is_empty());
-}
-
 // =============================================================================
 // Prompt caching (live, gated): proves cache marks drive real write/read and
 // the disjoint-bucket pricing is correct.
@@ -3091,71 +3034,31 @@ fn big_system_prompt() -> String {
     "You are a meticulous assistant. Follow every instruction exactly. ".repeat(400)
 }
 
+/// Anthropic's Models API gives the model's largest `max_tokens`, and a
+/// request with no cap goes out with it and is answered. Reasoning off is
+/// Anthropic's `thinking: disabled`, which Haiku 4.5 takes.
 #[tokio::test]
-async fn test_anthropic_cache_write_then_read() {
-    require_subscription!();
-    // read 0.1/Mtok, write 1.25/Mtok (1.25× the 1.0 input rate).
-    let gen = GeneratorInfo::claude_subscription(ANTHROPIC_TEST_MODEL)
-        .with_token_price(TokenPrice::new(1.0, 5.0).with_cache_rates(0.1, 1.25));
-    // Unique per run so call 1 is GUARANTEED cold; a fixed prompt may still be
-    // cached from a recent run (5-min TTL), which would make call 1 a read.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let big = format!("Session {nonce}. {}", big_system_prompt());
+async fn test_anthropic_model_info_fills_an_unset_cap() {
+    require_live!("ANTHROPIC_API_KEY");
+    let gen = own_client(GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL));
 
-    let captured: Arc<Mutex<Vec<CostInfo>>> = Arc::new(Mutex::new(Vec::new()));
-    let mk = || {
-        let sink = captured.clone();
-        NodeCompletionParameters::new()
-            .with_params(CompletionParameters::new().with_max_tokens(5))
-            .with_cost_tracking(true)
-            .with_cost_callback(move |i: CostInfo| sink.lock().unwrap().push(i))
-    };
+    let info = gen.model_info().await;
+    assert!(info.max_output_tokens.unwrap_or(0) > 0, "{info:?}");
 
-    // Call 1: cold → cache WRITE on the marked system prefix.
-    let root = ChatNode::root(big.clone());
-    root.cache_breakpoint();
-    root.add_user("Say A")
-        .complete(&gen, Some(&mk()))
+    let params = NodeCompletionParameters::new()
+        .with_params(CompletionParameters::new().with_reasoning(minillmlib::Reasoning::Off));
+    let answer = ChatNode::root("You are terse.")
+        .add_user("Say OK")
+        .complete(&gen, Some(&params))
         .await
-        .expect("write call");
-
-    // Call 2: same system prefix → cache READ.
-    let root2 = ChatNode::root(big);
-    root2.cache_breakpoint();
-    root2
-        .add_user("Say B")
-        .complete(&gen, Some(&mk()))
-        .await
-        .expect("read call");
-
-    let costs = captured.lock().unwrap();
-    assert_eq!(costs.len(), 2);
-    // First call writes the cache; second reads it. (Both Resolved estimates.)
-    assert!(
-        costs[0].cache_write_tokens > 0,
-        "first call writes the cache"
-    );
-    assert!(
-        costs[1].cache_read_tokens > 0,
-        "second call reads the cache"
-    );
-    // The read is far cheaper than the write (the whole point of caching).
-    assert!(
-        costs[1].cost < costs[0].cost,
-        "cache read ({}) must cost less than the write ({})",
-        costs[1].cost,
-        costs[0].cost
-    );
-    assert_eq!(costs[0].resolution, CostResolution::Resolved);
+        .expect("no cap, reasoning off");
+    assert!(!answer.text().unwrap_or_default().is_empty());
 }
 
 #[tokio::test]
 async fn test_anthropic_ensure_cached_warms_then_cheap_read() {
-    require_subscription!();
-    let gen = GeneratorInfo::claude_subscription(ANTHROPIC_TEST_MODEL)
+    require_live!("ANTHROPIC_API_KEY");
+    let gen = own_client(GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL))
         .with_token_price(TokenPrice::new(1.0, 5.0).with_cache_rates(0.1, 1.25));
 
     // Unique per run so the warm call is a guaranteed cold WRITE.
@@ -3207,8 +3110,8 @@ mod custom_provider {
     use super::*;
     use minillmlib::{
         provider::{
-            CompletionResponse, CostOutcome, GenericProvider, PostStreamCtx, Provider, StreamChunk,
-            TokenPrice, Usage,
+            CompletionResponse, CostOutcome, GenericProvider, Provider, StreamChunk, TokenPrice,
+            Usage,
         },
         Auth,
     };
@@ -3218,15 +3121,15 @@ mod custom_provider {
 
     /// What the mock server captured from the one request it served.
     #[derive(Debug, Clone, Default)]
-    struct CapturedRequest {
-        method: String,
-        path: String,
+    pub(super) struct CapturedRequest {
+        pub(super) method: String,
+        pub(super) path: String,
         headers: Vec<(String, String)>,
-        body: serde_json::Value,
+        pub(super) body: serde_json::Value,
     }
 
     impl CapturedRequest {
-        fn header(&self, name: &str) -> Option<&str> {
+        pub(super) fn header(&self, name: &str) -> Option<&str> {
             self.headers
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -3235,86 +3138,123 @@ mod custom_provider {
     }
 
     /// Spin up a one-shot mock HTTP server on a loopback port that serves exactly
-    /// one request: it reads the request line + headers + body, records them, and
-    /// replies with `response_body` (a JSON string) as `200 OK`. Returns the base
-    /// URL (e.g. `http://127.0.0.1:PORT`) and a oneshot receiver that yields the
-    /// captured request once it has been served. Raw `TcpListener` (same idiom as
-    /// the timeout tests) so no HTTP-server dependency is pulled in.
+    /// one request with `response_body` as `200 OK`. Returns the base URL (e.g.
+    /// `http://127.0.0.1:PORT`) and a oneshot receiver that yields the captured
+    /// request once it has been served.
     async fn mock_server(
         response_body: &'static str,
     ) -> (String, tokio::sync::oneshot::Receiver<CapturedRequest>) {
+        let (base_url, mut captured) = mock_sequence(vec![(200, response_body)]).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Some(request) = captured.recv().await {
+                let _ = tx.send(request);
+            }
+        });
+        (base_url, rx)
+    }
+
+    /// A mock HTTP server on a loopback port that answers its requests in
+    /// order with `replies` (status, JSON body), one connection each, and
+    /// sends every request it served down the returned channel. Raw
+    /// `TcpListener` (same idiom as the timeout tests) so no HTTP-server
+    /// dependency is pulled in.
+    pub(super) async fn mock_sequence(
+        replies: Vec<(u16, &'static str)>,
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<CapturedRequest>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
+            for (status, body) in replies {
+                let (socket, _) = listener.accept().await.unwrap();
+                serve_one(socket, status, body, &tx).await;
+            }
+        });
+        (base_url, rx)
+    }
 
-            // Read until we have headers + the full body (Content-Length bytes).
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            loop {
-                let n = socket.read(&mut tmp).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..n]);
-                // Find the header/body split.
-                if let Some(split) = find_subslice(&buf, b"\r\n\r\n") {
-                    let head = String::from_utf8_lossy(&buf[..split]).to_string();
-                    let content_len = head
-                        .lines()
-                        .find_map(|l| {
-                            let (k, v) = l.split_once(':')?;
-                            k.trim()
-                                .eq_ignore_ascii_case("content-length")
-                                .then(|| v.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .unwrap_or(0);
-                    let body_start = split + 4;
-                    if buf.len() - body_start >= content_len {
-                        break; // full body received
-                    }
+    /// Every request `captured` has seen so far, once the server is idle.
+    pub(super) fn served(
+        captured: &mut tokio::sync::mpsc::UnboundedReceiver<CapturedRequest>,
+    ) -> Vec<CapturedRequest> {
+        std::iter::from_fn(|| captured.try_recv().ok()).collect()
+    }
+
+    /// Read one request off `socket`, send what it carried down `captured`, then
+    /// answer it with `status` and `response_body`. Recorded before the reply,
+    /// so a caller that has its response has its request recorded too.
+    async fn serve_one(
+        mut socket: tokio::net::TcpStream,
+        status: u16,
+        response_body: &str,
+        captured: &tokio::sync::mpsc::UnboundedSender<CapturedRequest>,
+    ) {
+        // Read until we have headers + the full body (Content-Length bytes).
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = socket.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            // Find the header/body split.
+            if let Some(split) = find_subslice(&buf, b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..split]).to_string();
+                let content_len = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                let body_start = split + 4;
+                if buf.len() - body_start >= content_len {
+                    break; // full body received
                 }
             }
+        }
 
-            // Parse the captured request.
-            let split = find_subslice(&buf, b"\r\n\r\n").unwrap();
-            let head = String::from_utf8_lossy(&buf[..split]).to_string();
-            let mut lines = head.lines();
-            let request_line = lines.next().unwrap_or_default();
-            let mut parts = request_line.split_whitespace();
-            let method = parts.next().unwrap_or("").to_string();
-            let path = parts.next().unwrap_or("").to_string();
-            let headers: Vec<(String, String)> = lines
-                .filter_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    Some((k.trim().to_string(), v.trim().to_string()))
-                })
-                .collect();
-            let body_bytes = &buf[split + 4..];
-            let body: serde_json::Value =
-                serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
+        // Parse the captured request.
+        let split = find_subslice(&buf, b"\r\n\r\n").unwrap();
+        let head = String::from_utf8_lossy(&buf[..split]).to_string();
+        let mut lines = head.lines();
+        let request_line = lines.next().unwrap_or_default();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let path = parts.next().unwrap_or("").to_string();
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                Some((k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+        let body_bytes = &buf[split + 4..];
+        let body: serde_json::Value =
+            serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
 
-            // Reply with the canned response.
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            socket.write_all(resp.as_bytes()).await.unwrap();
-            socket.flush().await.unwrap();
-
-            let _ = tx.send(CapturedRequest {
-                method,
-                path,
-                headers,
-                body,
-            });
+        let _ = captured.send(CapturedRequest {
+            method,
+            path,
+            headers,
+            body,
         });
 
-        (base_url, rx)
+        // Reply with the canned response.
+        let resp = format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        socket.write_all(resp.as_bytes()).await.unwrap();
+        socket.flush().await.unwrap();
     }
 
     fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -3465,6 +3405,17 @@ mod custom_provider {
             _stream: bool,
             _include_usage: bool,
         ) -> minillmlib::Result<serde_json::Value> {
+            // EchoAI has a field for the output cap and nothing else: any other
+            // setting the caller made fails loudly instead of vanishing.
+            let only_the_cap = CompletionParameters {
+                max_tokens: params.max_tokens,
+                ..Default::default()
+            };
+            if serde_json::to_value(params)? != serde_json::to_value(&only_the_cap)? {
+                return Err(minillmlib::MiniLLMError::InvalidParameter(
+                    "EchoAI takes only max_tokens".into(),
+                ));
+            }
             // EchoAI takes a single flattened prompt, not a messages array. Flatten
             // the conversation into "ROLE: text" lines. EchoAI's wire is text-only,
             // so a multimodal message FAILS LOUDLY rather than silently dropping the
@@ -3485,13 +3436,15 @@ mod custom_provider {
             }
             let prompt = prompt_lines.join("\n");
 
-            Ok(serde_json::json!({
+            let mut body = serde_json::json!({
                 "model": model,
                 "prompt": prompt,
-                "settings": {
-                    "max_output_tokens": params.max_tokens.unwrap_or(256),
-                },
-            }))
+            });
+            // Only what the caller set; EchoAI's own default covers the rest.
+            if let Some(cap) = params.max_tokens {
+                body["settings"] = serde_json::json!({ "max_output_tokens": cap });
+            }
+            Ok(body)
         }
 
         fn parse_response(&self, raw: serde_json::Value) -> minillmlib::Result<CompletionResponse> {
@@ -3546,14 +3499,6 @@ mod custom_provider {
                 Some(p) => CostOutcome::resolved(p.cost_of(&usage), usage),
                 None => CostOutcome::unpriced(usage),
             }
-        }
-
-        fn resolve_post_stream<'a>(
-            &'a self,
-            _ctx: PostStreamCtx<'a>,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CostOutcome> + Send + 'a>> {
-            // No out-of-band cost endpoint.
-            Box::pin(async { CostOutcome::unknown() })
         }
     }
 
@@ -3670,6 +3615,24 @@ mod custom_provider {
             "multimodal must fail loudly on a text-only wire, got {result:?}"
         );
     }
+
+    #[tokio::test]
+    async fn echoai_fails_loudly_on_a_setting_it_cannot_send() {
+        // EchoAI has no temperature field: a temperature must ERROR, never be
+        // dropped. Refused in build_request, before any request is sent.
+        let generator = GeneratorInfo::custom("echoai", "http://127.0.0.1:9", "echo-1")
+            .with_provider(Arc::new(EchoAiProvider));
+        let params = NodeCompletionParameters::new()
+            .with_params(CompletionParameters::new().with_temperature(0.2));
+        let result = ChatNode::root("s")
+            .add_user("hi")
+            .complete(&generator, Some(&params))
+            .await;
+        assert!(
+            matches!(result, Err(minillmlib::MiniLLMError::InvalidParameter(_))),
+            "{result:?}"
+        );
+    }
 }
 
 // =============================================================================
@@ -3755,13 +3718,13 @@ async fn run_tool_round_trip(generator: &GeneratorInfo) {
 async fn test_openrouter_tool_calling_round_trip() {
     require_live!("OPENROUTER_API_KEY");
     dotenvy::dotenv().ok();
-    run_tool_round_trip(&GeneratorInfo::openrouter(TOOL_TEST_MODEL)).await;
+    run_tool_round_trip(&own_client(GeneratorInfo::openrouter(TOOL_TEST_MODEL))).await;
 }
 
 #[tokio::test]
 async fn test_anthropic_tool_calling_round_trip() {
     require_live!("ANTHROPIC_API_KEY");
-    run_tool_round_trip(&GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL)).await;
+    run_tool_round_trip(&own_client(GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL))).await;
 }
 
 #[tokio::test]
@@ -3770,7 +3733,7 @@ async fn test_openrouter_streaming_tool_calls_assemble() {
     dotenvy::dotenv().ok();
     // Streaming: tool-call fragments must assemble into complete typed calls on
     // the final node.
-    let generator = GeneratorInfo::openrouter(TOOL_TEST_MODEL);
+    let generator = own_client(GeneratorInfo::openrouter(TOOL_TEST_MODEL));
     let root = ChatNode::root("You are helpful.");
     let user = root.add_user("What's the weather in Paris?");
     let node = user
@@ -3787,7 +3750,7 @@ async fn test_anthropic_streaming_tool_calls_assemble() {
     require_live!("ANTHROPIC_API_KEY");
     // Anthropic streams tool calls via content_block_start + input_json_delta;
     // the fragments must assemble despite the shared text/tool index space.
-    let generator = GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL);
+    let generator = own_client(GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL));
     let root = ChatNode::root("You are helpful.");
     let user = root.add_user("What's the weather in Paris?");
     let node = user
@@ -3817,111 +3780,45 @@ macro_rules! require_network {
 #[tokio::test]
 async fn test_catalog_prices_a_first_party_model_with_cache_buckets() {
     require_network!();
-    let generator =
-        GeneratorInfo::anthropic("sonnet").with_openrouter_name("anthropic/claude-sonnet-4.6");
-    let rates = generator
-        .model_rates()
-        .await
-        .expect("anthropic serves its own sonnet 4.6");
+    // The catalog needs no credential, so OpenRouter's lookup reads it alone.
+    let generator = own_client(GeneratorInfo::openrouter("anthropic/claude-sonnet-4.6"));
+    let info = generator.model_info().await;
+    let price = info.price.clone().expect("the catalog lists sonnet 4.6");
+    assert!(info.context_length.unwrap_or(0) > 0, "{info:?}");
 
     // Rates are per MILLION tokens once parsed (the wire carries per-token strings).
-    assert!(rates.price.input_per_mtok > 0.1, "{:?}", rates.price);
+    assert!(price.input_per_mtok > 0.1, "{price:?}");
     assert!(
-        rates.price.output_per_mtok > rates.price.input_per_mtok,
+        price.output_per_mtok > price.input_per_mtok,
         "output costs more than input"
     );
 
     // Anthropic models publish both cache buckets: read is a discount, write a premium.
-    let read = rates
-        .price
+    let read = price
         .cache_read_per_mtok
         .expect("sonnet publishes a cache-read rate");
-    let write = rates
-        .price
+    let write = price
         .cache_write_per_mtok
         .expect("sonnet publishes a cache-write rate");
-    assert!(
-        read < rates.price.input_per_mtok,
-        "cache reads are discounted"
+    assert!(read < price.input_per_mtok, "cache reads are discounted");
+    assert!(write > price.input_per_mtok, "cache writes carry a premium");
+}
+
+/// A model the catalog does not list has an unknown price, and so an unknown
+/// estimate, rather than a guessed one.
+#[cfg(feature = "estimate")]
+#[tokio::test]
+async fn test_an_unknown_model_has_an_unknown_estimate() {
+    require_network!();
+    let generator = own_client(GeneratorInfo::openrouter("definitely/not-a-real-model"));
+    assert_eq!(generator.model_info().await.price, None);
+    let user = ChatNode::root("s").add_user("hi");
+    assert_eq!(
+        generator
+            .estimate_cost_usd(&user.thread(), &CompletionParameters::new())
+            .await,
+        None
     );
-    assert!(
-        write > rates.price.input_per_mtok,
-        "cache writes carry a premium"
-    );
-
-    assert!(rates.context_length > 0);
-}
-
-/// The bug this shape exists to prevent. A model served by many providers has no
-/// single price: `z-ai/glm-5.2` is served by more than twenty, and a real request
-/// was once billed at nearly four times the rate OpenRouter advertises for it.
-/// So an unpinned lookup MUST bound every pinned one.
-#[tokio::test]
-async fn test_an_unpinned_price_bounds_every_provider_that_serves_the_model() {
-    require_network!();
-    let generator = GeneratorInfo::openrouter("z-ai/glm-5.2");
-
-    let bound = generator
-        .model_rates_served_by(None)
-        .await
-        .expect("a catalogued model has endpoints");
-
-    // Fireworks is one of the pricier endpoints; whoever serves it, the unpinned
-    // figure must not come in under them.
-    for slug in ["fireworks", "together", "novita"] {
-        let Ok(pinned) = generator.model_rates_served_by(Some(slug)).await else {
-            continue; // that provider may not serve this model today
-        };
-        assert!(
-            bound.price.output_per_mtok >= pinned.price.output_per_mtok,
-            "the unpinned bound ({}) is under {slug} ({})",
-            bound.price.output_per_mtok,
-            pinned.price.output_per_mtok
-        );
-        assert!(bound.price.input_per_mtok >= pinned.price.input_per_mtok);
-    }
-}
-
-#[tokio::test]
-async fn test_catalog_refuses_an_unknown_model_rather_than_guessing_a_price() {
-    require_network!();
-    let err = GeneratorInfo::openrouter("definitely/not-a-real-model")
-        .model_rates()
-        .await
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(msg.contains("not in OpenRouter's catalog"), "{msg}");
-}
-
-/// A provider that does not serve a model prices at the dearest of ALL its
-/// providers: a known model must always estimate, and the dearest rate is the
-/// only bound that holds wherever the call really lands.
-#[tokio::test]
-async fn test_a_provider_that_does_not_serve_the_model_prices_at_the_dearest_of_all() {
-    require_network!();
-    let generator = GeneratorInfo::openrouter("anthropic/claude-sonnet-4.6");
-    let fallback = generator
-        .model_rates_served_by(Some("fireworks"))
-        .await
-        .expect("a known model always prices, whoever was named");
-    let dearest = generator
-        .model_rates_served_by(None)
-        .await
-        .expect("known model");
-    assert_eq!(fallback, dearest);
-}
-
-#[tokio::test]
-async fn test_catalog_serves_repeat_lookups_of_one_model_from_one_fetch() {
-    require_network!();
-    // Two lookups over the SAME generator must not refetch: the endpoints are
-    // cached on the generator, and the provider filter is applied to the cache.
-    let generator = GeneratorInfo::openrouter("anthropic/claude-sonnet-4.6");
-    generator.model_rates().await.expect("first lookup");
-    generator
-        .model_rates_served_by(Some("anthropic"))
-        .await
-        .expect("second selection over the cached endpoints");
 }
 
 /// The property the whole reservation scheme rests on: an estimate made BEFORE a
@@ -3933,15 +3830,15 @@ async fn test_estimate_is_an_upper_bound_on_a_real_completion() {
     require_live!("OPENROUTER_API_KEY");
 
     let model = "anthropic/claude-haiku-4.5";
-    let generator = GeneratorInfo::openrouter(model);
+    let generator = own_client(GeneratorInfo::openrouter(model));
 
     let root = ChatNode::root("You are terse.");
     let user = root.add_user("Name three primary colours, comma separated, nothing else.");
     let params = CompletionParameters::new().with_max_tokens(64);
 
-    // The generator pins no provider, so the estimate is bounded by the dearest
-    // endpoint that routing could pick. One call: the generator resolves the
-    // catalog id, fetches and caches the rates, and prices the prompt.
+    // OpenRouter may route to any provider of the model, so the estimate is
+    // bounded by the dearest endpoint. One call: the generator looks the model
+    // up in the catalog, keeps the answer, and prices the prompt.
     let estimate = generator
         .estimate_cost_usd(&user.thread(), &params)
         .await
@@ -3973,4 +3870,384 @@ async fn test_estimate_is_an_upper_bound_on_a_real_completion() {
         estimate >= actual,
         "the estimate ({estimate}) must never fall below the real cost ({actual})"
     );
+}
+
+// =============================================================================
+// Retries, billing, and model lookups against a scripted server (offline).
+// Layer-3 contract tests: the real completion pipeline over real HTTP to a
+// loopback server that answers from a script.
+// =============================================================================
+
+mod scripted {
+    use super::custom_provider::{mock_sequence, served};
+    use super::*;
+    use minillmlib::provider::{AnthropicProvider, TokenPrice};
+    use minillmlib::MiniLLMError;
+    use std::sync::Arc;
+
+    const EMPTY: &str = r#"{"id":"e","model":"m","choices":[{"index":0,
+        "message":{"role":"assistant","content":""},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":10,"completion_tokens":0,"total_tokens":10}}"#;
+    const GOOD: &str = r#"{"id":"g","model":"m","choices":[{"index":0,
+        "message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#;
+    const DOWN: &str = r#"{"error":{"message":"overloaded"}}"#;
+
+    fn generator(base_url: &str) -> GeneratorInfo {
+        GeneratorInfo::custom("scripted", base_url, "m").with_token_price(TokenPrice::new(1.0, 1.0))
+    }
+
+    /// A tracked completion reports to its context, so it refuses a callback
+    /// of the caller's own (which it would never fire) before sending
+    /// anything.
+    #[tokio::test]
+    async fn a_tracked_completion_refuses_a_cost_callback() {
+        let (ctx, _) = make_test_context(generator("http://127.0.0.1:9"));
+        let params = NodeCompletionParameters::new().with_cost_callback(|_: CostInfo| {});
+        let user = ChatNode::root("s").add_user("hi");
+        let err = user
+            .complete_tracked(&ctx, Some(&params))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MiniLLMError::InvalidParameter(_)), "{err}");
+        let err = user
+            .complete_streaming_collect_tracked(&ctx, Some(&params))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MiniLLMError::InvalidParameter(_)), "{err}");
+        assert!(user
+            .complete_streaming_tracked(&ctx, Some(&params))
+            .await
+            .is_err());
+    }
+
+    /// With no retries a failure is the attempt's own error, after exactly one
+    /// request; with retries it is wrapped, after one request per attempt.
+    #[tokio::test]
+    async fn retries_happen_only_when_asked() {
+        let (base_url, mut captured) = mock_sequence(vec![(503, DOWN)]).await;
+        let err = ChatNode::root("s")
+            .add_user("hi")
+            .complete(&generator(&base_url), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MiniLLMError::Api { status: 503, .. }),
+            "{err:?}"
+        );
+        assert_eq!(served(&mut captured).len(), 1);
+
+        let (base_url, mut captured) =
+            mock_sequence(vec![(503, DOWN), (503, DOWN), (503, DOWN)]).await;
+        let params = NodeCompletionParameters::new()
+            .with_retry(2)
+            .with_back_off_time(0.0);
+        let err = ChatNode::root("s")
+            .add_user("hi")
+            .complete(&generator(&base_url), Some(&params))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MiniLLMError::MaxRetriesExceeded(_)),
+            "{err:?}"
+        );
+        assert_eq!(served(&mut captured).len(), 3);
+    }
+
+    /// A response rejected by `crash_on_empty_response` was billed, so its cost
+    /// is reported beside the accepted one, and even when the run fails.
+    #[tokio::test]
+    async fn a_rejected_response_is_still_billed() {
+        let (base_url, _captured) = mock_sequence(vec![(200, EMPTY), (200, GOOD)]).await;
+        let params = NodeCompletionParameters::new()
+            .with_crash_on_empty(true)
+            .with_retry(1)
+            .with_back_off_time(0.0);
+        let (result, costs) = ChatNode::root("s")
+            .add_user("hi")
+            .complete_costed(&generator(&base_url), Some(&params))
+            .await;
+        assert_eq!(result.unwrap().text(), Some("hi"));
+        assert_eq!(costs.len(), 2, "{costs:?}");
+
+        let (base_url, _captured) = mock_sequence(vec![(200, EMPTY)]).await;
+        let params = NodeCompletionParameters::new().with_crash_on_empty(true);
+        let (result, costs) = ChatNode::root("s")
+            .add_user("hi")
+            .complete_costed(&generator(&base_url), Some(&params))
+            .await;
+        assert!(matches!(result, Err(MiniLLMError::EmptyResponse)));
+        assert_eq!(costs.len(), 1, "the rejected answer was billed");
+    }
+
+    /// A rejected response followed by a non-retryable error still reports
+    /// the rejected one's cost.
+    #[tokio::test]
+    async fn a_rejected_response_is_billed_when_a_later_attempt_is_refused() {
+        let (base_url, _captured) = mock_sequence(vec![(200, EMPTY), (401, DOWN)]).await;
+        let params = NodeCompletionParameters::new()
+            .with_crash_on_empty(true)
+            .with_retry(1)
+            .with_back_off_time(0.0);
+        let (result, costs) = ChatNode::root("s")
+            .add_user("hi")
+            .complete_costed(&generator(&base_url), Some(&params))
+            .await;
+        assert!(
+            matches!(result, Err(MiniLLMError::Api { status: 401, .. })),
+            "{result:?}"
+        );
+        assert_eq!(costs.len(), 1);
+    }
+
+    /// The cost callback fires once per billed response, rejected ones
+    /// included, at the model's price.
+    #[tokio::test]
+    async fn every_billed_response_fires_the_callback_at_the_models_price() {
+        let (base_url, _captured) = mock_sequence(vec![(200, EMPTY), (200, GOOD)]).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let generator = GeneratorInfo::custom("scripted", &base_url, "m")
+            .with_token_price(TokenPrice::new(1_000_000.0, 1_000_000.0));
+        let params = NodeCompletionParameters::new()
+            .with_crash_on_empty(true)
+            .with_retry(1)
+            .with_back_off_time(0.0)
+            .with_cost_callback(move |info| sink.lock().unwrap().push(info.cost));
+        ChatNode::root("s")
+            .add_user("hi")
+            .complete(&generator, Some(&params))
+            .await
+            .unwrap();
+        // 10 prompt tokens, then 10 + 2, at $1 per token.
+        assert_eq!(*seen.lock().unwrap(), vec![10.0, 12.0]);
+    }
+
+    /// The Anthropic provider looks the model up once, with the generator's own
+    /// headers, and an unset cap goes out as the model's largest. The price is
+    /// given, so the catalog is not read and the test stays offline.
+    #[tokio::test]
+    async fn the_anthropic_lookup_rides_the_requests_headers() {
+        const MODEL: &str = r#"{"id":"claude-x","max_tokens":32000,"capabilities":null}"#;
+        const MESSAGE: &str = r#"{"id":"a","model":"claude-x","content":[{"type":"text","text":"ok"}],
+            "stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":1}}"#;
+        let (base_url, mut captured) =
+            mock_sequence(vec![(200, MODEL), (200, MESSAGE), (200, MESSAGE)]).await;
+        let generator = GeneratorInfo::new("anthropic", &base_url, "claude-x")
+            .with_provider(Arc::new(AnthropicProvider))
+            .with_api_key("k")
+            .with_header("X-Gateway", "g")
+            .with_token_price(TokenPrice::new(1.0, 5.0));
+        for _ in 0..2 {
+            ChatNode::root("s")
+                .add_user("hi")
+                .complete(&generator, None)
+                .await
+                .unwrap();
+        }
+        let requests = served(&mut captured);
+        assert_eq!(requests.len(), 3, "one lookup, two messages");
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/v1/models/claude-x");
+        assert_eq!(requests[0].header("X-Gateway"), Some("g"));
+        assert_eq!(requests[0].header("x-api-key"), Some("k"));
+        assert_eq!(requests[1].path, "/v1/messages");
+        assert_eq!(requests[1].body["max_tokens"], 32000);
+    }
+}
+
+// =============================================================================
+// Every feature, live, on the native Anthropic wire.
+// =============================================================================
+
+mod anthropic_features {
+    use super::*;
+    use minillmlib::{CostResolution, Reasoning};
+
+    fn haiku() -> GeneratorInfo {
+        own_client(GeneratorInfo::anthropic(ANTHROPIC_TEST_MODEL))
+            .with_openrouter_name("anthropic/claude-haiku-4.5")
+    }
+
+    #[tokio::test]
+    async fn tool_calling_round_trip() {
+        require_live!("ANTHROPIC_API_KEY");
+        run_tool_round_trip(&haiku()).await;
+    }
+
+    /// An inline image goes out as an Anthropic image block and is answered.
+    #[tokio::test]
+    async fn an_image_is_seen() {
+        require_live!("ANTHROPIC_API_KEY");
+        // A 1x1 PNG.
+        let pixel = ImageData::from_base64(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+            "image/png",
+        );
+        let user = ChatNode::root("You are terse.").add_user(MessageContent::with_images(
+            "What is this? One word.",
+            &[pixel],
+        ));
+        let params = NodeCompletionParameters::new()
+            .with_params(CompletionParameters::new().with_max_tokens(20));
+        let answer = user
+            .complete(&haiku(), Some(&params))
+            .await
+            .expect("an image completion");
+        assert!(!answer.text().unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test]
+    async fn json_is_parsed_and_repaired() {
+        require_live!("ANTHROPIC_API_KEY");
+        let params = NodeCompletionParameters::new()
+            .with_params(CompletionParameters::new().with_max_tokens(200))
+            .expecting_json()
+            .with_crash_on_refusal(true);
+        let answer = ChatNode::root("Answer with a JSON object only.")
+            .add_user(r#"Give {"city": <a French city>, "population": <a number>}."#)
+            .complete(&haiku(), Some(&params))
+            .await
+            .expect("json completion");
+        let value: serde_json::Value =
+            serde_json::from_str(answer.text().unwrap()).expect("the reply is repaired JSON");
+        assert!(value["city"].is_string(), "{value}");
+    }
+
+    /// A raw stream yields text chunks; a collected stream ends in a node; and
+    /// both stream and plain completions report a resolved cost.
+    #[tokio::test]
+    async fn streaming_and_the_cost_of_a_call() {
+        require_live!("ANTHROPIC_API_KEY");
+        let generator = haiku();
+        let user = ChatNode::root("You are terse.").add_user("Count from 1 to 5.");
+
+        let mut stream = user
+            .complete_streaming(&generator, None)
+            .await
+            .expect("raw stream");
+        let mut chunks = 0;
+        while let Some(chunk) = stream.next_chunk().await {
+            chunk.expect("a chunk");
+            chunks += 1;
+        }
+        assert!(chunks > 1, "the reply arrived in pieces");
+
+        let (result, costs) = user.complete_costed(&generator, None).await;
+        result.expect("plain completion");
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].resolution, CostResolution::Resolved);
+        assert!(costs[0].cost > 0.0);
+
+        let seen: Arc<Mutex<Vec<CostInfo>>> = Arc::default();
+        let sink = seen.clone();
+        let callback: AsyncCostCallback = Arc::new(move |info: CostInfo, _m: CompletionMeta| {
+            let sink = sink.clone();
+            Box::pin(async move { sink.lock().unwrap().push(info) })
+        });
+        let ctx = CompletionContext::new(generator, serde_json::json!({}), callback, "u", "t");
+        user.complete_streaming_collect_tracked(&ctx, None)
+            .await
+            .expect("tracked stream");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].resolution, CostResolution::Resolved);
+        assert!(seen[0].cost > 0.0);
+    }
+
+    /// The estimate, made before the call from the catalog's price, never
+    /// comes in under what the call cost at that price.
+    #[cfg(feature = "estimate")]
+    #[tokio::test]
+    async fn the_estimate_bounds_the_real_cost() {
+        require_live!("ANTHROPIC_API_KEY");
+        let generator = haiku();
+        let user = ChatNode::root("You are terse.").add_user("Name three colours.");
+        let params = CompletionParameters::new().with_max_tokens(64);
+        let estimate = generator
+            .estimate_cost_usd(&user.thread(), &params)
+            .await
+            .expect("priced and bounded");
+        let (result, costs) = user
+            .complete_costed(
+                &generator,
+                Some(&NodeCompletionParameters::new().with_params(params)),
+            )
+            .await;
+        result.expect("completion");
+        assert!(estimate >= costs[0].cost, "{estimate} < {}", costs[0].cost);
+    }
+
+    /// Reasoning unset, off, on, and on at a named effort all go through on a
+    /// model that takes them; an effort the model lacks is refused by the API
+    /// itself, and that refusal is the error.
+    #[tokio::test]
+    async fn reasoning_is_passed_down() {
+        require_live!("ANTHROPIC_API_KEY");
+        let sonnet = own_client(GeneratorInfo::anthropic("claude-sonnet-4-6"));
+        let ask = |reasoning: Option<Reasoning>| {
+            let sonnet = sonnet.clone();
+            async move {
+                let mut params = CompletionParameters::new().with_max_tokens(4000);
+                params.reasoning = reasoning;
+                ChatNode::root("You are terse.")
+                    .add_user("Say OK")
+                    .complete(
+                        &sonnet,
+                        Some(&NodeCompletionParameters::new().with_params(params)),
+                    )
+                    .await
+            }
+        };
+        for reasoning in [
+            None,
+            Some(Reasoning::Off),
+            Some(Reasoning::On(None)),
+            Some(Reasoning::On(Some("high".into()))),
+        ] {
+            ask(reasoning.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{reasoning:?}: {e}"));
+        }
+        let err = ask(Some(Reasoning::On(Some("xhigh".into()))))
+            .await
+            .expect_err("sonnet 4.6 has no xhigh effort");
+        assert!(
+            matches!(err, minillmlib::MiniLLMError::Api { status: 400, .. }),
+            "{err}"
+        );
+    }
+
+    /// A marked prefix is written to the cache once and read after.
+    #[tokio::test]
+    async fn the_cache_marker_writes_then_reads() {
+        require_live!("ANTHROPIC_API_KEY");
+        let generator = haiku();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let big = format!("Session {nonce}. {}", big_system_prompt());
+        let params = NodeCompletionParameters::new()
+            .with_params(CompletionParameters::new().with_max_tokens(5));
+        let mut costs = Vec::new();
+        for ask in ["Say A", "Say B"] {
+            let root = ChatNode::root(big.clone());
+            root.cache_breakpoint();
+            let (result, cost) = root
+                .add_user(ask)
+                .complete_costed(&generator, Some(&params))
+                .await;
+            result.expect("completion");
+            costs.extend(cost);
+        }
+        assert!(costs[0].cache_write_tokens > 0, "{:?}", costs[0]);
+        assert!(costs[1].cache_read_tokens > 0, "{:?}", costs[1]);
+        assert!(
+            costs[1].cost < costs[0].cost,
+            "the read ({}) costs less than the write ({})",
+            costs[1].cost,
+            costs[0].cost
+        );
+    }
 }

@@ -8,7 +8,8 @@
 use super::super::auth::Auth;
 use super::super::response::{error_object, preview_str, CompletionResponse, StreamChunk, Usage};
 use super::super::wire::{
-    kept_cache_breakpoints, price_or_unpriced, CostOutcome, Provider, TokenPrice,
+    kept_cache_breakpoints, price_or_unpriced, CostOutcome, InfoFuture, ModelInfo, ModelLookup,
+    Provider, SideCall, TokenPrice,
 };
 use crate::error::{MiniLLMError, Result};
 use crate::generator::CompletionParameters;
@@ -61,7 +62,7 @@ fn tool_use_block(call: &ToolCall) -> Result<serde_json::Value> {
 /// role=system message), `max_tokens` is required, the response is `content[]`
 /// blocks (not `choices[]`), and usage is `input_tokens`/`output_tokens` (no
 /// dollar cost, price via `TokenPrice`, like OpenAI). Auth is `x-api-key` for an
-/// API key, or `Authorization: Bearer` for a subscription OAuth token.
+/// API key, or `Authorization: Bearer` for an OAuth token.
 #[derive(Debug, Clone, Default)]
 pub struct AnthropicProvider;
 
@@ -69,22 +70,17 @@ pub struct AnthropicProvider;
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 impl AnthropicProvider {
-    /// The message's full text, FAILING LOUDLY on multimodal content (image/audio/
-    /// video) which has no Anthropic mapping wired yet. `all_text()` joins every
-    /// text part, so a multi-text message never silently drops its later parts the
-    /// way `get_text()` (first part only) would. Shared by the turn and system paths.
-    ///
-    /// Multimodal content (image/audio/video parts) has no Anthropic mapping wired
-    /// yet, and Anthropic's block shape differs from the OpenAI-shaped normalized
-    /// parts, so a multimodal message FAILS LOUDLY rather than silently shipping a
-    /// text-only request that drops the attachment. (Wiring Anthropic image/document
-    /// blocks is a clean future extension.)
-    fn text_only(msg: &Message) -> Result<String> {
+    /// A system message's full text, every text part joined. Anthropic's
+    /// `system` field takes text only, so media there fails loudly instead of
+    /// being dropped.
+    fn system_text(msg: &Message) -> Result<String> {
         use crate::message::MessageContent;
         if let MessageContent::Parts(parts) = &msg.content {
             if parts.iter().any(|p| p.as_text().is_none()) {
                 return Err(MiniLLMError::InvalidParameter(
-                    "the Anthropic provider does not yet support multimodal content (image/audio/video/document); send text-only messages or use an OpenAI-wire provider".to_string(),
+                    "Anthropic's system prompt takes text only; put the image or document \
+                     in a user message"
+                        .to_string(),
                 ));
             }
         }
@@ -94,13 +90,15 @@ impl AnthropicProvider {
     /// Map one non-system message to its Anthropic turn: the wire role
     /// (`user`/`assistant`; a tool RESULT is a `user` turn on this wire) plus its
     /// content blocks:
-    /// - assistant `tool_calls` become `tool_use` blocks after any text,
+    /// - the content as text, `image` and `document` blocks ([`content_blocks`]),
+    /// - assistant `tool_calls` become `tool_use` blocks after the content,
     /// - a `Role::Tool` message becomes a `tool_result` block (requiring its
-    ///   `tool_call_id`, failing loudly without one),
+    ///   `tool_call_id`, failing loudly without one), carrying its text, or its
+    ///   blocks when it holds media,
     /// - `cached` puts a `cache_control` marker on the message's last block.
     fn turn_blocks(msg: &Message, cached: bool) -> Result<(&'static str, Vec<serde_json::Value>)> {
         use crate::message::Role;
-        let text = Self::text_only(msg)?;
+        let content = content_blocks(msg)?;
         let mut blocks: Vec<serde_json::Value> = Vec::new();
 
         let role = match msg.role {
@@ -111,24 +109,28 @@ impl AnthropicProvider {
                             .to_string(),
                     ));
                 };
+                let result = if content.iter().all(|b| b["type"] == "text") {
+                    serde_json::json!(msg.content.all_text())
+                } else {
+                    serde_json::json!(content)
+                };
                 blocks.push(serde_json::json!({
                     "type": "tool_result",
                     "tool_use_id": call_id,
-                    "content": text,
+                    "content": result,
                 }));
                 "user"
             }
             role => {
-                // A text block only when there is text OR nothing else to say
-                // (Anthropic rejects empty text blocks, but an all-empty message
-                // still needs a body).
-                if !text.is_empty() || msg.tool_calls.is_none() {
-                    blocks.push(serde_json::json!({ "type": "text", "text": text }));
-                }
+                blocks.extend(content);
                 if let Some(calls) = &msg.tool_calls {
                     for call in calls {
                         blocks.push(tool_use_block(call)?);
                     }
+                }
+                // An all-empty message still needs a body.
+                if blocks.is_empty() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": "" }));
                 }
                 if role == Role::Assistant {
                     "assistant"
@@ -148,140 +150,179 @@ impl AnthropicProvider {
     }
 }
 
-/// How a Claude model takes its thinking configuration. Claude 4.5 and every
-/// earlier generation speak extended thinking only (`thinking: {type:
-/// "enabled", budget_tokens}`); the 4.6 generation takes both, and 4.7 onward
-/// (Opus 4.7, 4.8, 5, Sonnet 5, Fable, Mythos) reject `enabled` and steer
-/// depth with `output_config.effort` under `thinking: {type: "adaptive"}`.
-/// Read off the model id; anything not recognisably 4.5-or-earlier is taken
-/// as adaptive, the direction every newer model goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ThinkingMode {
-    /// `thinking: {type: "enabled", budget_tokens: N}`.
-    Extended,
-    /// `thinking: {type: "adaptive"}` plus `output_config.effort`.
-    Adaptive,
-}
-
-fn thinking_mode(model: &str) -> ThinkingMode {
-    let m = model.to_ascii_lowercase();
-    let extended_only = ["-4-5", "-4-1", "-3-7", "-3-5", "-3-", "-4-20", "-4@"];
-    if extended_only.iter().any(|tag| m.contains(tag)) || m.ends_with("-4") {
-        ThinkingMode::Extended
-    } else {
-        ThinkingMode::Adaptive
-    }
-}
-
-/// The share of `max_tokens` an effort level hands to thinking on a model
-/// that takes a budget rather than an effort: OpenRouter's convention, so a
-/// config reads the same through both wires.
-fn budget_share(effort: &str) -> Result<f64> {
-    Ok(match effort {
-        "minimal" => 0.10,
-        "low" => 0.20,
-        "medium" => 0.50,
-        "high" => 0.80,
-        "xhigh" | "max" => 0.95,
-        other => {
-            return Err(MiniLLMError::InvalidParameter(format!(
-                "unknown reasoning effort `{other}`; one of none, minimal, low, medium, high, xhigh, max"
-            )))
+/// A message's content as Anthropic blocks: each run of text parts as one
+/// `text` block (newline-joined, empty runs left out), each image as an
+/// `image` block and each PDF as a `document` block. Anthropic's API takes no
+/// audio or video, so either fails loudly instead of being dropped.
+fn content_blocks(msg: &Message) -> Result<Vec<serde_json::Value>> {
+    use crate::message::{ContentPart, MessageContent};
+    let parts = match &msg.content {
+        MessageContent::Text(text) if text.is_empty() => return Ok(Vec::new()),
+        MessageContent::Text(text) => {
+            return Ok(vec![serde_json::json!({ "type": "text", "text": text })])
         }
-    })
-}
-
-/// Anthropic's `output_config.effort` vocabulary: `low`, `medium`, `high`,
-/// `xhigh`, `max`. `minimal` has no Anthropic spelling and rounds to `low`.
-fn adaptive_effort(effort: &str) -> Result<&'static str> {
-    Ok(match effort {
-        "minimal" | "low" => "low",
-        "medium" => "medium",
-        "high" => "high",
-        "xhigh" => "xhigh",
-        "max" => "max",
-        other => {
-            return Err(MiniLLMError::InvalidParameter(format!(
-                "unknown reasoning effort `{other}`; one of none, minimal, low, medium, high, xhigh, max"
-            )))
+        MessageContent::Parts(parts) => parts,
+    };
+    let mut blocks = Vec::new();
+    let mut text: Vec<&str> = Vec::new();
+    let flush = |text: &mut Vec<&str>, blocks: &mut Vec<serde_json::Value>| {
+        let joined = text.join("\n");
+        if !joined.is_empty() {
+            blocks.push(serde_json::json!({ "type": "text", "text": joined }));
         }
-    })
-}
-
-/// Anthropic's smallest legal thinking budget.
-const MIN_BUDGET_TOKENS: u32 = 1024;
-
-/// The request keys a [`ReasoningConfig`] becomes on the `/v1/messages` wire.
-///
-/// Off (`effort: "none"`, or nothing set) writes nothing: a Claude model that
-/// can be off is off unless asked, and the models that always think (Fable,
-/// Mythos) reject every spelling of "disabled", so silence is the one answer
-/// that never fails. On, the model's mode decides: an extended-thinking model
-/// gets `thinking: {type: "enabled", budget_tokens}` (an explicit budget, or
-/// the effort's share of `max_tokens`, never under Anthropic's 1024 floor and
-/// always under `max_tokens`, which thinking counts against); an adaptive
-/// model gets `thinking: {type: "adaptive"}` and `output_config.effort`, and
-/// has no budget knob, so a budget with no effort is refused rather than
-/// dropped. `exclude` has no translation here (the response's `display`
-/// setting is a different thing) and is refused too.
-fn thinking_request(
-    model: &str,
-    reasoning: &crate::generator::ReasoningConfig,
-    max_tokens: u32,
-) -> Result<Vec<(&'static str, serde_json::Value)>> {
-    if reasoning.exclude == Some(true) {
-        return Err(MiniLLMError::InvalidParameter(
-            "the Anthropic provider does not translate `reasoning.exclude`; omit it".into(),
-        ));
-    }
-    let effort = reasoning.effort.as_deref();
-    let off =
-        matches!(effort, Some("none")) || (effort.is_none() && reasoning.max_tokens.is_none());
-    if off {
-        return Ok(Vec::new());
-    }
-    match thinking_mode(model) {
-        ThinkingMode::Extended => {
-            let budget = match (reasoning.max_tokens, effort) {
-                (Some(budget), _) => budget,
-                (None, Some(effort)) => (max_tokens as f64 * budget_share(effort)?) as u32,
-                (None, None) => unreachable!("off was handled above"),
-            };
-            let budget = budget.max(MIN_BUDGET_TOKENS);
-            if budget >= max_tokens {
-                return Err(MiniLLMError::InvalidParameter(format!(
-                    "a thinking budget of {budget} tokens needs `max_tokens` above it (thinking \
-                     counts against max_tokens, which is {max_tokens}); raise max_tokens"
-                )));
+        text.clear();
+    };
+    for part in parts {
+        let media = match part {
+            ContentPart::Text { text: t } => {
+                text.push(t);
+                continue;
             }
-            Ok(vec![(
-                "thinking",
-                serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
-            )])
-        }
-        ThinkingMode::Adaptive => {
-            let Some(effort) = effort else {
-                return Err(MiniLLMError::InvalidParameter(format!(
-                    "`{model}` steers thinking by effort, not by a token budget; set \
-                     `reasoning.effort` (low, medium, high, xhigh, max)"
-                )));
-            };
-            Ok(vec![
-                ("thinking", serde_json::json!({ "type": "adaptive" })),
-                (
-                    "output_config",
-                    serde_json::json!({ "effort": adaptive_effort(effort)? }),
-                ),
-            ])
-        }
+            ContentPart::Image { image_url } => serde_json::json!({
+                "type": "image",
+                "source": media_source(&image_url.url, "an image")?,
+            }),
+            ContentPart::File { file } => serde_json::json!({
+                "type": "document",
+                "source": media_source(&file.file_data, "a document")?,
+                "title": file.filename,
+            }),
+            ContentPart::Audio { .. } => {
+                return Err(MiniLLMError::InvalidParameter(
+                    "Anthropic's API takes no audio input; use a provider whose model hears \
+                     audio"
+                        .to_string(),
+                ))
+            }
+            ContentPart::Video { .. } => {
+                return Err(MiniLLMError::InvalidParameter(
+                    "Anthropic's API takes no video input; use a provider whose model watches \
+                     video"
+                        .to_string(),
+                ))
+            }
+        };
+        flush(&mut text, &mut blocks);
+        blocks.push(media);
+    }
+    flush(&mut text, &mut blocks);
+    Ok(blocks)
+}
+
+/// Where a media part's bytes are, in Anthropic's `source` shape: inline
+/// base64 with its media type for a `data:<type>;base64,<data>` URL, else the
+/// URL for Anthropic to fetch. `what` names the part in the error.
+fn media_source(url: &str, what: &str) -> Result<serde_json::Value> {
+    let inline = url
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"));
+    if !inline {
+        return Ok(serde_json::json!({ "type": "url", "url": url }));
+    }
+    let (media_type, data) = url[5..].split_once(";base64,").ok_or_else(|| {
+        MiniLLMError::InvalidParameter(format!(
+            "{what} is a data URL without base64 data; Anthropic takes inline media as base64"
+        ))
+    })?;
+    Ok(serde_json::json!({
+        "type": "base64",
+        "media_type": media_type,
+        "data": data,
+    }))
+}
+
+/// How long a model lookup may take, so a hung one does not hold the requests
+/// waiting on it.
+const INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What Anthropic's Models API (`GET /v1/models/{model}`) says about `model`:
+/// its largest `max_tokens` and its context window. A model it does not know,
+/// or a read that fails, comes back unknown; either is logged once per read.
+/// The read is shared across the process and kept for an hour
+/// ([`SideCall::get_cached`]).
+async fn models_api_info(call: &SideCall, model: &str) -> ModelInfo {
+    if let Err(e) = crate::provider::model_id::validate_model_id(model) {
+        tracing::warn!("cannot look `{model}` up on Anthropic's Models API: {e}");
+        return ModelInfo::default();
+    }
+    let path = format!("/v1/models/{model}");
+    let url = call.url(&path);
+    let id = model.to_string();
+    call.get_cached(&path, INFO_TIMEOUT, move |status, body| {
+        parse_models_api(&id, &url, status, body)
+    })
+    .await
+    // A failure was logged by the read.
+    .unwrap_or_default()
+}
+
+/// The limits in one Models API reply.
+fn parse_models_api(
+    model: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Result<ModelInfo> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        tracing::warn!("Anthropic's Models API does not know `{model}`, so its limits are unknown");
+        return Ok(ModelInfo::default());
+    }
+    if !status.is_success() {
+        return Err(MiniLLMError::Api {
+            status: status.as_u16(),
+            message: format!("{url} answered: {}", preview_str(body)),
+        });
+    }
+    let entry: serde_json::Value = serde_json::from_str(body).map_err(|_| {
+        MiniLLMError::MalformedResponse(format!(
+            "the Models API reply for `{model}` is not JSON: {}",
+            preview_str(body)
+        ))
+    })?;
+    Ok(ModelInfo {
+        price: None,
+        max_output_tokens: tokens(model, &entry, "max_tokens")?,
+        context_length: tokens(model, &entry, "max_input_tokens")?,
+    })
+}
+
+/// A token count from a Models API entry; absent is unknown.
+fn tokens(model: &str, entry: &serde_json::Value, field: &str) -> Result<Option<u32>> {
+    entry[field]
+        .as_u64()
+        .map(|v| {
+            u32::try_from(v).map_err(|_| {
+                MiniLLMError::MalformedResponse(format!(
+                    "the Models API gives `{model}` a {field} of {v}, past what a request can carry"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// The thinking keys a [`Reasoning`](crate::generator::Reasoning) becomes on
+/// this wire: off is `thinking: {type: "disabled"}`; on is adaptive thinking
+/// at `output_config.effort`, `"low"` (Anthropic's lowest) when no effort is
+/// given, else the caller's word as written. Nothing is checked: a model that
+/// does not take it (one that cannot switch thinking off, one that thinks
+/// only on a token budget) refuses at the API.
+fn thinking_keys(
+    reasoning: &crate::generator::Reasoning,
+) -> Vec<(&'static str, serde_json::Value)> {
+    use crate::generator::Reasoning;
+    match reasoning {
+        Reasoning::Off => vec![("thinking", serde_json::json!({ "type": "disabled" }))],
+        Reasoning::On(effort) => vec![
+            ("thinking", serde_json::json!({ "type": "adaptive" })),
+            (
+                "output_config",
+                serde_json::json!({ "effort": effort.as_deref().unwrap_or("low") }),
+            ),
+        ],
     }
 }
 
 impl Provider for AnthropicProvider {
-    fn openrouter_slug(&self) -> Option<&'static str> {
-        Some("anthropic")
-    }
-
     fn endpoint_url(&self, base_url: &str) -> String {
         format!("{}/v1/messages", base_url.trim_end_matches('/'))
     }
@@ -291,9 +332,44 @@ impl Provider for AnthropicProvider {
         4
     }
 
-    /// `x-api-key` for an API key; `Authorization: Bearer` for a subscription
-    /// token. `anthropic-version` is always sent; the `oauth-2025-04-20` beta is
-    /// added on the bearer path (harmless, and future-proofs the OAuth route).
+    /// The model's largest `max_tokens` and context window from Anthropic's
+    /// Models API, and its price from OpenRouter's catalog at Anthropic's own
+    /// rate (Anthropic publishes no prices in its API), read at the same time;
+    /// each source that cannot answer leaves only its own fields unknown. A
+    /// source whose facts the caller does not want is not asked. The catalog
+    /// finds the model as `anthropic/<id>` unless the generator names another
+    /// catalog id.
+    fn model_info(&self, lookup: ModelLookup) -> Option<InfoFuture> {
+        let wanted = lookup.wanted;
+        let catalog_model = lookup
+            .openrouter_name
+            .unwrap_or_else(|| format!("anthropic/{}", lookup.model));
+        let catalog = super::catalog_call(lookup.call.client.clone());
+        Some(Box::pin(async move {
+            let limits = async {
+                match wanted.limits {
+                    true => models_api_info(&lookup.call, &lookup.model).await,
+                    false => ModelInfo::default(),
+                }
+            };
+            let price = async {
+                match wanted.price {
+                    true => super::catalog_info(&catalog, &catalog_model, Some("anthropic")).await,
+                    false => ModelInfo::default(),
+                }
+            };
+            let (limits, price) = futures::future::join(limits, price).await;
+            limits.or(price)
+        }))
+    }
+
+    /// Anthropic refuses a request without `max_tokens`.
+    fn requires_max_tokens(&self) -> bool {
+        true
+    }
+
+    /// `x-api-key` for an API key, `Authorization: Bearer` for a bearer token.
+    /// `anthropic-version` is always sent.
     fn auth_headers(&self, auth: &Auth) -> Result<Vec<(String, String)>> {
         let mut headers = vec![(
             "anthropic-version".to_string(),
@@ -308,7 +384,6 @@ impl Provider for AnthropicProvider {
                     "Authorization".to_string(),
                     format!("Bearer {}", t.expose_secret()),
                 ));
-                headers.push(("anthropic-beta".to_string(), "oauth-2025-04-20".to_string()));
             }
             Auth::None => {}
         }
@@ -316,9 +391,11 @@ impl Provider for AnthropicProvider {
     }
 
     /// Build the `/v1/messages` body: hoist system message(s) to the top-level
-    /// `system` field, map the rest to user/assistant turns, require `max_tokens`
-    /// (Anthropic rejects a request without it, so fall back to the params' default),
-    /// and carry the sampling params Anthropic accepts plus merged `extra`.
+    /// `system` field, map the rest to user/assistant turns, and carry the
+    /// params Anthropic accepts plus merged `extra`. Anthropic requires
+    /// `max_tokens`; a request goes through
+    /// [`GeneratorInfo::request_params`](crate::GeneratorInfo::request_params),
+    /// which fills it, so a body built without one is refused here.
     ///
     /// Prompt caching: a [`Message::cache_breakpoint`] becomes a `cache_control`
     /// marker on that block. Anthropic allows at most 4 breakpoints per request, so
@@ -335,13 +412,18 @@ impl Provider for AnthropicProvider {
     ) -> Result<serde_json::Value> {
         use crate::message::Role;
 
-        // Fail loudly on normalized fields with no Anthropic mapping wired yet,
-        // rather than silently dropping them. Each is a clean future translation,
-        // not a silent "for now" omission.
-        for (present, field) in [(params.response_format.is_some(), "response_format")] {
+        // Fail loudly on settings Anthropic's API has no field for, rather than
+        // silently dropping what the caller asked for.
+        for (present, field) in [
+            (params.response_format.is_some(), "response_format"),
+            (params.seed.is_some(), "seed"),
+            (params.frequency_penalty.is_some(), "frequency_penalty"),
+            (params.presence_penalty.is_some(), "presence_penalty"),
+            (params.repetition_penalty.is_some(), "repetition_penalty"),
+        ] {
             if present {
                 return Err(MiniLLMError::InvalidParameter(format!(
-                    "the Anthropic provider does not yet translate `{field}`; omit it or use an OpenAI-wire provider"
+                    "Anthropic's API has no `{field}`; leave it unset for this provider"
                 )));
             }
         }
@@ -363,10 +445,9 @@ impl Provider for AnthropicProvider {
         for (i, msg) in messages.iter().enumerate() {
             let cached = kept.contains(&i);
             if msg.role == Role::System {
-                // Run the system text through the same all-text + multimodal guard
-                // as a turn, so a multi-text or multimodal system message can't
-                // silently drop content here either.
-                let text = Self::text_only(msg)?;
+                // Every text part is kept; media fails loudly (Anthropic's
+                // `system` takes text only).
+                let text = Self::system_text(msg)?;
                 if !system.is_empty() {
                     system.push('\n');
                 }
@@ -397,13 +478,18 @@ impl Provider for AnthropicProvider {
             })
             .collect();
 
+        let max_tokens = params.max_tokens.ok_or_else(|| {
+            MiniLLMError::InvalidParameter(
+                "Anthropic requires `max_tokens`; build the request from \
+                 `GeneratorInfo::request_params`, which fills it"
+                    .into(),
+            )
+        })?;
         let mut body = serde_json::json!({
             "model": model,
             "messages": turns,
             "stream": stream,
-            // Anthropic REQUIRES max_tokens. The params default (4096) is the floor
-            // when the caller leaves it unset.
-            "max_tokens": params.max_tokens.unwrap_or(4096),
+            "max_tokens": max_tokens,
         });
         if !system.is_empty() {
             // A cached system uses the block-array form so it can carry the marker.
@@ -417,7 +503,7 @@ impl Provider for AnthropicProvider {
                 serde_json::json!(system)
             };
         }
-        // Sampling params Anthropic accepts (it ignores OpenAI-only ones).
+        // The sampling params Anthropic's API has.
         if let Some(t) = params.temperature {
             body["temperature"] = serde_json::json!(t);
         }
@@ -456,10 +542,8 @@ impl Provider for AnthropicProvider {
             body["tool_choice"] = value;
         }
 
-        // Thinking, in the dialect the model speaks (see `thinking_request`).
         if let Some(reasoning) = &params.reasoning {
-            let max_tokens = body["max_tokens"].as_u64().unwrap_or(4096) as u32;
-            for (key, value) in thinking_request(model, reasoning, max_tokens)? {
+            for (key, value) in thinking_keys(reasoning) {
                 body[key] = value;
             }
         }
@@ -499,7 +583,7 @@ impl Provider for AnthropicProvider {
     }
 
     /// Token-only, like OpenAI: derive cost from `TokenPrice` or report `Unpriced`
-    /// (Anthropic returns no dollar amount, on either API-key or subscription auth).
+    /// (Anthropic returns no dollar amount).
     fn cost_of(&self, usage: Usage, price: Option<&TokenPrice>) -> CostOutcome {
         price_or_unpriced(usage, price)
     }
@@ -692,61 +776,29 @@ pub fn parse_anthropic_chunk(data: &str) -> Option<crate::error::Result<StreamCh
     }
 }
 
-// ── Claude subscription credentials ─────────────────────────────────
-
-/// Resolve a Claude **subscription** bearer token, env superseding the on-disk
-/// Claude Code credential.
-///
-/// 1. `ANTHROPIC_AUTH_TOKEN` if set and non-empty (explicit override; the caller
-///    is responsible for keeping it fresh, e.g. from `claude setup-token`);
-/// 2. else the Claude Code credential at `~/.claude/.credentials.json`
-///    (`claudeAiOauth.accessToken`), the live Pro/Max subscription token, which
-///    Claude Code refreshes on disk, so reading it each call always gets a current
-///    token without the library having to manage OAuth refresh.
-///
-/// Returns [`Auth::None`] when neither source yields a token (the request then
-/// fails loudly as unauthenticated, rather than silently using the wrong account).
-pub fn resolve_claude_subscription_auth() -> Auth {
-    if let Ok(token) = std::env::var("ANTHROPIC_AUTH_TOKEN") {
-        if !token.trim().is_empty() {
-            return Auth::BearerToken(secrecy::SecretString::from(token));
-        }
-    }
-    match dirs_home().map(|h| h.join(".claude/.credentials.json")) {
-        Some(path) => match read_claude_code_token(&path) {
-            Some(token) => Auth::BearerToken(secrecy::SecretString::from(token)),
-            None => Auth::None,
-        },
-        None => Auth::None,
-    }
-}
-
-/// The user's home directory (`$HOME`), or `None` if unset.
-fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
-}
-
-/// Extract `claudeAiOauth.accessToken` from a Claude Code credentials file.
-/// Pure over the file contents (the path is read here, parsing is in
-/// [`parse_claude_code_token`]) so the parse is unit-testable without a real file.
-fn read_claude_code_token(path: &std::path::Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    parse_claude_code_token(&contents)
-}
-
-/// Parse the subscription access token out of a Claude Code credentials JSON body.
-fn parse_claude_code_token(contents: &str) -> Option<String> {
-    let json: serde_json::Value = serde_json::from_str(contents).ok()?;
-    json["claudeAiOauth"]["accessToken"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generator::Reasoning;
     use crate::provider::CostResolution;
+
+    impl AnthropicProvider {
+        /// `build_request` as a request makes it, with the cap
+        /// [`GeneratorInfo::request_params`](crate::GeneratorInfo::request_params)
+        /// would fill (64,000 here) when the params set none.
+        fn body(
+            &self,
+            model: &str,
+            messages: &[Message],
+            params: &CompletionParameters,
+            stream: bool,
+            include_usage: bool,
+        ) -> Result<serde_json::Value> {
+            let mut params = params.clone();
+            params.max_tokens = params.max_tokens.or(Some(64_000));
+            self.build_request(model, messages, &params, stream, include_usage)
+        }
+    }
 
     #[test]
     fn definition_anthropic_wire_shape() {
@@ -813,22 +865,18 @@ mod tests {
         assert!(h.iter().any(|(k, _)| k == "anthropic-version"));
         assert!(!h.iter().any(|(k, _)| k == "Authorization"));
 
-        // Subscription bearer → Authorization: Bearer (+ version + oauth beta).
-        let h = p
-            .auth_headers(&Auth::BearerToken("sk-ant-oat01-tok".into()))
-            .unwrap();
+        // Bearer token → Authorization: Bearer (+ version).
+        let h = p.auth_headers(&Auth::BearerToken("tok".into())).unwrap();
         assert!(h
             .iter()
-            .any(|(k, v)| k == "Authorization" && v == "Bearer sk-ant-oat01-tok"));
+            .any(|(k, v)| k == "Authorization" && v == "Bearer tok"));
         assert!(h.iter().any(|(k, _)| k == "anthropic-version"));
-        assert!(h
-            .iter()
-            .any(|(k, v)| k == "anthropic-beta" && v == "oauth-2025-04-20"));
+        assert!(!h.iter().any(|(k, _)| k == "anthropic-beta"));
         assert!(!h.iter().any(|(k, _)| k == "x-api-key"));
     }
 
     #[test]
-    fn anthropic_build_request_hoists_system_and_requires_max_tokens() {
+    fn anthropic_build_request_hoists_system_and_sends_only_what_is_set() {
         let p = AnthropicProvider;
         let messages = vec![
             Message::system("You are terse."),
@@ -838,7 +886,7 @@ mod tests {
         ];
         let params = CompletionParameters::new().with_temperature(0.5);
         let body = p
-            .build_request("claude-haiku-4-5", &messages, &params, false, true)
+            .body("claude-haiku-4-5", &messages, &params, false, true)
             .unwrap();
 
         // System hoisted to top-level, NOT a message.
@@ -848,8 +896,7 @@ mod tests {
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"], "Hi");
         assert_eq!(msgs[1]["role"], "assistant");
-        // max_tokens present (Anthropic requires it); defaults to params default.
-        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["max_tokens"], 64_000);
         assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["model"], "claude-haiku-4-5");
         assert_eq!(body["stream"], false);
@@ -862,9 +909,7 @@ mod tests {
         let params = CompletionParameters::new()
             .with_max_tokens(64)
             .with_stop(vec!["END".to_string()]);
-        let body = p
-            .build_request("m", &messages, &params, true, true)
-            .unwrap();
+        let body = p.body("m", &messages, &params, true, true).unwrap();
         assert_eq!(body["max_tokens"], 64);
         // OpenAI `stop` maps to Anthropic `stop_sequences`.
         assert_eq!(body["stop_sequences"][0], "END");
@@ -879,15 +924,11 @@ mod tests {
         let messages = vec![Message::user("Hi")];
         // `model` collides with a reserved key → loud error.
         let params = CompletionParameters::new().with_extra("model", serde_json::json!("x"));
-        assert!(p
-            .build_request("m", &messages, &params, false, true)
-            .is_err());
+        assert!(p.body("m", &messages, &params, false, true).is_err());
         // A genuinely-extra key is fine.
         let params =
             CompletionParameters::new().with_extra("metadata", serde_json::json!({"user": "u1"}));
-        assert!(p
-            .build_request("m", &messages, &params, false, true)
-            .is_ok());
+        assert!(p.body("m", &messages, &params, false, true).is_ok());
     }
 
     #[test]
@@ -895,7 +936,6 @@ mod tests {
         // EVERY field the rejection loop guards must fail loudly, never be silently
         // dropped. One assertion per field, so removing any entry from the
         // production list fails this test.
-        use crate::generator::ReasoningConfig;
         let p = AnthropicProvider;
         let messages = vec![Message::user("Hi")];
 
@@ -904,200 +944,213 @@ mod tests {
                 "response_format",
                 CompletionParameters::new().with_json_response(),
             ),
+            ("seed", CompletionParameters::new().with_seed(1)),
             (
-                "reasoning.exclude",
-                CompletionParameters::new().with_reasoning(ReasoningConfig {
-                    effort: Some("high".into()),
-                    max_tokens: None,
-                    exclude: Some(true),
-                }),
+                "frequency_penalty",
+                CompletionParameters {
+                    frequency_penalty: Some(0.1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "presence_penalty",
+                CompletionParameters {
+                    presence_penalty: Some(0.1),
+                    ..Default::default()
+                },
+            ),
+            (
+                "repetition_penalty",
+                CompletionParameters {
+                    repetition_penalty: Some(1.1),
+                    ..Default::default()
+                },
             ),
         ];
         for (field, params) in cases {
             assert!(
-                p.build_request("m", &messages, &params, false, true)
-                    .is_err(),
+                p.body("m", &messages, &params, false, true).is_err(),
                 "{field} must fail loudly, not vanish"
             );
         }
     }
 
-    fn reasoning(effort: Option<&str>, budget: Option<u32>) -> CompletionParameters {
-        CompletionParameters::new().with_reasoning(crate::generator::ReasoningConfig {
-            effort: effort.map(str::to_string),
-            max_tokens: budget,
-            exclude: None,
-        })
+    fn reasoning(reasoning: Reasoning) -> CompletionParameters {
+        CompletionParameters::new().with_reasoning(reasoning)
     }
 
-    /// Off never fails and never writes: a model that can be off is off
-    /// unless asked, and the always-on models reject every "disabled".
-    #[test]
-    fn anthropic_reasoning_off_writes_nothing_on_every_model() {
-        let p = AnthropicProvider;
-        let messages = vec![Message::user("Hi")];
-        for model in [
-            "claude-sonnet-4-5",
-            "claude-opus-4-6",
-            "claude-opus-5",
-            "claude-fable-5-1",
-        ] {
-            let body = p
-                .build_request(
-                    model,
-                    &messages,
-                    &reasoning(Some("none"), None),
-                    false,
-                    true,
-                )
-                .unwrap();
-            assert!(body.get("thinking").is_none(), "{model}: {body}");
-            assert!(body.get("output_config").is_none(), "{model}: {body}");
-        }
-    }
+    /// A Models API entry, as the API returned it for claude-haiku-4-5.
+    const HAIKU_ENTRY: &str = r#"{"id":"claude-haiku-4-5-20251001","max_tokens":64000,
+        "max_input_tokens":200000,"capabilities":{"thinking":{"supported":true}}}"#;
 
-    /// An extended-thinking model takes a budget: the effort's share of
-    /// max_tokens, floored at 1024, or the explicit budget verbatim.
+    /// The Models API entry gives the largest `max_tokens` and the context
+    /// window; a missing field stays unknown, and one past what a request can
+    /// carry is malformed.
     #[test]
-    fn anthropic_extended_models_take_a_budget_from_the_effort() {
-        let p = AnthropicProvider;
-        let messages = vec![Message::user("Hi")];
-        // 20% of the 4096 default is 819, under the floor: 1024.
-        let body = p
-            .build_request(
-                "claude-sonnet-4-5",
-                &messages,
-                &reasoning(Some("low"), None),
-                false,
-                true,
-            )
-            .unwrap();
+    fn anthropic_models_api_entry_gives_the_limits() {
+        let entry = serde_json::from_str(HAIKU_ENTRY).unwrap();
+        assert_eq!(tokens("m", &entry, "max_tokens").unwrap(), Some(64_000));
         assert_eq!(
-            body["thinking"],
-            serde_json::json!({ "type": "enabled", "budget_tokens": 1024 })
+            tokens("m", &entry, "max_input_tokens").unwrap(),
+            Some(200_000)
         );
-        assert!(body.get("output_config").is_none());
-        // 50% of 16000.
-        let params = reasoning(Some("medium"), None).with_max_tokens(16000);
-        let body = p
-            .build_request("claude-haiku-4-5", &messages, &params, false, true)
-            .unwrap();
-        assert_eq!(body["thinking"]["budget_tokens"], 8000);
-        // An explicit budget wins.
-        let body = p
+        let silent = serde_json::json!({ "max_tokens": null });
+        assert_eq!(tokens("m", &silent, "max_tokens").unwrap(), None);
+        let huge = serde_json::json!({ "max_tokens": u64::from(u32::MAX) + 1 });
+        assert!(tokens("m", &huge, "max_tokens").is_err());
+    }
+
+    /// A body built without `max_tokens` is refused: the API requires it, and
+    /// a request fills it before it gets here.
+    #[test]
+    fn anthropic_a_body_without_max_tokens_is_refused() {
+        let err = AnthropicProvider
             .build_request(
-                "claude-opus-4-1",
-                &messages,
-                &reasoning(Some("high"), Some(2000)),
-                false,
-                true,
-            )
-            .unwrap();
-        assert_eq!(body["thinking"]["budget_tokens"], 2000);
-        // A budget with no room under max_tokens is refused, not sent to fail.
-        let err = p
-            .build_request(
-                "claude-sonnet-4-5",
-                &messages,
-                &reasoning(None, Some(5000)),
+                "m",
+                &[Message::user("Hi")],
+                &CompletionParameters::new(),
                 false,
                 true,
             )
             .unwrap_err();
-        assert!(err.to_string().contains("raise max_tokens"), "{err}");
+        assert!(err.to_string().contains("requires `max_tokens`"), "{err}");
     }
 
-    /// An adaptive model takes an effort, `minimal` rounded to `low`, and
-    /// refuses a bare budget rather than dropping it.
+    /// Reasoning in Anthropic's spelling: off is `thinking: disabled`; on is
+    /// adaptive thinking at `output_config.effort`, `low` when no effort is
+    /// given and the caller's word as written otherwise. Unset sends nothing.
     #[test]
-    fn anthropic_adaptive_models_take_an_effort() {
+    fn anthropic_reasoning_is_passed_down_in_anthropics_spelling() {
         let p = AnthropicProvider;
         let messages = vec![Message::user("Hi")];
-        for (model, effort, wire) in [
-            ("claude-opus-4-6", "low", "low"),
-            ("claude-opus-4-7", "minimal", "low"),
-            ("claude-sonnet-5", "high", "high"),
-            ("claude-fable-5-1", "max", "max"),
+        let off = p
+            .body("m", &messages, &reasoning(Reasoning::Off), false, true)
+            .unwrap();
+        assert_eq!(off["thinking"], serde_json::json!({ "type": "disabled" }));
+        assert!(off.get("output_config").is_none(), "{off}");
+        for (on, effort) in [
+            (Reasoning::On(None), "low"),
+            (Reasoning::On(Some("max".into())), "max"),
+            (Reasoning::On(Some("not-a-level".into())), "not-a-level"),
         ] {
-            let body = p
-                .build_request(
-                    model,
-                    &messages,
-                    &reasoning(Some(effort), None),
-                    false,
-                    true,
-                )
-                .unwrap();
-            assert_eq!(
-                body["thinking"],
-                serde_json::json!({ "type": "adaptive" }),
-                "{model}"
-            );
-            assert_eq!(body["output_config"]["effort"], wire, "{model}");
+            let body = p.body("m", &messages, &reasoning(on), false, true).unwrap();
+            assert_eq!(body["thinking"], serde_json::json!({ "type": "adaptive" }));
+            assert_eq!(body["output_config"]["effort"], effort);
         }
-        let err = p
-            .build_request(
-                "claude-opus-5",
-                &messages,
-                &reasoning(None, Some(2000)),
-                false,
-                true,
-            )
-            .unwrap_err();
-        assert!(err.to_string().contains("by effort"), "{err}");
-        let err = p
-            .build_request(
-                "claude-opus-5",
-                &messages,
-                &reasoning(Some("loud"), None),
-                false,
-                true,
-            )
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("unknown reasoning effort"),
-            "{err}"
-        );
+        let unset = p
+            .body("m", &messages, &CompletionParameters::new(), false, true)
+            .unwrap();
+        assert!(unset.get("thinking").is_none() && unset.get("output_config").is_none());
     }
 
+    /// Images and PDFs become Anthropic `image` and `document` blocks, in
+    /// order with the text: inline bytes as base64 with their type, a URL as
+    /// a URL for Anthropic to fetch.
     #[test]
-    fn anthropic_thinking_mode_follows_the_generation() {
-        for m in [
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5-20251001",
-            "claude-opus-4-1",
-            "claude-3-7-sonnet",
-            "claude-sonnet-4-20250514",
-            "claude-opus-4",
-        ] {
-            assert_eq!(thinking_mode(m), ThinkingMode::Extended, "{m}");
-        }
-        for m in [
-            "claude-opus-4-6",
-            "claude-sonnet-4-6",
-            "claude-opus-4-7",
-            "claude-opus-4-8",
-            "claude-opus-5",
-            "claude-sonnet-5",
-            "claude-fable-5-1",
-            "claude-mythos-5",
-        ] {
-            assert_eq!(thinking_mode(m), ThinkingMode::Adaptive, "{m}");
-        }
-    }
-
-    #[test]
-    fn anthropic_build_request_fails_loudly_on_multimodal_content() {
-        // A message with an image attachment must error rather than ship a
-        // text-only request that silently drops the image.
-        use crate::message::{ImageData, MessageContent};
+    fn anthropic_sends_images_and_documents_as_blocks() {
+        use crate::message::{ContentPart, DocumentData, ImageData, MessageContent};
         let p = AnthropicProvider;
-        let img = ImageData::from_url("https://example.com/x.png");
-        let mut msg = Message::user("look at this");
-        msg.content = MessageContent::with_images("look at this", &[img]);
-        assert!(p
-            .build_request("m", &[msg], &CompletionParameters::new(), false, true)
-            .is_err());
+        let mut msg = Message::user("");
+        msg.content = MessageContent::Parts(vec![
+            ContentPart::text("compare these"),
+            ContentPart::image(&ImageData::from_bytes(b"png-bytes", "image/png")),
+            ContentPart::image(&ImageData::from_url("https://example.com/x.png")),
+            ContentPart::document(
+                &DocumentData::from_bytes(b"%PDF", "application/pdf").with_filename("report.pdf"),
+            ),
+            ContentPart::document(&DocumentData::from_url("https://example.com/a/spec.pdf")),
+            ContentPart::text("and say which is newer"),
+        ]);
+        let body = p
+            .body("m", &[msg], &CompletionParameters::new(), false, true)
+            .unwrap();
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 6, "{body}");
+        assert_eq!(
+            blocks[0],
+            serde_json::json!({"type": "text", "text": "compare these"})
+        );
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert!(!blocks[1]["source"]["data"].as_str().unwrap().is_empty());
+        assert_eq!(
+            blocks[2]["source"],
+            serde_json::json!({"type": "url", "url": "https://example.com/x.png"})
+        );
+        assert_eq!(blocks[3]["type"], "document");
+        assert_eq!(blocks[3]["source"]["media_type"], "application/pdf");
+        assert_eq!(blocks[3]["title"], "report.pdf");
+        assert_eq!(
+            blocks[4]["source"],
+            serde_json::json!({"type": "url", "url": "https://example.com/a/spec.pdf"})
+        );
+        assert_eq!(blocks[4]["title"], "spec.pdf");
+        assert_eq!(blocks[5]["text"], "and say which is newer");
+    }
+
+    /// Anthropic's API takes no audio or video, and its system prompt takes
+    /// text only: each fails before sending instead of being dropped.
+    #[test]
+    fn anthropic_refuses_what_its_api_cannot_take() {
+        use crate::message::{AudioData, ContentPart, ImageData, MessageContent, Role, VideoData};
+        let p = AnthropicProvider;
+        let with = |part: ContentPart, role: Role| {
+            let mut msg = Message::user("");
+            msg.role = role;
+            msg.content = MessageContent::Parts(vec![ContentPart::text("hi"), part]);
+            p.body("m", &[msg], &CompletionParameters::new(), false, true)
+        };
+        let audio = ContentPart::audio(&AudioData::from_bytes(b"x", "mp3"));
+        let video = ContentPart::video(&VideoData::from_url("https://example.com/v.mp4"));
+        let image = ContentPart::image(&ImageData::from_url("https://example.com/x.png"));
+        for (part, role) in [
+            (audio, Role::User),
+            (video, Role::User),
+            (image, Role::System),
+        ] {
+            let err = with(part, role).unwrap_err();
+            assert!(matches!(err, MiniLLMError::InvalidParameter(_)), "{err}");
+        }
+    }
+
+    /// A tool result holding an image carries it as blocks, and a cache mark
+    /// lands on the message's last block even when that block is media.
+    #[test]
+    fn anthropic_tool_results_carry_media_and_media_takes_the_cache_mark() {
+        use crate::message::{ContentPart, ImageData, MessageContent};
+        let p = AnthropicProvider;
+        let mut result = Message::tool("call_1", "");
+        result.content = MessageContent::Parts(vec![
+            ContentPart::text("the chart"),
+            ContentPart::image(&ImageData::from_url("https://example.com/c.png")),
+        ]);
+        let mut marked = Message::user("");
+        marked.content = MessageContent::Parts(vec![
+            ContentPart::text("look"),
+            ContentPart::image(&ImageData::from_url("https://example.com/y.png")),
+        ]);
+        marked.cache_breakpoint = true;
+        let body = p
+            .body(
+                "m",
+                &[result, marked],
+                &CompletionParameters::new(),
+                false,
+                true,
+            )
+            .unwrap();
+        let blocks = body["messages"][0]["content"].as_array().unwrap();
+        let tool_result = &blocks[0]["content"];
+        assert_eq!(tool_result[0]["text"], "the chart");
+        assert_eq!(tool_result[1]["type"], "image");
+        // The marked user message merges into the same user turn.
+        let last = blocks.last().unwrap();
+        assert_eq!(last["type"], "image");
+        assert_eq!(
+            last["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
     }
 
     #[test]
@@ -1120,7 +1173,7 @@ mod tests {
             MessageContent::Parts(vec![ContentPart::text("sysA"), ContentPart::text("sysB")]);
 
         let body = p
-            .build_request(
+            .body(
                 "m",
                 &[system, user],
                 &CompletionParameters::new(),
@@ -1157,9 +1210,7 @@ mod tests {
             .with_tool(weather_tool().with_strict(true))
             .with_tool_choice(ToolChoice::Required)
             .with_parallel_tool_calls(false);
-        let body = p
-            .build_request("m", &messages, &params, false, true)
-            .unwrap();
+        let body = p.body("m", &messages, &params, false, true).unwrap();
 
         assert_eq!(body["tools"][0]["name"], "get_weather");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
@@ -1178,7 +1229,7 @@ mod tests {
             .with_tool(weather_tool())
             .with_parallel_tool_calls(false);
         let body = p
-            .build_request("m", &[Message::user("hi")], &params, false, true)
+            .body("m", &[Message::user("hi")], &params, false, true)
             .unwrap();
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
@@ -1187,7 +1238,7 @@ mod tests {
             .with_tool(weather_tool())
             .with_parallel_tool_calls(true);
         let body = p
-            .build_request("m", &[Message::user("hi")], &params, false, true)
+            .body("m", &[Message::user("hi")], &params, false, true)
             .unwrap();
         assert!(body.get("tool_choice").is_none());
     }
@@ -1203,7 +1254,7 @@ mod tests {
         )]);
         let messages = vec![Message::user("weather?"), assistant];
         let body = p
-            .build_request("m", &messages, &CompletionParameters::new(), false, true)
+            .body("m", &messages, &CompletionParameters::new(), false, true)
             .unwrap();
 
         let blocks = body["messages"][1]["content"].as_array().unwrap();
@@ -1223,7 +1274,7 @@ mod tests {
         let mut assistant = Message::assistant("");
         assistant.tool_calls = Some(vec![ToolCall::new("tu_1", "get_weather", "{}")]);
         let body = p
-            .build_request(
+            .body(
                 "m",
                 &[Message::user("weather?"), assistant],
                 &CompletionParameters::new(),
@@ -1255,7 +1306,7 @@ mod tests {
             Message::user("thanks, summarize"),
         ];
         let body = p
-            .build_request("m", &messages, &CompletionParameters::new(), false, true)
+            .body("m", &messages, &CompletionParameters::new(), false, true)
             .unwrap();
 
         let turns = body["messages"].as_array().unwrap();
@@ -1282,7 +1333,7 @@ mod tests {
         let mut orphan = Message::tool("x", "result");
         orphan.tool_call_id = None;
         assert!(p
-            .build_request(
+            .body(
                 "m",
                 &[Message::user("hi"), orphan],
                 &CompletionParameters::new(),
@@ -1300,7 +1351,7 @@ mod tests {
         let mut assistant = Message::assistant("");
         assistant.tool_calls = Some(vec![ToolCall::new("tu_1", "t", "{not json")]);
         assert!(p
-            .build_request(
+            .body(
                 "m",
                 &[Message::user("hi"), assistant],
                 &CompletionParameters::new(),
@@ -1325,7 +1376,7 @@ mod tests {
         let p = AnthropicProvider;
         let messages = vec![Message::system("sys"), Message::user("hi")];
         let body = p
-            .build_request("m", &messages, &CompletionParameters::new(), false, true)
+            .body("m", &messages, &CompletionParameters::new(), false, true)
             .unwrap();
         // No marks → system is a plain string, user content is a plain string.
         assert!(body["system"].is_string());
@@ -1340,7 +1391,7 @@ mod tests {
             Message::user("hi"),
         ];
         let body = p
-            .build_request("m", &messages, &CompletionParameters::new(), false, true)
+            .body("m", &messages, &CompletionParameters::new(), false, true)
             .unwrap();
         // Marked system → block-array form carrying cache_control.
         assert_eq!(body["system"][0]["type"], "text");
@@ -1357,7 +1408,7 @@ mod tests {
             Message::user("new"),
         ];
         let body = p
-            .build_request("m", &messages, &CompletionParameters::new(), false, true)
+            .body("m", &messages, &CompletionParameters::new(), false, true)
             .unwrap();
         // Consecutive user messages merge into ONE user turn (Anthropic wants
         // alternating roles); the marked message's block carries cache_control,
@@ -1378,7 +1429,7 @@ mod tests {
             .map(|i| cached_msg(Message::user(format!("turn{i}"))))
             .collect();
         let body = p
-            .build_request("m", &messages, &CompletionParameters::new(), false, true)
+            .body("m", &messages, &CompletionParameters::new(), false, true)
             .unwrap();
         // The 5 consecutive user messages merge into one user turn of 5 text
         // blocks; only the LAST 4 blocks carry cache_control.
@@ -1562,25 +1613,5 @@ mod tests {
             }
             other => panic!("expected Some(Err(Api)), got {other:?}"),
         }
-    }
-
-    // ── Claude subscription credentials ──────────────────────────────
-
-    #[test]
-    fn parses_claude_code_subscription_token() {
-        let body = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-abc",
-            "refreshToken":"sk-ant-ort01-x","subscriptionType":"max"}}"#;
-        assert_eq!(
-            parse_claude_code_token(body).as_deref(),
-            Some("sk-ant-oat01-abc")
-        );
-    }
-
-    #[test]
-    fn missing_or_empty_token_is_none() {
-        assert!(parse_claude_code_token(r#"{"claudeAiOauth":{}}"#).is_none());
-        assert!(parse_claude_code_token(r#"{"claudeAiOauth":{"accessToken":""}}"#).is_none());
-        assert!(parse_claude_code_token("not json").is_none());
-        assert!(parse_claude_code_token(r#"{"other":"shape"}"#).is_none());
     }
 }

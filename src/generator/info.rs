@@ -1,11 +1,18 @@
 //! Generator information - configuration for LLM providers
 
+use crate::error::Result;
 use crate::provider::{
-    AnthropicProvider, AppIdentity, Auth, GenericProvider, OpenAiProvider, OpenRouterProvider,
-    Provider, TokenPrice,
+    AnthropicProvider, AppIdentity, Auth, GenericProvider, ModelInfo, ModelLookup, OpenAiProvider,
+    OpenRouterProvider, Provider, SideCall, TokenPrice, Wanted,
 };
+use reqwest_middleware::ClientWithMiddleware;
 use secrecy::SecretString;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// The output cap a request carries on a wire that requires one when neither
+/// the caller nor the model's info gives one.
+const UNKNOWN_MAX_TOKENS: u32 = 4096;
 
 /// Configuration for an LLM provider/generator
 #[derive(Debug, Clone)]
@@ -20,15 +27,14 @@ pub struct GeneratorInfo {
     pub model: String,
 
     /// The model's id in OpenRouter's catalog, when it differs from [`model`].
-    /// This is what unlocks cost estimation: [`model_rates`] looks the model up
-    /// by this name, falling back to `model` itself (an OpenRouter generator's
-    /// model id already IS the catalog id, so it needs nothing set here). A
-    /// vendor's own id rarely matches the catalog's (Anthropic's
+    /// The built-in providers look a model's price up in that catalog
+    /// ([`model_info`](Self::model_info)) by this name, falling back to `model`
+    /// itself (an OpenRouter generator's model id already IS the catalog id).
+    /// A vendor's own id rarely matches the catalog's (Anthropic's
     /// `claude-haiku-4-5-20251001` is the catalog's `anthropic/claude-haiku-4.5`),
-    /// so a direct-vendor generator sets this to become estimable.
+    /// so a direct-vendor generator sets this to have its price found.
     ///
     /// [`model`]: Self::model
-    /// [`model_rates`]: Self::model_rates
     pub openrouter_name: Option<String>,
 
     /// How this generator authenticates. The provider maps it to concrete headers
@@ -38,27 +44,15 @@ pub struct GeneratorInfo {
     /// Custom headers to include in requests
     pub custom_headers: Vec<(String, String)>,
 
-    /// Whether this provider supports streaming
-    pub supports_streaming: bool,
-
-    /// Whether this provider supports vision/images
-    pub supports_vision: bool,
-
-    /// Whether this provider supports audio input
-    pub supports_audio: bool,
-
-    /// Maximum context length (tokens)
-    pub max_context_length: Option<usize>,
-
     /// Provider implementation: the wire dialect (token-limit key, usage opt-in,
     /// usage parsing, cost aggregation, out-of-band resolution, attribution
     /// headers). Swap this to target a different provider.
     pub provider: Arc<dyn Provider>,
 
-    /// Per-token price for this model, used to derive cost when the provider
-    /// returns token counts but no dollar amount (OpenAI, Anthropic, ...). When
-    /// `None` and the provider has no native cost, cost is reported `Unpriced`.
-    pub token_price: Option<TokenPrice>,
+    /// What you tell the library about the model: its price, its largest
+    /// output, its context window. Whatever you leave unset is looked up
+    /// ([`model_info`](Self::model_info)).
+    pub info: ModelInfo,
 
     /// Calling-app identity for providers that attribute usage to an app (e.g.
     /// OpenRouter rankings). The provider decides which headers express it.
@@ -66,11 +60,6 @@ pub struct GeneratorInfo {
 
     /// Default completion parameters for this generator
     pub default_params: super::CompletionParameters,
-
-    /// The generator's cached view of OpenRouter's published prices for its
-    /// model, behind [`model_rates`](Self::model_rates). Clones share it, so a
-    /// generator kept alive keeps its prices warm instead of refetching per call.
-    pub(crate) prices: super::pricing::PriceCache,
 
     /// A caller-supplied HTTP client. When set, every request made for this
     /// generator (completions, streaming, out-of-band cost queries) goes
@@ -94,15 +83,10 @@ impl GeneratorInfo {
             openrouter_name: None,
             auth: Auth::None,
             custom_headers: Vec::new(),
-            supports_streaming: true,
-            supports_vision: false,
-            supports_audio: false,
-            max_context_length: None,
             provider: Arc::new(GenericProvider::default()),
-            token_price: None,
+            info: ModelInfo::default(),
             app_attribution: None,
             default_params: super::CompletionParameters::default(),
-            prices: super::pricing::PriceCache::default(),
             http_client: None,
         }
     }
@@ -115,8 +99,8 @@ impl GeneratorInfo {
         self
     }
 
-    /// Set the model's OpenRouter catalog id, which unlocks cost estimation when
-    /// the generator's own model id is not already a catalog id (see
+    /// Set the model's OpenRouter catalog id, so its price is found when the
+    /// generator's own model id is not already a catalog id (see
     /// [`openrouter_name`](Self::openrouter_name)).
     pub fn with_openrouter_name(mut self, name: impl Into<String>) -> Self {
         self.openrouter_name = Some(name.into());
@@ -144,10 +128,10 @@ impl GeneratorInfo {
         self
     }
 
-    /// Set the per-token price (USD per million tokens) used to derive cost for
-    /// providers that return token counts but no dollar amount.
+    /// Set the model's per-token price (USD per million tokens), the
+    /// [`info`](Self::info) price, over any looked up.
     pub fn with_token_price(mut self, price: TokenPrice) -> Self {
-        self.token_price = Some(price);
+        self.info.price = Some(price);
         self
     }
 
@@ -165,7 +149,7 @@ impl GeneratorInfo {
         self
     }
 
-    /// Set an OAuth/bearer token (e.g. a Claude subscription token). Always sent
+    /// Set an OAuth/bearer token. Always sent
     /// as `Authorization: Bearer <token>`.
     pub fn with_bearer_token(mut self, token: impl Into<String>) -> Self {
         self.auth = Auth::BearerToken(SecretString::from(token.into()));
@@ -192,39 +176,176 @@ impl GeneratorInfo {
         self
     }
 
-    /// Enable vision support
-    pub fn with_vision(mut self) -> Self {
-        self.supports_vision = true;
-        self
-    }
-
-    /// Enable audio support
-    pub fn with_audio(mut self) -> Self {
-        self.supports_audio = true;
-        self
-    }
-
-    /// Set max context length
-    pub fn with_max_context(mut self, length: usize) -> Self {
-        self.max_context_length = Some(length);
-        self
-    }
-
     /// Set default completion parameters
     pub fn with_default_params(mut self, params: super::CompletionParameters) -> Self {
         self.default_params = params;
         self
     }
 
+    /// The parameters a call with `params` sends: this generator's
+    /// [`default_params`](Self::default_params), with every field the caller
+    /// set taking precedence; and on a wire whose API requires an output cap
+    /// ([`Provider::requires_max_tokens`](crate::Provider::requires_max_tokens)),
+    /// when neither set one, the model's largest
+    /// ([`ModelInfo::max_output_tokens`]), or 4096 when that is unknown. Every
+    /// request goes through here.
+    pub async fn request_params(
+        &self,
+        params: &super::CompletionParameters,
+    ) -> super::CompletionParameters {
+        self.request_params_over(self.client().http(), params, None)
+            .await
+    }
+
+    /// [`request_params`](Self::request_params), with any lookup over
+    /// `client` (the one the request rides) and given up after `deadline`, in
+    /// which case the cap is 4096: a slow lookup never delays a request past
+    /// its own deadline, and it keeps running for the next one.
+    pub(crate) async fn request_params_over(
+        &self,
+        client: &ClientWithMiddleware,
+        params: &super::CompletionParameters,
+        deadline: Option<Duration>,
+    ) -> super::CompletionParameters {
+        let mut sent = self.default_params.merge(params);
+        if sent.max_tokens.is_none() && self.provider.requires_max_tokens() {
+            let largest = match self.info.max_output_tokens {
+                Some(largest) => Some(largest),
+                None => {
+                    let limits = Wanted {
+                        price: false,
+                        limits: true,
+                    };
+                    let lookup = self.model_info_for(client, limits);
+                    match deadline {
+                        None => lookup.await.max_output_tokens,
+                        Some(deadline) => match tokio::time::timeout(deadline, lookup).await {
+                            Ok(info) => info.max_output_tokens,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "looking `{}` up took longer than the request's deadline, \
+                                     so it goes out with max_tokens {UNKNOWN_MAX_TOKENS}",
+                                    self.model
+                                );
+                                None
+                            }
+                        },
+                    }
+                }
+            };
+            sent.max_tokens = Some(largest.unwrap_or(UNKNOWN_MAX_TOKENS));
+        }
+        sent
+    }
+
     /// Supply the HTTP client every request for this generator rides
     /// (completions, streaming, out-of-band cost queries). Accepts a plain
     /// `reqwest::Client` or a `ClientWithMiddleware`.
+    ///
+    /// Without one, the generator uses the crate's shared client
+    /// ([`global_client`](crate::provider::global_client)). If your program
+    /// starts more than one tokio runtime, give each runtime's generators a
+    /// client of their own: a connection belongs to the runtime that opened
+    /// it, so once that runtime shuts down, a shared client fails with
+    /// `MiniLLMError::Http`, whose cause chain ends in "runtime dropped the
+    /// dispatch task". A client you pass replaces the shared one completely,
+    /// including its 600-second limit on a silent connection.
     pub fn with_http_client(
         mut self,
         client: impl Into<reqwest_middleware::ClientWithMiddleware>,
     ) -> Self {
         self.http_client = Some(client.into());
         self
+    }
+
+    /// What the library knows about this generator's model: every field you
+    /// gave in [`info`](Self::info), and the rest from the provider's lookup
+    /// ([`Provider::model_info`](crate::Provider::model_info)), made over this
+    /// generator's client. The lookup's requests are shared across the process
+    /// and kept for an hour ([`SideCall::get_cached`](crate::SideCall::get_cached)),
+    /// so asking again is free. A field nobody can tell stays unknown.
+    pub async fn model_info(&self) -> ModelInfo {
+        self.model_info_for(self.client().http(), Wanted::ALL).await
+    }
+
+    /// The facts in `wanted` that were not given, looked up over `client`,
+    /// with everything given. Nothing is looked up when nothing wanted is
+    /// missing: the price is missing when none was given, the limits when no
+    /// largest output was.
+    pub(crate) async fn model_info_for(
+        &self,
+        client: &ClientWithMiddleware,
+        wanted: Wanted,
+    ) -> ModelInfo {
+        let missing = Wanted {
+            price: wanted.price && self.info.price.is_none(),
+            limits: wanted.limits
+                && (self.info.max_output_tokens.is_none() || self.info.context_length.is_none()),
+        };
+        if !missing.price && !missing.limits {
+            return self.info.clone();
+        }
+        let call = match self.side_call(client) {
+            Ok(call) => call,
+            Err(e) => {
+                tracing::warn!("cannot look `{}` up: {e}", self.model);
+                return self.info.clone();
+            }
+        };
+        let lookup = ModelLookup {
+            call,
+            model: self.model.clone(),
+            openrouter_name: self.openrouter_name.clone(),
+            wanted: missing,
+        };
+        match self.provider.model_info(lookup) {
+            Some(lookup) => self.info.clone().or(lookup.await),
+            None => self.info.clone(),
+        }
+    }
+
+    /// Tell the library about the model (see [`info`](Self::info)): every
+    /// field you set is used as given, over anything set before; the rest is
+    /// looked up.
+    pub fn with_model_info(mut self, info: ModelInfo) -> Self {
+        self.info = info.or(self.info);
+        self
+    }
+
+    /// A deliberately high estimate, in USD, of what one completion will cost,
+    /// or `None` when the model's price, or how much it can produce, is
+    /// unknown. The caller's parameters over the generator's
+    /// [`default_params`](Self::default_params) are priced against
+    /// [`model_info`](Self::model_info), with an unset cap read as the model's
+    /// largest output, else its context window: never below the cap the
+    /// request will carry, whatever a lookup at send time answers. See
+    /// [`estimate_cost_usd`](crate::provider::estimate_cost_usd) for what the
+    /// figure assumes.
+    ///
+    /// If the prompt carries audio or video, set each clip's real length
+    /// (`with_duration`), and give each PDF its page count
+    /// (`with_page_count`): a clip of unstated length is assumed to run a
+    /// minute and a PDF twenty pages, which UNDERSHOOTS anything longer. Those
+    /// and a request that writes the cache are where the figure can come in
+    /// low.
+    #[cfg(feature = "estimate")]
+    pub async fn estimate_cost_usd(
+        &self,
+        messages: &[crate::message::Message],
+        params: &super::CompletionParameters,
+    ) -> Option<f64> {
+        let info = self.model_info().await;
+        crate::provider::estimate_cost_usd(messages, &self.default_params.merge(params), &info)
+    }
+
+    /// Where a side call about this generator's requests goes: over `client`,
+    /// to its address, with its headers.
+    pub(crate) fn side_call(&self, client: &ClientWithMiddleware) -> Result<SideCall> {
+        Ok(SideCall {
+            client: client.clone(),
+            base_url: self.base_url.clone(),
+            headers: crate::provider::client::generator_headers(self)?,
+        })
     }
 
     /// The `LLMClient` requests for this generator go through: the injected
@@ -260,9 +381,10 @@ impl GeneratorInfo {
 
     /// Create an OpenAI generator.
     ///
-    /// OpenAI returns token counts but no dollar cost, so set a
-    /// [`with_token_price`](Self::with_token_price) to get a resolved cost;
-    /// otherwise cost tracking reports `Unpriced`.
+    /// OpenAI returns token counts but no dollar cost, so calls are priced at
+    /// the model's price: the one given with
+    /// [`with_token_price`](Self::with_token_price), else OpenRouter's catalog
+    /// rate for `openai/<model>`.
     pub fn openai(model: impl Into<String>) -> Self {
         Self::new("OpenAI", "https://api.openai.com/v1", model)
             .with_provider(Arc::new(OpenAiProvider))
@@ -272,34 +394,15 @@ impl GeneratorInfo {
     /// Create a native Anthropic generator (`/v1/messages`, `content[]` envelope,
     /// `x-api-key` auth from `ANTHROPIC_API_KEY`).
     ///
-    /// Anthropic returns token counts but no dollar cost, so set a
-    /// [`with_token_price`](Self::with_token_price) for a resolved cost; otherwise
-    /// cost tracking reports `Unpriced`.
+    /// Anthropic returns token counts but no dollar cost, so calls are priced
+    /// at the model's price: the one given with
+    /// [`with_token_price`](Self::with_token_price), else OpenRouter's catalog
+    /// rate, which needs [`with_openrouter_name`](Self::with_openrouter_name)
+    /// since Anthropic's ids are not catalog ids.
     pub fn anthropic(model: impl Into<String>) -> Self {
         Self::new("Anthropic", "https://api.anthropic.com", model)
             .with_provider(Arc::new(AnthropicProvider))
             .with_api_key_from_env("ANTHROPIC_API_KEY")
-    }
-
-    /// Create a Claude **subscription** generator: native Anthropic wire,
-    /// authenticated with a Claude Pro/Max OAuth bearer token so usage draws on
-    /// the **subscription's** rolling quota rather than pay-as-you-go API billing.
-    ///
-    /// The token is resolved by [`crate::resolve_claude_subscription_auth`]: the
-    /// `ANTHROPIC_AUTH_TOKEN` env var supersedes, otherwise the live Claude Code
-    /// credential at `~/.claude/.credentials.json` (which Claude Code keeps
-    /// refreshed) is used. NOTE: a Console/API OAuth token (e.g. from the `ant`
-    /// CLI) bills the API account, NOT the subscription; use an API key via
-    /// [`anthropic`](Self::anthropic) for Console, and this preset only for the
-    /// actual Pro/Max subscription token.
-    ///
-    /// Cost is an ESTIMATE: Anthropic returns only token counts, so set a
-    /// [`with_token_price`](Self::with_token_price) reflecting the model's
-    /// published price for a `Resolved` USD estimate; otherwise `Unpriced`.
-    pub fn claude_subscription(model: impl Into<String>) -> Self {
-        Self::new("Claude (subscription)", "https://api.anthropic.com", model)
-            .with_provider(Arc::new(AnthropicProvider))
-            .with_auth(crate::provider::resolve_claude_subscription_auth())
     }
 
     /// Create a custom URL-based generator
@@ -313,59 +416,209 @@ impl GeneratorInfo {
 }
 
 #[cfg(test)]
-mod estimation_identity_tests {
+mod tests {
     use super::GeneratorInfo;
+    use crate::generator::CompletionParameters;
+    use crate::provider::{
+        CostOutcome, CostResolution, InfoFuture, ModelInfo, ModelLookup, Provider, TokenPrice,
+        Usage, Wanted,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    /// The names cost estimation resolves from live on concepts that already
-    /// exist: the provider impl knows its catalog slug, and the generator knows
-    /// its model's catalog id (defaulting to the model itself).
-    #[test]
-    fn each_vendor_provider_knows_its_own_catalog_slug() {
-        assert_eq!(
-            GeneratorInfo::anthropic("m").provider.openrouter_slug(),
-            Some("anthropic")
-        );
-        assert_eq!(
-            GeneratorInfo::claude_subscription("m")
-                .provider
-                .openrouter_slug(),
-            Some("anthropic"),
-            "a subscription call is still served by Anthropic"
-        );
-        assert_eq!(
-            GeneratorInfo::openai("m").provider.openrouter_slug(),
-            Some("openai")
-        );
+    /// Answers lookups with fixed info, after `delay`, recording what each
+    /// lookup was given; optionally requires a cap like Anthropic.
+    #[derive(Debug, Default)]
+    struct Scripted {
+        lookups: AtomicUsize,
+        seen: Mutex<Vec<(Option<String>, Wanted)>>,
+        requires_cap: bool,
+        delay: Duration,
     }
 
-    /// A router or a custom API is not a vendor the catalog lists, so it claims
-    /// no slug: estimation bounds over every provider serving the model, which is
-    /// exactly where such a call may land.
-    #[test]
-    fn a_router_or_custom_provider_claims_no_slug() {
-        assert_eq!(
-            GeneratorInfo::openrouter("m").provider.openrouter_slug(),
-            None
-        );
-        assert_eq!(
-            GeneratorInfo::custom("n", "u", "m")
-                .provider
-                .openrouter_slug(),
-            None
-        );
+    impl Provider for Scripted {
+        fn model_info(&self, lookup: ModelLookup) -> Option<InfoFuture> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((lookup.openrouter_name.clone(), lookup.wanted));
+            let delay = self.delay;
+            Some(Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                ModelInfo {
+                    price: Some(TokenPrice::new(1.0, 2.0)),
+                    max_output_tokens: Some(100),
+                    context_length: Some(1000),
+                }
+            }))
+        }
+
+        fn requires_max_tokens(&self) -> bool {
+            self.requires_cap
+        }
+
+        fn cost_of(&self, usage: Usage, price: Option<&TokenPrice>) -> CostOutcome {
+            crate::provider::wire::price_or_unpriced(usage, price)
+        }
     }
 
-    /// A vendor's own model id rarely matches the catalog's; setting the catalog
-    /// id is what unlocks estimation. Unset, the model id itself is the lookup.
-    #[test]
-    fn the_openrouter_name_defaults_to_unset_and_is_settable() {
-        let plain = GeneratorInfo::anthropic("claude-haiku-4-5-20251001");
-        assert_eq!(plain.openrouter_name, None);
+    fn scripted(provider: Scripted) -> (GeneratorInfo, Arc<Scripted>) {
+        let provider = Arc::new(provider);
+        let generator =
+            GeneratorInfo::new("t", "http://unused", "a").with_provider(provider.clone());
+        (generator, provider)
+    }
 
-        let estimable = plain.with_openrouter_name("anthropic/claude-haiku-4.5");
-        assert_eq!(
-            estimable.openrouter_name.as_deref(),
-            Some("anthropic/claude-haiku-4.5")
+    fn requiring_cap() -> Scripted {
+        Scripted {
+            requires_cap: true,
+            ..Default::default()
+        }
+    }
+
+    /// The caller's fields win over the generator's defaults, the defaults fill
+    /// what the caller left unset, and what neither set stays unset on a wire
+    /// that requires nothing.
+    #[tokio::test]
+    async fn the_caller_wins_over_the_generator_defaults() {
+        let generator = GeneratorInfo::openai("m").with_default_params(
+            CompletionParameters::new()
+                .with_temperature(0.2)
+                .with_seed(3),
         );
+        let sent = generator
+            .request_params(&CompletionParameters::new().with_temperature(0.9))
+            .await;
+        assert_eq!(sent.temperature, Some(0.9));
+        assert_eq!(sent.seed, Some(3));
+        assert_eq!(sent.max_tokens, None);
+    }
+
+    /// On a wire that requires a cap: the caller's, else the given largest
+    /// output (no lookup), else the looked-up one.
+    #[tokio::test]
+    async fn a_required_cap_is_the_callers_else_the_models() {
+        let (generator, provider) = scripted(requiring_cap());
+        let set = CompletionParameters::new().with_max_tokens(7);
+        assert_eq!(generator.request_params(&set).await.max_tokens, Some(7));
+        let given = generator.clone().with_model_info(ModelInfo {
+            max_output_tokens: Some(50),
+            ..Default::default()
+        });
+        let unset = CompletionParameters::new();
+        assert_eq!(given.request_params(&unset).await.max_tokens, Some(50));
+        assert_eq!(provider.lookups.load(Ordering::SeqCst), 0);
+        assert_eq!(generator.request_params(&unset).await.max_tokens, Some(100));
+    }
+
+    /// A lookup slower than the request's deadline is given up on: the request
+    /// goes out with 4096 at the deadline rather than wait or fail.
+    #[tokio::test]
+    async fn a_slow_lookup_gives_way_to_4096_at_the_deadline() {
+        let (generator, _) = scripted(Scripted {
+            delay: Duration::from_secs(60),
+            ..requiring_cap()
+        });
+        let client = generator.client().http().clone();
+        let started = std::time::Instant::now();
+        let sent = generator
+            .request_params_over(
+                &client,
+                &CompletionParameters::new(),
+                Some(Duration::from_millis(20)),
+            )
+            .await;
+        assert_eq!(sent.max_tokens, Some(4096));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The fields the caller gives win, the rest is looked up, and the lookup
+    /// is told what is still missing and the catalog id; with every field
+    /// given, nothing is looked up.
+    #[tokio::test]
+    async fn given_fields_win_and_the_rest_is_looked_up() {
+        let (generator, provider) = scripted(Scripted::default());
+        let given = generator
+            .clone()
+            .with_openrouter_name("vendor/a")
+            .with_model_info(ModelInfo {
+                max_output_tokens: Some(7),
+                ..Default::default()
+            });
+        let info = given.model_info().await;
+        assert_eq!(info.max_output_tokens, Some(7));
+        assert_eq!(info.price, Some(TokenPrice::new(1.0, 2.0)));
+        let seen = provider.seen.lock().unwrap().clone();
+        assert_eq!(seen[0].0.as_deref(), Some("vendor/a"));
+        assert_eq!(
+            seen[0].1,
+            Wanted::ALL,
+            "the context window is still missing, so the limits are asked for"
+        );
+
+        let enough = generator
+            .with_token_price(TokenPrice::new(3.0, 4.0))
+            .with_model_info(ModelInfo {
+                max_output_tokens: Some(9),
+                context_length: Some(90),
+                ..Default::default()
+            });
+        let info = enough.model_info().await;
+        assert_eq!(
+            info.price,
+            Some(TokenPrice::new(3.0, 4.0)),
+            "with_model_info keeps the price"
+        );
+        assert_eq!(info.context_length, Some(90));
+        assert_eq!(provider.lookups.load(Ordering::SeqCst), 1);
+    }
+
+    /// A provider with no way to look a model up tells only what was given.
+    #[tokio::test]
+    async fn a_provider_without_a_lookup_tells_only_what_was_given() {
+        let generator = GeneratorInfo::custom("n", "http://unused", "m")
+            .with_token_price(TokenPrice::new(1.0, 1.0));
+        let info = generator.model_info().await;
+        assert_eq!(info.price, Some(TokenPrice::new(1.0, 1.0)));
+        assert_eq!(info.max_output_tokens, None);
+    }
+
+    /// A response the provider cannot price on its own is priced at the
+    /// looked-up price, with only the price asked for; one the caller priced
+    /// asks nothing.
+    #[tokio::test]
+    async fn an_unpriced_response_is_priced_at_the_looked_up_price() {
+        let (generator, provider) = scripted(Scripted::default());
+        let response = crate::provider::CompletionResponse {
+            id: "r".into(),
+            model: "a".into(),
+            content: "hi".into(),
+            finish_reason: None,
+            usage: Some(Usage {
+                uncached_input_tokens: 1_000_000,
+                completion_tokens: 1_000_000,
+                ..Default::default()
+            }),
+            tool_calls: None,
+            media: Vec::new(),
+            raw_response: None,
+        };
+        let cost = crate::tracking::cost_for_response(&generator, &response).await;
+        assert_eq!(cost.resolution, CostResolution::Resolved);
+        assert!((cost.cost - 3.0).abs() < 1e-9, "{cost:?}");
+        assert_eq!(
+            provider.seen.lock().unwrap()[0].1,
+            Wanted {
+                price: true,
+                limits: false
+            }
+        );
+
+        let priced = generator.with_token_price(TokenPrice::new(2.0, 2.0));
+        let cost = crate::tracking::cost_for_response(&priced, &response).await;
+        assert!((cost.cost - 4.0).abs() < 1e-9, "{cost:?}");
+        assert_eq!(provider.lookups.load(Ordering::SeqCst), 1);
     }
 }

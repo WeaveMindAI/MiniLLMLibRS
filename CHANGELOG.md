@@ -5,6 +5,132 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-10-18
+
+### Changed
+
+- The Anthropic provider sends images and PDFs, as Anthropic `image` and
+  `document` blocks (inline bytes as base64, a URL for Anthropic to fetch),
+  in user messages and tool results. It used to refuse any media. Audio and
+  video are still refused, since Anthropic's API takes neither, and so is
+  media in a system message.
+- The library sends only what you set. `CompletionParameters::default()`
+  used to send `temperature: 0.7` and `max_tokens: 4096` on every request
+  that did not set them. Now an unset field is not sent and the provider's
+  own default applies. Set `with_temperature` or
+  `with_max_tokens` if you relied on the old values.
+- `max_tokens` counts everything the model writes, reasoning included, which
+  is how OpenAI, Anthropic and OpenRouter all count their cap. Unset, nothing
+  is sent, except on Anthropic, whose API requires a cap: it gets the model's
+  largest output, or 4096 when that is unknown.
+- `Reasoning` replaces `ReasoningConfig`: unset (nothing sent), `Off`, or
+  `On(effort)`, where `None` is a low effort and `Some("high")` is sent as
+  written. Nothing is checked; a model that cannot do it refuses at the API.
+  `Off` is now sent on OpenAI (`reasoning_effort: "none"`) and Anthropic
+  (`thinking: disabled`), where 0.5.11 wrote nothing, so a model that always
+  reasons, or never does, refuses it. The budget translation for Claude 4.5
+  and earlier is gone: send `thinking` through `with_extra`. `Provider::openai_reasoning_value` is now
+  `openai_reasoning_field`, which returns the key and the value. For each
+  provider's spelling, see the parameters chapter.
+- What the library knows about a model is one `ModelInfo` (price, largest
+  output, context window), used the same way for every provider: to estimate
+  a call, to bill a call that returns only token counts, and to fill the cap
+  Anthropic requires. Give what you know with `GeneratorInfo::with_model_info`
+  or `with_token_price`; the provider looks up the rest through the new
+  `Provider::model_info`, and `GeneratorInfo::model_info` returns it. A
+  looked-up price now bills too: OpenAI and Anthropic calls are priced from
+  OpenRouter's catalog when you give no price (an OpenAI model is found as
+  `openai/<model>`; an Anthropic one is tried as `anthropic/<model>`, which
+  usually misses, so give its catalog id with `with_openrouter_name`). For where
+  each provider looks, see the cost estimation chapter.
+- Model lookups go through the new `SideCall::get_cached(path, timeout,
+  parse)`. Each lookup is shared by the whole program and kept for an
+  hour after a success or a 404. Any other reply is not kept, and a source
+  that does not answer is asked again after a minute. A request looks up
+  only the cap it needs, and billing looks up only the price. A lookup never
+  fails a request: whatever it cannot find stays unknown, with a warning. If
+  the lookup takes longer than half the request's timeout, the request goes
+  out with 4096 and keeps the other half. A custom provider can read
+  OpenRouter's catalog with `provider::catalog_info` and `catalog_call`.
+- The default client no longer cuts a request off after 600 seconds in
+  total, which killed any stream longer than ten minutes. It now fails a
+  connection after 600 seconds of silence.
+- On Anthropic, `with_bearer_token` sends only `Authorization: Bearer`; it no
+  longer adds the `anthropic-beta: oauth-2025-04-20` header.
+- `provider::openai_wire` exposes its request builder and usage parsers
+  (`openai_build_request`, `openai_reasoning_field`, `parse_openai_usage`,
+  `parse_openai_usage_field`, `usage_field`), so a custom provider can reuse
+  them.
+- `provider::kept_cache_breakpoints` is public, so a custom `build_request`
+  that writes cache markers can honour `max_cache_breakpoints`.
+- The estimate counts tool definitions, and the tool calls already in the
+  conversation, as input (both were priced at zero).
+- Anthropic now refuses `seed` and the three penalties, which its API has no
+  field for, the way it already refused `response_format`, instead of
+  dropping them silently.
+- `Provider::resolve_post_stream` is now `usage_out_of_band`: it returns the
+  generation's usage, and the cost is worked out from it like any other
+  usage. Its context, `PostStreamCtx`, is now `UsageQuery` and no longer
+  carries a price.
+- The `_tracked` methods refuse a cost callback (they report to their
+  `CompletionContext`); they used to drop it without a word.
+- `GeneratorInfo::estimate_cost_usd` returns `Option<f64>`: `None` when the
+  model's price, or how much it can write, is unknown. The free function
+  `estimate_cost_usd` takes a `ModelInfo`.
+- `Provider::requires_max_tokens` (new) declares a wire whose API refuses a
+  request without a cap; the generator fills it.
+- `GeneratorInfo::request_params` (new, async) returns the parameters a call
+  sends: the generator's `default_params` under the caller's, plus the
+  required cap. Every request goes through it, including direct `LLMClient`
+  calls, which used to ignore `default_params`.
+- `NodeCompletionParameters::retry` defaults to 0: a failed request is not
+  repeated unless you ask (`with_retry(n)`). It used to retry 4 times, each
+  a new paid request. With no retries a failure is the attempt's own error;
+  `MaxRetriesExceeded` wraps the last one only when retries happened. With
+  retries on, a negative, infinite, NaN or too-large backoff is now an error
+  instead of a panic.
+- Every billed response is reported. A response rejected by
+  `crash_on_empty_response` or `crash_on_refusal` was billed, so the cost
+  callback fires for it and the tracked paths report it; `complete_costed`
+  returns one `CostInfo` per billed request (a `Vec`, was an `Option`), also
+  when the completion fails. `complete_streaming`, whose raw stream reports
+  no cost, refuses a cost callback. `TrackedStream::reject` is gone: a
+  streamed response that was billed is booked, like a rejected non-streaming
+  one.
+- An image of declared size is estimated at the higher of OpenAI's tile price
+  and Anthropic's pixel price (width x height / 750, up to 1,600), so a Claude
+  model no longer comes in under the estimate.
+- `NodeCompletionParameters::params` is a plain `CompletionParameters` (was
+  `Option`). `with_params` is unchanged.
+- `ProviderSettings` is now `OpenRouterRouting`, and lives with the
+  OpenRouter provider.
+- New error variants: `SideRequest` (a side request failed, shared by every
+  caller waiting on it) and `Internal` (a side request that panicked, or whose
+  runtime shut down under it).
+
+### Removed
+
+- `GeneratorInfo::claude_subscription` and `resolve_claude_subscription_auth`,
+  because Anthropic's usage policy no longer allows a Claude Pro/Max
+  subscription in a library like this one. Use `GeneratorInfo::anthropic` with
+  an API key.
+- `Auth::is_some`: match on `Auth::None` instead.
+- `CompletionContext::is_byok`: the library never reads your metadata, so
+  read `"isByok"` from `ctx.meta` yourself.
+- `GeneratorInfo::model_rates`, `model_rates_served_by`, `pricing_key`,
+  `ModelRates`, `ProviderSettings::billing_provider` and
+  `Provider::openrouter_slug`: prices are part of `ModelInfo`, looked up by
+  each provider. An OpenRouter model's looked-up price (used for estimates,
+  and to bill a call only when OpenRouter reports no cost) is the dearest
+  rate of any provider serving it; routing settings are not read.
+- `GeneratorInfo::token_price`: the price lives in `GeneratorInfo::info`.
+- `NodeCompletionParameters::token_price` and its `with_token_price`: a
+  model has one price, on its generator; if some calls need another price,
+  clone the generator and give the clone that price.
+- `GeneratorInfo::supports_streaming`, `supports_vision`, `supports_audio`,
+  `max_context_length`, and `with_vision`, `with_audio`, `with_max_context`:
+  nothing read them.
+
 ## [0.5.11] - 2026-09-06
 
 ### Changed
@@ -30,7 +156,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New `Provider::openai_reasoning_value` hook for OpenAI-wire providers
     with their own dialect.
 
-
+## [0.5.10] - 2026-08-27
 
 ### Fixed
 

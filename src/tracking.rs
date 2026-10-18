@@ -10,6 +10,7 @@
 
 use crate::generator::GeneratorInfo;
 use crate::provider::CostInfo;
+use crate::provider::Wanted;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -53,30 +54,11 @@ impl CompletionContext {
         }
     }
 
-    /// Detect whether this is a BYOK (Bring Your Own Key) setup.
-    /// Reads "isByok" from the metadata JSON (defaults to false if absent).
-    pub fn is_byok(&self) -> bool {
-        self.meta
-            .get("isByok")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    }
-
     /// Fire the cost callback. Called internally by complete_tracked().
     /// Also available publicly for testing or manual cost reporting.
     pub async fn report_cost(&self, cost_info: CostInfo) {
         let fut = (self.callback)(cost_info, self.meta.clone());
         fut.await;
-    }
-
-    /// Derive the cost for a completed response (typed usage, or backoff
-    /// generation-cost query when absent). The single decision shared with the
-    /// streaming path; reports `Unknown` rather than a fake $0 when unresolvable.
-    pub(crate) async fn cost_for_response(
-        &self,
-        response: &crate::provider::CompletionResponse,
-    ) -> CostInfo {
-        cost_for_response(&self.generator, response).await
     }
 }
 
@@ -96,11 +78,6 @@ pub struct TrackedStream {
     /// Cost has been reported (`report_cost`/`cancel`): suppresses the Drop
     /// fallback and makes `report_cost` idempotent.
     cost_reported: bool,
-    /// The caller explicitly rejected this completion (`reject`): Drop books
-    /// nothing. The ONLY way to legitimately drop a `TrackedStream` without
-    /// booking cost; otherwise a dropped, un-reported stream books (so a
-    /// forgotten `report_cost` can't silently lose an accepted generation's cost).
-    rejected: bool,
 }
 
 /// How a [`TrackedStream::collect_or_cancel`] drain ended. Cost reporting has
@@ -132,7 +109,6 @@ impl TrackedStream {
             meta: ctx.meta.clone(),
             generator: ctx.generator.clone(),
             cost_reported: false,
-            rejected: false,
         }
     }
 
@@ -153,10 +129,9 @@ impl TrackedStream {
     /// switch: racing the chunks yourself and forgetting `cancel().await` on
     /// the kill path would silently lose the interrupted call's cost.
     ///
-    /// Unlike [`collect`](Self::collect) + [`report_cost`](Self::report_cost),
-    /// the finished cost is booked BEFORE the caller sees the content: use
-    /// this when the call must be paid for regardless of content quality
-    /// (metering), not when the caller may still [`reject`](Self::reject).
+    /// The finished cost is booked before the caller sees the content, the
+    /// same as [`collect`](Self::collect) then
+    /// [`report_cost`](Self::report_cost).
     pub async fn collect_or_cancel(
         mut self,
         interrupt: impl std::future::Future<Output = ()>,
@@ -191,10 +166,10 @@ impl TrackedStream {
         CollectOutcome::Finished(response)
     }
 
-    /// Drain the stream and return the typed response. Does NOT report cost, so
-    /// the caller can post-process (and reject empty/invalid) the content before
-    /// any cost is booked, mirroring the non-streaming order. Call
-    /// [`report_cost`](Self::report_cost) afterwards.
+    /// Drain the stream and return the typed response. Does NOT report cost:
+    /// call [`report_cost`](Self::report_cost) afterwards, or let the drop
+    /// book it. A billed response is booked whatever its content, like a
+    /// rejected non-streaming one.
     pub async fn collect(&mut self) -> crate::error::Result<crate::provider::CompletionResponse> {
         while let Some(result) = self.inner.next_chunk().await {
             result?;
@@ -203,7 +178,7 @@ impl TrackedStream {
     }
 
     /// Report cost for an already-collected response: from typed usage when
-    /// present, otherwise via the shared backoff generation-cost resolver. Marks
+    /// present, otherwise from the provider's own record of it. Marks
     /// the stream reported so Drop does not re-report. Idempotent: a second call
     /// is a no-op (the callback is the money sink; reporting twice would double-book).
     pub async fn report_cost(&mut self, response: &crate::provider::CompletionResponse) {
@@ -217,7 +192,7 @@ impl TrackedStream {
     }
 
     /// Settle the cost of a cancelled (un-collected) stream and report it,
-    /// **awaiting** the resolution (which may include a backoff out-of-band query)
+    /// **awaiting** the resolution (which may include an out-of-band query)
     /// on the caller's runtime.
     ///
     /// This is the explicit, reliable cancellation path: prefer it over just
@@ -248,16 +223,6 @@ impl TrackedStream {
         self.cost_reported = true; // suppress the Drop fallback
     }
 
-    /// Explicitly reject this completion: book NO cost and suppress the Drop
-    /// fallback. The deliberate "this completion was unacceptable, don't pay for
-    /// it" path (mirrors the non-streaming `crash_on_empty`/`crash_on_refusal`
-    /// behavior). This is the ONLY way to drop a `TrackedStream` without booking
-    /// cost: a plain drop of an un-reported stream books, so forgetting to report
-    /// can't silently lose an accepted generation's cost.
-    pub fn reject(mut self) {
-        self.rejected = true;
-    }
-
     /// Check if the stream has finished
     pub fn is_finished(&self) -> bool {
         self.inner.is_finished()
@@ -276,9 +241,8 @@ impl TrackedStream {
 
 impl Drop for TrackedStream {
     fn drop(&mut self) {
-        // Already reported (report_cost/cancel) or explicitly rejected (reject):
-        // nothing to book. These are the only two ways to drop without booking.
-        if self.cost_reported || self.rejected {
+        // Already reported (report_cost/cancel): nothing more to book.
+        if self.cost_reported {
             return;
         }
 
@@ -305,7 +269,7 @@ impl Drop for TrackedStream {
         // Any other drop (whether the stream was fully drained because the consumer
         // forgot to report, or cancelled mid-flight) is an accepted/used generation
         // whose cost has NOT been reported. We must book it, not silently lose it.
-        // Drop can't await the (possibly multi-second, backoff) settle, so this is
+        // Drop can't await the (possibly multi-second) settle, so this is
         // a best-effort detached task that can be cancelled if the runtime shuts
         // down first; that risk is logged LOUDLY. Callers wanting a guarantee use
         // `cancel().await` (cancellation) or `report_cost().await` (normal end).
@@ -326,12 +290,12 @@ impl Drop for TrackedStream {
         // most of which complete fine. The LOUD signal is reserved for an actual
         // loss (the LostGuard below), so it can't cry wolf.
         tracing::debug!(
-            "TrackedStream for {} dropped without report_cost()/cancel()/reject(); settling cost on a detached task",
+            "TrackedStream for {} dropped without report_cost()/cancel(); settling cost on a detached task",
             response.id
         );
         handle.spawn(async move {
             // If this task is cancelled before booking (e.g. the runtime shuts down
-            // during the backoff/HTTP in resolve_post_stream), the guard's Drop
+            // during the out-of-band usage query), the guard's Drop
             // fires the LOUD loss log. On success we disarm it after the callback.
             let mut guard = LostCostGuard::new(response.id.clone());
             let cost_info = cost_for_response(&generator, &response).await;
@@ -370,36 +334,71 @@ impl Drop for LostCostGuard {
 }
 
 /// Derive the cost for a completed response. The single owner of the
-/// "response -> CostInfo" decision, used by every enforced-tracking path. All
-/// provider-specific knowledge (cost aggregation, out-of-band resolution) lives
-/// behind `generator.provider`; this function only routes:
-/// - usage present  -> `accounting.cost_of(usage, price)` (native cost, or
-///   token×price, or `Unpriced`),
-/// - usage absent    -> `accounting.resolve_post_stream(...)` (the provider's
-///   own out-of-band query, or `Unknown` if it has none).
+/// "response -> CostInfo" decision, used by every path that reports cost:
+/// - the usage is the response's own, else the provider's record of it
+///   ([`Provider::usage_out_of_band`](crate::Provider::usage_out_of_band));
+///   with neither, the cost is `Unknown`;
+/// - the provider prices it ([`Provider::cost_of`](crate::Provider::cost_of)):
+///   its own reported cost, else the tokens at the model's price, else
+///   `Unpriced`.
+///
+/// The model's price is the one you gave, else the one its provider looks up
+/// ([`GeneratorInfo::model_info`]). The lookup happens only for usage the
+/// provider could not price on its own, so a provider that reports its own
+/// cost (OpenRouter) never waits on it.
 pub(crate) async fn cost_for_response(
     generator: &GeneratorInfo,
     response: &crate::provider::CompletionResponse,
 ) -> CostInfo {
-    let price = generator.token_price.as_ref();
-    let outcome = match &response.usage {
-        Some(usage) => generator.provider.cost_of(usage.clone(), price),
-        None => {
-            // The out-of-band query rides the GENERATOR's client, the same
-            // one the call it resolves rode: an injected client's routing
-            // sees the follow-up too, never a second side-channel client.
-            let client = generator.client();
-            let ctx = crate::provider::PostStreamCtx {
-                client: client.http().clone(),
-                base_url: &generator.base_url,
-                generation_id: &response.id,
-                auth: &generator.auth,
-                price,
-            };
-            generator.provider.resolve_post_stream(ctx).await
+    let usage = match &response.usage {
+        Some(usage) => Some(usage.clone()),
+        None => usage_out_of_band(generator, &response.id).await,
+    };
+    let outcome = match usage {
+        None => crate::provider::CostOutcome::unknown(),
+        Some(usage) => {
+            let given = generator.info.price.clone();
+            let outcome = generator.provider.cost_of(usage.clone(), given.as_ref());
+            let unpriced = outcome.resolution == crate::provider::CostResolution::Unpriced;
+            if unpriced && given.is_none() {
+                let price = Wanted {
+                    price: true,
+                    limits: false,
+                };
+                let found = generator
+                    .model_info_for(generator.client().http(), price)
+                    .await
+                    .price;
+                generator.provider.cost_of(usage, found.as_ref())
+            } else {
+                outcome
+            }
         }
     };
     outcome.into_cost_info(response.model.clone(), response.id.clone())
+}
+
+/// The provider's record of a generation's usage, asked over the generator's
+/// client (an injected client's routing sees the follow-up too).
+async fn usage_out_of_band(
+    generator: &GeneratorInfo,
+    generation_id: &str,
+) -> Option<crate::provider::Usage> {
+    match generator.side_call(generator.client().http()) {
+        Ok(call) => {
+            let ctx = crate::provider::UsageQuery {
+                call,
+                generation_id,
+            };
+            generator.provider.usage_out_of_band(ctx).await
+        }
+        // The headers that failed here failed the request first; there is
+        // nothing to ask with.
+        Err(e) => {
+            tracing::error!("cannot query the usage of {generation_id}: {e}");
+            None
+        }
+    }
 }
 
 impl std::fmt::Debug for CompletionContext {
@@ -408,7 +407,6 @@ impl std::fmt::Debug for CompletionContext {
             .field("generator", &self.generator.name)
             .field("model", &self.generator.model)
             .field("meta", &self.meta)
-            .field("is_byok", &self.is_byok())
             .finish()
     }
 }
@@ -454,14 +452,6 @@ mod tests {
         assert_eq!(captured.len(), 1);
         assert!((captured[0].0.cost - 0.001).abs() < 1e-9);
         assert_eq!(captured[0].1["userId"], "u1");
-    }
-
-    #[test]
-    fn is_byok_reads_metadata() {
-        let (byok, _) = capturing_context(serde_json::json!({"isByok": true}));
-        assert!(byok.is_byok());
-        let (not_byok, _) = capturing_context(serde_json::json!({}));
-        assert!(!not_byok.is_byok());
     }
 
     #[tokio::test]
@@ -625,23 +615,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_reject_books_nothing() {
-        // The deliberate "unacceptable completion, don't pay" path.
-        let (ctx, log) = capturing_context(serde_json::json!({}));
-        drained_stream(&ctx).await.reject();
-        for _ in 0..3 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "an explicitly rejected stream must not book cost"
-        );
-    }
-
-    #[tokio::test]
     async fn drained_then_dropped_without_report_still_books_cost() {
         // Forgetting to report on an accepted (fully-drained) stream must NOT
-        // silently lose the cost: Drop books it (only reject() opts out).
+        // silently lose the cost: Drop books it.
         let (ctx, log) = capturing_context(serde_json::json!({}));
         {
             let _tracked = drained_stream(&ctx).await; // dropped here, un-reported

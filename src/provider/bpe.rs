@@ -276,11 +276,6 @@ mod tests {
         assert!(count_tokens("café über naïve") > 0);
     }
 
-    /// The split pattern does not bound the length of a symbol run, so a prompt of
-    /// nothing but punctuation arrives here as ONE piece. A merge loop that
-    /// re-hashed every pair on every step would take seconds on it, which turns a
-    /// crafted prompt into a way to stall the caller before any model is reached.
-    /// The cached pair ranks keep it linear enough to be uninteresting.
     #[test]
     fn a_pathological_single_piece_does_not_blow_up() {
         // The split pattern does not bound a piece's length, so a prompt of nothing
@@ -289,24 +284,34 @@ mod tests {
         // stall the caller: the old one took 4.5 seconds on 100 KB.
         //
         // Asserting a wall-clock budget would only measure the machine. Assert the
-        // SHAPE instead: quadrupling the input must not multiply the time by
-        // sixteen. A generous factor of six still fails a return to quadratic while
-        // tolerating a loaded, unoptimised debug build.
-        let time = |n: usize| {
-            let piece = "!".repeat(n);
+        // SHAPE instead: eight times the input must not multiply the time by
+        // sixty-four. The merge is heap-based, n log n, which predicts about ten;
+        // a limit of twenty-four sits far from both, so it fails a return to
+        // quadratic while tolerating a loaded, unoptimised debug build.
+        //
+        // Each size is timed as the fastest of several runs, and the runs of the
+        // two sizes alternate. A run the scheduler preempted is slower than the
+        // work, never faster, so the minimum is the closest reading of the work
+        // itself; alternating puts both sizes under the same load. Measured
+        // under heavy load, a 4x gap with a limit of six left too little room.
+        let once = |piece: &str| {
             let start = std::time::Instant::now();
-            assert!(count_tokens(&piece) > 0);
+            assert!(count_tokens(piece) > 0);
             start.elapsed()
         };
+        let (small_piece, large_piece) = ("!".repeat(5_000), "!".repeat(40_000));
 
         // Warm the vocabulary and the regex so neither is charged to the first run.
-        time(1_000);
+        once(&"!".repeat(1_000));
 
-        let small = time(10_000);
-        let large = time(40_000);
+        let (mut small, mut large) = (std::time::Duration::MAX, std::time::Duration::MAX);
+        for _ in 0..7 {
+            small = small.min(once(&small_piece));
+            large = large.min(once(&large_piece));
+        }
         assert!(
-            large < small * 6,
-            "4x the input took {large:?} vs {small:?}: the merge went quadratic"
+            large < small * 24,
+            "8x the input took {large:?} vs {small:?}: the merge went quadratic"
         );
     }
 }

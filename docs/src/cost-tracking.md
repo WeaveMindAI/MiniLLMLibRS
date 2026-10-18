@@ -1,36 +1,37 @@
 # Cost Tracking
 
-The library tracks usage and cost per request, and is honest about when a cost is
-actually known.
+The library reports what each request cost, and says so when it does not know.
 
 ## Token buckets
 
-Input tokens are split into three **disjoint, additive** buckets so caching is
-priced correctly across every provider's differing wire conventions:
+Input tokens are split into three buckets that never overlap, so each token is
+priced once, at its own rate, whatever the provider:
 
 - `uncached_input_tokens`: full-price prompt tokens,
 - `cache_read_tokens`: served from a warm cache (cheap),
 - `cache_write_tokens`: written to the cache this request (a premium).
 
-Total input is the sum of the three; cost is a clean weighted sum, no subtraction.
+These are the fields of `Usage`, on `CompletionResponse::usage`. A `CostInfo`
+carries `cache_read_tokens`, `cache_write_tokens` and `prompt_tokens`, which is
+the sum of all three, so the uncached count is `prompt_tokens` minus the other
+two. The cost is each bucket times its rate, plus the output tokens times the
+output rate.
 
-## Resolution: never a fake $0
+## Resolution: whether the cost is known
 
 Every reported `CostInfo` carries a `CostResolution`:
 
 | Resolution | Meaning |
 |---|---|
-| `Resolved` | The USD cost is authoritative (native, or tokens × a configured `TokenPrice`) |
-| `Unpriced` | Tokens are real, but no native cost and no `TokenPrice` was set. `cost` is `0.0` but must NOT be treated as a free request. Set a `TokenPrice` to resolve it. |
-| `Unknown` | Cost could not be determined at all (no usage, and any out-of-band query failed) |
+| `Resolved` | The USD cost is real: the provider's own figure, or the tokens at the model's price (yours, or the one looked up) |
+| `Unpriced` | Tokens are real, but the provider returned no dollar amount and the model's price is unknown (none given, none found in the catalog). `cost` is `0.0` but must NOT be treated as a free request. Give the price (`with_token_price`), or, on OpenAI or Anthropic, the catalog id (`with_openrouter_name`) so it can be looked up. |
+| `Unknown` | Cost could not be worked out at all: no usage came back, and asking the provider afterwards (only OpenRouter can be asked) found none |
 
 Check `resolution` before trusting `cost`.
 
 ## The reply and the bill together: `complete_costed`
 
-The simplest tracked shape, and the right default when the caller itself acts
-on the cost (settles a budget hold, gates the next call, logs it right there):
-the `CostInfo` comes back WITH the result, no callback to register.
+If you want the cost handed back with the reply, call `complete_costed`:
 
 ```rust,no_run
 use minillmlib::{ChatNode, GeneratorInfo};
@@ -39,22 +40,22 @@ use minillmlib::{ChatNode, GeneratorInfo};
 let generator = GeneratorInfo::openrouter("google/gemini-2.5-flash-lite");
 let root = ChatNode::root("You are helpful.");
 
-let (result, cost) = root.add_user("Hi").complete_costed(&generator, None).await;
-let reply = result.expect("completion");
-if let Some(cost) = cost {
-    println!("that cost ${:.6} ({:?})", cost.cost, cost.resolution);
+let (result, costs) = root.add_user("Hi").complete_costed(&generator, None).await;
+for cost in &costs {
+    println!("a request cost ${:.6} ({:?})", cost.cost, cost.resolution);
 }
+let reply = result.expect("completion");
 # }
 ```
 
-Same accounting as every other tracked path (usage from the response, the
-provider's out-of-band resolution as backstop, never a fake $0). An errored
-completion carries no cost info: the request failed before a billable response
-existed.
+There is one `CostInfo` per response received: a response rejected by
+`crash_on_empty_response` or `crash_on_refusal` was billed too, so it is listed,
+also when the completion fails in the end. A request that fails without a
+response lists nothing, though a provider may still bill it (one that timed out
+after the model had finished, for example).
 
-When many call sites should feed one central sink instead, use the callback
-shapes below; streaming always goes through them, since a stream's cost
-resolves only after it ends.
+If you would rather have the cost pushed to you, set a callback, as below. If you stream, there is no costed version: use
+`complete_streaming_collect` with a callback, or `complete_streaming_tracked`.
 
 ## A callback per completion
 
@@ -69,7 +70,6 @@ let sink = total.clone();
 
 let params = NodeCompletionParameters::new()
     .with_params(CompletionParameters::new().with_max_tokens(200))
-    .with_cost_tracking(true)
     .with_cost_callback(move |info: CostInfo| {
         // info.cost, .prompt_tokens, .completion_tokens,
         // .cache_read_tokens, .cache_write_tokens, .resolution
@@ -82,13 +82,15 @@ println!("total spent: {}", *total.lock().unwrap());
 # Ok(()) }
 ```
 
+Setting a callback already asks the provider for usage, so you do not need
+`with_cost_tracking(true)`. The `_tracked` methods refuse a callback, because
+they report to their `CompletionContext`.
+
 ## Enforced tracking via CompletionContext
 
-When you want cost reporting to be structurally guaranteed (not opt-in per call),
-wrap the generator in a `CompletionContext` and use `complete_tracked`. It always
-reports cost through the context's async callback, and on a cancelled or
-usage-less stream it resolves out-of-band (e.g. OpenRouter's `/generation` query)
-or reports `Unknown`, rather than silently booking `$0`.
+If every completion in your app must report its cost to one place, wrap the
+generator in a `CompletionContext` and call `complete_tracked`. It reports every
+billed response through the context's async callback.
 
 ```rust,no_run
 use minillmlib::{CompletionContext, CostInfo, AsyncCostCallback, CompletionMeta, GeneratorInfo, ChatNode};
@@ -109,6 +111,21 @@ let _answer = root.add_user("Hi").complete_tracked(&ctx, None).await?;
 # Ok(()) }
 ```
 
-For streaming, `complete_streaming_tracked` returns a `TrackedStream` that settles
-cost when it finishes or is cancelled (use `cancel().await` for a reliable
-settle; a plain drop is best-effort).
+The last two arguments are your app's URL and name; on OpenRouter they become
+the `HTTP-Referer` and `X-Title` headers it credits usage to.
+
+If you stream, `complete_streaming_tracked` returns a `TrackedStream`. If you
+only want the finished node, call `complete_streaming_collect_tracked` instead:
+it collects the stream, reports the cost and adds the reply to the tree for
+you. If you keep the `TrackedStream` and want the whole reply,
+call `collect().await`, which reads whatever is left of the stream, then
+`report_cost(&response).await`, and `append_response(&response)` on the node you
+started the stream from, if you want it in the tree. If you want a kill switch, `collect_or_cancel(interrupt)`
+collects and reports in one call, or cancels and reports if `interrupt` fires
+first. It returns a `CollectOutcome`: `Finished(response)`, which is not yet in
+the tree, `Interrupted`, or `Failed(error)` when the stream broke off (a dropped
+connection, an idle timeout, or an error the provider sent mid-stream), in
+which case nothing is booked. If you stop
+early, call `cancel().await`, which waits until the cost is reported. Just
+dropping the stream reports it from a background task, which is lost if your
+runtime shuts down first.

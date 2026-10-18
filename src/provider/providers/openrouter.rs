@@ -6,17 +6,119 @@
 //! Claude-model cache markers, and the out-of-band `/generation` endpoint
 //! for streams that died before delivering usage.
 
-use secrecy::ExposeSecret;
-
-use super::super::auth::Auth;
 use super::super::openai_wire::messages_to_payload;
 use super::super::openai_wire::{mark_openai_message, parse_openai_usage, usage_field};
 use super::super::response::Usage;
 use super::super::wire::{
-    kept_cache_breakpoints, price_or_unpriced, AppIdentity, CostFuture, CostOutcome, PostStreamCtx,
-    Provider, TokenPrice,
+    kept_cache_breakpoints, price_or_unpriced, AppIdentity, CostOutcome, InfoFuture, ModelLookup,
+    Provider, SideCall, TokenPrice, UsageFuture, UsageQuery,
 };
 use crate::message::Message;
+use serde::{Deserialize, Serialize};
+
+/// OpenRouter provider routing settings
+///
+/// See: <https://openrouter.ai/docs/provider-routing>
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenRouterRouting {
+    /// Ordered list of provider names to try
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
+
+    /// Sort providers by: "price", "throughput", or "latency"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<String>,
+
+    /// List of providers to ignore/exclude
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore: Option<Vec<String>>,
+
+    /// Data collection preference: "allow" or "deny"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_collection: Option<String>,
+
+    /// Allow fallback to other providers if preferred ones fail
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_fallbacks: Option<bool>,
+
+    /// Require specific provider parameters
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_parameters: Option<bool>,
+}
+
+impl OpenRouterRouting {
+    /// Create new provider settings
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Serialize to the JSON value OpenRouter expects under the request's
+    /// `"provider"` key (used by
+    /// [`CompletionParameters::with_openrouter_routing`](crate::CompletionParameters::with_openrouter_routing)).
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("routing settings are plain strings and flags")
+    }
+
+    /// Set ordered list of providers to try
+    pub fn with_order(mut self, providers: Vec<String>) -> Self {
+        self.order = Some(providers);
+        self
+    }
+
+    /// Sort by throughput (fastest)
+    pub fn sort_by_throughput(mut self) -> Self {
+        self.sort = Some("throughput".to_string());
+        self
+    }
+
+    /// Sort by price (cheapest)
+    pub fn sort_by_price(mut self) -> Self {
+        self.sort = Some("price".to_string());
+        self
+    }
+
+    /// Sort by latency (lowest)
+    pub fn sort_by_latency(mut self) -> Self {
+        self.sort = Some("latency".to_string());
+        self
+    }
+
+    /// Set providers to ignore/exclude
+    pub fn with_ignore(mut self, providers: Vec<String>) -> Self {
+        self.ignore = Some(providers);
+        self
+    }
+
+    /// Deny data collection
+    pub fn deny_data_collection(mut self) -> Self {
+        self.data_collection = Some("deny".to_string());
+        self
+    }
+
+    /// Allow data collection
+    pub fn allow_data_collection(mut self) -> Self {
+        self.data_collection = Some("allow".to_string());
+        self
+    }
+
+    /// Set whether to allow fallbacks
+    pub fn with_fallbacks(mut self, allow: bool) -> Self {
+        self.allow_fallbacks = Some(allow);
+        self
+    }
+}
+
+impl crate::generator::CompletionParameters {
+    /// Set OpenRouter provider-routing settings (order/sort/ignore/data_collection).
+    ///
+    /// OpenRouter-specific: it goes through [`extra`](Self::extra) under the
+    /// `"provider"` key, the home for a provider-specific knob. Every provider
+    /// sends that key, and only OpenRouter understands it: OpenAI and Anthropic
+    /// refuse a request carrying it, so set it only for OpenRouter.
+    pub fn with_openrouter_routing(self, routing: OpenRouterRouting) -> Self {
+        self.with_extra("provider", routing.to_value())
+    }
+}
 
 /// OpenRouter: OpenAI-wire request/response, plus native USD cost
 /// (`usage.cost` + BYOK `usage.cost_details.upstream_inference_cost`), usage
@@ -39,17 +141,31 @@ impl Provider for OpenRouterProvider {
         body["usage"] = serde_json::json!({ "include": true });
     }
 
-    /// OpenRouter's `reasoning` object IS the normalized config (effort,
-    /// budget, exclude), and it translates it per upstream model itself;
-    /// `effort: "none"` is its spelling of off, which the models that cannot
-    /// switch reasoning off refuse loudly. The object goes through verbatim.
-    fn openai_reasoning_value(
+    /// OpenRouter's own `reasoning` object, which it translates per upstream
+    /// model itself: off is `effort: "none"`, on with no effort is
+    /// `"minimal"` (OpenRouter's lowest, which it rounds to the nearest level
+    /// a model has), and an effort is the caller's word as written.
+    fn openai_reasoning_field(
         &self,
-        obj: &mut serde_json::Map<String, serde_json::Value>,
-        reasoning: &crate::generator::ReasoningConfig,
-    ) -> crate::error::Result<()> {
-        obj.insert("reasoning".into(), serde_json::to_value(reasoning)?);
-        Ok(())
+        reasoning: &crate::generator::Reasoning,
+    ) -> (&'static str, serde_json::Value) {
+        use crate::generator::Reasoning;
+        let effort = match reasoning {
+            Reasoning::Off => "none",
+            Reasoning::On(None) => "minimal",
+            Reasoning::On(Some(effort)) => effort,
+        };
+        ("reasoning", serde_json::json!({ "effort": effort }))
+    }
+
+    /// The model from OpenRouter's catalog, read through the generator's own
+    /// address (a gateway in front of OpenRouter sees it), at the dearest
+    /// provider that serves it, since routing may land on any of them.
+    fn model_info(&self, lookup: ModelLookup) -> Option<InfoFuture> {
+        let model = lookup.openrouter_name.unwrap_or(lookup.model);
+        Some(Box::pin(async move {
+            super::catalog_info(&lookup.call, &model, None).await
+        }))
     }
 
     /// OpenRouter normalizes requests before forwarding, so unknown keys in
@@ -117,78 +233,78 @@ impl Provider for OpenRouterProvider {
         }
     }
 
-    fn resolve_post_stream<'a>(&'a self, ctx: PostStreamCtx<'a>) -> CostFuture<'a> {
+    fn usage_out_of_band<'a>(&'a self, ctx: UsageQuery<'a>) -> UsageFuture<'a> {
         Box::pin(async move {
             if ctx.generation_id.is_empty() {
-                return CostOutcome::unknown();
+                return None;
             }
             // OpenRouter may not finalize the generation record immediately; poll
-            // every second before giving up to an honest Unknown. Plain 1s polls,
+            // every second before giving up (the cost is then Unknown). Plain 1s polls,
             // no backoff: the endpoint is free and the caller is waiting, so the
             // only cost of polling fast is nothing and the cost of polling slow
             // is user-visible latency. Measured: a completed generation's record
             // appears ~9s after it finishes, and a CANCELLED call's only after
             // the upstream generation runs to its own end anyway (client aborts
             // do not stop these routes) plus the same ~9s, i.e. ~18s for a short
-            // generation. We poll for 25s.
-            for _ in 0..25 {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if let Some(usage) =
-                    query_generation(&ctx.client, ctx.base_url, ctx.generation_id, ctx.auth).await
-                {
-                    return self.cost_of(usage, ctx.price);
+            // generation. We poll for 25s in all, slow queries included.
+            let poll = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if let Some(usage) = query_generation(&ctx.call, ctx.generation_id).await {
+                        return usage;
+                    }
+                    tracing::debug!("OpenRouter generation {} not found yet", ctx.generation_id);
                 }
-                tracing::debug!("OpenRouter generation {} not found yet", ctx.generation_id);
-            }
-            CostOutcome::unknown()
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(25), poll)
+                .await
+                .ok()
         })
     }
 }
 
-/// Query OpenRouter's `/api/v1/generation` for a finished generation's usage.
-/// `None` on any failure or when the record carries no usable cost.
-async fn query_generation(
-    client: &reqwest_middleware::ClientWithMiddleware,
-    base_url: &str,
-    generation_id: &str,
-    auth: &Auth,
-) -> Option<Usage> {
-    let api_key = auth.secret()?;
+/// How long one generation-record query may take, so one hung query does not
+/// use up the whole poll.
+const GENERATION_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Query OpenRouter's `/api/v1/generation` for a finished generation's usage,
+/// at the generator's own address with its own headers. `None` on any failure
+/// or when the record carries no usable cost.
+async fn query_generation(call: &SideCall, generation_id: &str) -> Option<Usage> {
     let encoded =
         url::form_urlencoded::byte_serialize(generation_id.as_bytes()).collect::<String>();
-    // The generator's own address, never a hardcoded host: a generator
-    // pointed at a gateway resolves its costs through that gateway too.
-    let url = format!(
-        "{}/generation?id={}",
-        base_url.trim_end_matches('/'),
-        encoded
-    );
-
-    let response = match client
-        .get(&url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", api_key.expose_secret()),
+    let (status, body) = match call
+        .get(
+            &format!("/generation?id={encoded}"),
+            GENERATION_QUERY_TIMEOUT,
         )
-        .send()
         .await
     {
-        Ok(r) => r,
+        Ok(reply) => reply,
         Err(e) => {
             tracing::error!("Generation cost query for {} failed: {}", generation_id, e);
             return None;
         }
     };
-    if !response.status().is_success() {
+    if !status.is_success() {
         tracing::warn!(
             "Generation cost query for {} returned {}",
             generation_id,
-            response.status()
+            status
         );
         return None;
     }
-    let json: serde_json::Value = response.json().await.ok()?;
-    usage_from_generation_record(json.get("data")?)
+    let usage = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|json| usage_from_generation_record(json.get("data")?));
+    if usage.is_none() {
+        tracing::warn!(
+            "Generation cost query for {} returned a record with no usable cost: {}",
+            generation_id,
+            super::super::response::preview_str(&body)
+        );
+    }
+    usage
 }
 
 /// Parse a `/generation` record's `data` object into a `Usage`. Pure.
@@ -238,31 +354,24 @@ mod tests {
 
     use crate::generator::CompletionParameters;
 
-    /// OpenRouter takes the normalized object as it is, `none` included: it
-    /// is the wire that translates per model, and the wire whose models say
-    /// loudly when off is not on offer.
+    /// OpenRouter takes reasoning as its own `reasoning` object, never
+    /// OpenAI's `reasoning_effort`: `"none"` for off, `"minimal"` for on with
+    /// no effort, and the caller's word as written otherwise.
     #[test]
-    fn openrouter_sends_the_reasoning_object_verbatim() {
-        use crate::generator::ReasoningConfig;
+    fn openrouter_reasoning_is_its_reasoning_object() {
+        use crate::generator::Reasoning;
         let p = OpenRouterProvider;
         let messages = vec![Message::user("Hi")];
-        for (effort, budget) in [
-            (Some("none"), None),
-            (Some("low"), None),
-            (None, Some(2000)),
+        for (reasoning, effort) in [
+            (Reasoning::Off, "none"),
+            (Reasoning::On(None), "minimal"),
+            (Reasoning::On(Some("high".into())), "high"),
         ] {
-            let params = CompletionParameters::new().with_reasoning(ReasoningConfig {
-                effort: effort.map(str::to_string),
-                max_tokens: budget,
-                exclude: None,
-            });
+            let params = CompletionParameters::new().with_reasoning(reasoning);
             let body = p
                 .build_request("z-ai/glm-5.3-flash", &messages, &params, false, true)
                 .unwrap();
-            assert_eq!(
-                body["reasoning"],
-                serde_json::to_value(params.reasoning.as_ref().unwrap()).unwrap()
-            );
+            assert_eq!(body["reasoning"], serde_json::json!({ "effort": effort }));
             assert!(body.get("reasoning_effort").is_none());
         }
     }

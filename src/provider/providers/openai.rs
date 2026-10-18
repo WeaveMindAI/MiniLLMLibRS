@@ -3,7 +3,9 @@
 //! are the streaming usage opt-in and token-only pricing.
 
 use super::super::response::Usage;
-use super::super::wire::{price_or_unpriced, CostOutcome, Provider, TokenPrice};
+use super::super::wire::{
+    price_or_unpriced, CostOutcome, InfoFuture, ModelLookup, Provider, TokenPrice,
+};
 
 /// OpenAI: OpenAI-wire, returns token counts but no dollar cost (price them via a
 /// configured `TokenPrice`). Streaming usage requires the
@@ -12,8 +14,17 @@ use super::super::wire::{price_or_unpriced, CostOutcome, Provider, TokenPrice};
 pub struct OpenAiProvider;
 
 impl Provider for OpenAiProvider {
-    fn openrouter_slug(&self) -> Option<&'static str> {
-        Some("openai")
+    /// The model from OpenRouter's catalog, at OpenAI's own rate (OpenAI
+    /// publishes no prices in its API). An OpenAI id is found there as
+    /// `openai/<id>`, unless the generator names another catalog id.
+    fn model_info(&self, lookup: ModelLookup) -> Option<InfoFuture> {
+        let model = lookup
+            .openrouter_name
+            .unwrap_or_else(|| format!("openai/{}", lookup.model));
+        let call = super::catalog_call(lookup.call.client);
+        Some(Box::pin(async move {
+            super::catalog_info(&call, &model, Some("openai")).await
+        }))
     }
 
     fn openai_request_usage(&self, body: &mut serde_json::Value, stream: bool) {
@@ -26,15 +37,16 @@ impl Provider for OpenAiProvider {
     // parse_usage uses the default (`parse_openai_usage_field`): OpenAI reports
     // no native cost fields, so the base OpenAI-wire parse is exactly right.
 
-    /// OpenAI reports no native cost; price tokens via `TokenPrice` or report
-    /// `Unpriced`.
+    /// OpenAI reports no native cost: the tokens at the model's price, or
+    /// `Unpriced` when it is unknown.
     fn cost_of(&self, usage: Usage, price: Option<&TokenPrice>) -> CostOutcome {
         price_or_unpriced(usage, price)
     }
 
-    // No out-of-band endpoint: a cancelled stream that never delivered usage is
-    // genuinely unresolvable, so the default `resolve_post_stream` (Unknown) is
-    // correct. A stream that DID deliver usage prices it via `cost_of`.
+    // No out-of-band endpoint: a cancelled stream that never delivered usage
+    // has no usage to find, so the default `usage_out_of_band` (none, so the
+    // cost is Unknown) is right. A stream that DID deliver usage prices it via
+    // `cost_of`.
 }
 
 #[cfg(test)]
@@ -51,41 +63,26 @@ mod tests {
         }
     }
 
-    /// OpenAI's own dialect: `reasoning_effort: <effort>`; off writes
-    /// nothing (a plain model refuses the key in any value, and off is what
-    /// it does anyway); a budget has no key here and is refused.
+    /// OpenAI's own dialect: `reasoning_effort`, `"none"` for off, `"low"`
+    /// for on with no effort, and the caller's word as written otherwise.
     #[test]
-    fn openai_reasoning_is_an_effort_string_and_off_is_silence() {
-        use crate::generator::{CompletionParameters, ReasoningConfig};
+    fn openai_reasoning_is_reasoning_effort() {
+        use crate::generator::{CompletionParameters, Reasoning};
         use crate::message::Message;
         let p = OpenAiProvider;
         let messages = vec![Message::user("Hi")];
-        let with = |effort: Option<&str>, budget: Option<u32>| {
-            CompletionParameters::new().with_reasoning(ReasoningConfig {
-                effort: effort.map(str::to_string),
-                max_tokens: budget,
-                exclude: None,
-            })
-        };
-        let body = p
-            .build_request("gpt-5", &messages, &with(Some("low"), None), false, true)
-            .unwrap();
-        assert_eq!(body["reasoning_effort"], "low");
-        assert!(
-            body.get("reasoning").is_none(),
-            "no OpenRouter object on OpenAI's wire: {body}"
-        );
-        let body = p
-            .build_request("gpt-4o", &messages, &with(Some("none"), None), false, true)
-            .unwrap();
-        assert!(
-            body.get("reasoning_effort").is_none() && body.get("reasoning").is_none(),
-            "{body}"
-        );
-        let err = p
-            .build_request("gpt-5", &messages, &with(None, Some(2000)), false, true)
-            .unwrap_err();
-        assert!(err.to_string().contains("by effort"), "{err}");
+        for (reasoning, wire) in [
+            (Reasoning::Off, "none"),
+            (Reasoning::On(None), "low"),
+            (Reasoning::On(Some("xhigh".into())), "xhigh"),
+        ] {
+            let params = CompletionParameters::new().with_reasoning(reasoning);
+            let body = p
+                .build_request("gpt-5", &messages, &params, false, true)
+                .unwrap();
+            assert_eq!(body["reasoning_effort"], wire);
+            assert!(body.get("reasoning").is_none(), "{body}");
+        }
     }
 
     #[test]

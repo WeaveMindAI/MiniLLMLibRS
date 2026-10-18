@@ -20,10 +20,9 @@
 //! cost is known after the call and should always replace it.
 
 use crate::generator::CompletionParameters;
-use crate::generator::ModelRates;
 use crate::message::{ContentPart, Message, MessageContent};
 use crate::provider::bpe;
-use crate::provider::wire::TokenPrice;
+use crate::provider::wire::{ModelInfo, TokenPrice};
 
 /// Corrects `o200k_base`'s systematic undercount on non-GPT tokenizers.
 ///
@@ -55,16 +54,19 @@ const TOKENS_PER_STILL_IMAGE: u32 = 1_600;
 /// OpenAI-style tile pricing for a still whose dimensions are DECLARED: the
 /// image is scaled to fit 2048x2048, then its shortest side to 768, and each
 /// 512px tile costs `TOKENS_PER_IMAGE_TILE` on top of a flat
-/// `TOKENS_PER_IMAGE_BASE`. This is the dominant published vision-pricing
-/// model and, after the two resizes, tops out at 8 tiles (1445 tokens),
-/// safely under the unknown-size flat bound above; providers that price
-/// flatter (Gemini's 258/image) come in lower still, which is the safe
-/// direction for a ceiling.
+/// `TOKENS_PER_IMAGE_BASE`. After the two resizes it tops out at 8 tiles
+/// (1445 tokens). Providers that price flatter (Gemini's 258/image) come in
+/// lower, which is the safe direction for a ceiling.
 const TOKENS_PER_IMAGE_BASE: u32 = 85;
 const TOKENS_PER_IMAGE_TILE: u32 = 170;
 
-/// Tokens for a still image: tile-priced when its dimensions are declared,
-/// the flat unknown-size bound otherwise.
+/// Anthropic prices a still at its pixel count over this, up to the flat
+/// bound (it shrinks larger images first).
+const PIXELS_PER_ANTHROPIC_TOKEN: f64 = 750.0;
+
+/// Tokens for a still image: when its dimensions are declared, the higher of
+/// OpenAI's tile price and Anthropic's pixel price (never above the flat
+/// bound), since either may serve it; the flat unknown-size bound otherwise.
 fn still_image_tokens(width: Option<u32>, height: Option<u32>) -> u32 {
     let (Some(w), Some(h)) = (width, height) else {
         return TOKENS_PER_STILL_IMAGE;
@@ -72,6 +74,13 @@ fn still_image_tokens(width: Option<u32>, height: Option<u32>) -> u32 {
     if w == 0 || h == 0 {
         return TOKENS_PER_STILL_IMAGE;
     }
+    let pixels = (f64::from(w) * f64::from(h) / PIXELS_PER_ANTHROPIC_TOKEN).ceil();
+    let anthropic = pixels.min(f64::from(TOKENS_PER_STILL_IMAGE)) as u32;
+    tiled_image_tokens(w, h).max(anthropic)
+}
+
+/// OpenAI's tile price for a `w` x `h` still.
+fn tiled_image_tokens(w: u32, h: u32) -> u32 {
     // Scale to fit 2048x2048, then shortest side to 768 (never upscaling).
     let (mut w, mut h) = (f64::from(w), f64::from(h));
     let fit = (2048.0 / w).min(2048.0 / h).min(1.0);
@@ -116,8 +125,8 @@ const DOCUMENT_TEXT_TOKENS_PER_PAGE: u32 = 1_500;
 /// What to assume a document runs when the caller did not declare a page
 /// count. Same reasoning as [`DEFAULT_MEDIA_SECONDS`]: a caller that parsed
 /// the file knows and should pass it (`with_page_count`); absent that, twenty
-/// pages is a reasonable document and anything it understates is caught by
-/// the context-window clamp in pricing.
+/// pages is a reasonable document. A longer one is undercounted: the
+/// context-window clamp only caps the figure from above.
 const DEFAULT_DOCUMENT_PAGES: u32 = 20;
 
 /// The page count to price a document at: what the caller said, or the
@@ -187,6 +196,15 @@ pub fn estimate_prompt_tokens(messages: &[Message]) -> PromptEstimate {
 
     for message in messages {
         text_tokens += u64::from(TOKENS_PER_MESSAGE);
+        // Tool calls already in the history go back to the model as text (the
+        // name, id and arguments), so they bill as input like the content.
+        if let Some(calls) = &message.tool_calls {
+            let json = serde_json::to_string(calls).expect("tool calls are plain JSON");
+            text_tokens += bpe::count_tokens(&json) as u64;
+        }
+        if let Some(id) = &message.tool_call_id {
+            text_tokens += bpe::count_tokens(id) as u64;
+        }
         match &message.content {
             MessageContent::Text(t) => text_tokens += bpe::count_tokens(t) as u64,
             MessageContent::Parts(parts) => {
@@ -247,7 +265,8 @@ pub fn estimate_prompt_tokens(messages: &[Message]) -> PromptEstimate {
 ///
 /// Unclamped: a prompt can be counted larger than any model would accept, because
 /// counting does not know which model it is for. [`estimate_cost_usd`] clamps to
-/// the model's context window, the largest input that can physically be sent.
+/// the model's context window, the largest input that can physically be sent,
+/// when the window is known.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PromptEstimate {
@@ -271,7 +290,7 @@ impl PromptEstimate {
     }
 
     /// What this prompt costs to send, in USD, given a model's rates and the
-    /// largest input it accepts.
+    /// largest input it accepts (`None`: unknown, so nothing is clamped).
     ///
     /// A count above the context window describes a prompt no provider would take,
     /// so the honest bound is the cost of filling the window instead. Which tokens
@@ -280,7 +299,7 @@ impl PromptEstimate {
     /// times text, yet on a model that prices no audio separately it bills exactly
     /// as text. Filling with cheap tokens would understate the cost, the one
     /// failure a spend gate cannot tolerate.
-    fn input_cost_usd(self, context_length: u32, price: &TokenPrice) -> f64 {
+    fn input_cost_usd(self, context_length: Option<u32>, price: &TokenPrice) -> f64 {
         let mut buckets: [(u64, f64); 3] = [
             (self.audio_tokens, price.audio_rate()),
             (self.image_tokens, price.image_rate()),
@@ -289,7 +308,7 @@ impl PromptEstimate {
         // Dearest first, so the window fills with the priciest tokens present.
         buckets.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-        let mut room = u64::from(context_length);
+        let mut room = context_length.map_or(u64::MAX, u64::from);
         let mut cost = 0.0;
         for (tokens, rate) in buckets {
             let billed = tokens.min(room);
@@ -300,33 +319,31 @@ impl PromptEstimate {
     }
 }
 
-/// The largest completion this request can produce, in tokens.
+/// The largest completion this request can produce, in tokens, reasoning
+/// included, or `None` when nothing bounds it.
 ///
-/// Precedence: an explicit `max_tokens` binds it; otherwise the model's published
-/// completion cap; otherwise the context window, which is the only ceiling that
-/// exists for the ~17% of catalog models publishing no completion cap.
+/// Precedence: an explicit `max_tokens` binds it, within the model's own
+/// ceiling; otherwise the model's largest output; otherwise its context window,
+/// the only ceiling that exists for a model publishing no output cap.
 ///
-/// Reasoning tokens are billed at the output rate and are NOT counted against
-/// `max_tokens` by any provider, so a thinking model bills past the ceiling the
-/// caller set. When reasoning is enabled we add its budget on top: an explicit
-/// reasoning `max_tokens` when given, else the model's own completion ceiling,
-/// since an effort level places no numeric bound on how long a model may think.
-fn max_output_tokens(params: &CompletionParameters, rates: &ModelRates) -> u64 {
-    let ceiling = rates.max_completion_tokens.unwrap_or(rates.context_length);
-
-    // Both halves are bounded by what the model can emit, so neither a caller's
-    // `max_tokens` nor a reasoning budget can inflate the estimate past reality.
-    let visible = params.max_tokens.unwrap_or(ceiling).min(ceiling);
-    let thinking = match &params.reasoning {
-        None => 0,
-        Some(r) if r.effort.as_deref() == Some("none") => 0,
-        Some(r) => r.max_tokens.unwrap_or(ceiling).min(ceiling),
+/// Reasoning needs no budget of its own: `max_tokens` is the combined cap for
+/// reasoning and answer, which is how every supported wire counts it (OpenAI's
+/// and OpenRouter's `max_completion_tokens`, Anthropic's `max_tokens`), and the
+/// model's ceiling bounds both together too.
+fn max_output_tokens(params: &CompletionParameters, info: &ModelInfo) -> Option<u64> {
+    let ceiling = info.max_output_tokens.or(info.context_length);
+    let tokens = match (params.max_tokens, ceiling) {
+        (Some(asked), Some(ceiling)) => asked.min(ceiling),
+        (Some(asked), None) => asked,
+        (None, ceiling) => ceiling?,
     };
-
-    u64::from(visible) + u64::from(thinking)
+    Some(u64::from(tokens))
 }
 
-/// A deliberately high estimate, in USD, of what one completion will cost.
+/// A deliberately high estimate, in USD, of what one completion will cost, or
+/// `None` when it cannot be estimated: the model's price is unknown, or nothing
+/// bounds how much it can produce (no `max_tokens`, and neither its largest
+/// output nor its context window is known).
 ///
 /// Every assumption leans expensive, so the figure works as a ceiling to reserve
 /// against; it is still an estimate (tokenizers differ across model families),
@@ -342,24 +359,42 @@ fn max_output_tokens(params: &CompletionParameters, rates: &ModelRates) -> u64 {
 /// estimate total: an unknown clip length, or a very long one, yields the cost of
 /// filling the window rather than an error the caller has to handle.
 ///
-/// Everything is charged as uncached. Caching only ever makes the real cost lower,
-/// so ignoring it keeps the estimate on the high side.
+/// Everything is charged as uncached input. A cache read costs less, but a
+/// request that WRITES the cache pays more than the input rate on the cached
+/// part, so on that request the estimate can come in low.
+///
+/// `params` are the caller's parameters (an unset cap is read as the model's
+/// largest output, else its context window), and `info` what is known about
+/// the model: [`GeneratorInfo::estimate_cost_usd`](crate::GeneratorInfo::estimate_cost_usd)
+/// passes its `default_params` under the caller's, and
+/// [`GeneratorInfo::model_info`](crate::GeneratorInfo::model_info).
 pub fn estimate_cost_usd(
     messages: &[Message],
     params: &CompletionParameters,
-    rates: &ModelRates,
-) -> f64 {
-    let price = &rates.price;
-    let input = estimate_prompt_tokens(messages).input_cost_usd(rates.context_length, price);
-    let output = max_output_tokens(params, rates) as f64 * price.output_per_mtok;
+    info: &ModelInfo,
+) -> Option<f64> {
+    let price = info.price.as_ref()?;
+    let output = max_output_tokens(params, info)? as f64 * price.output_per_mtok;
+    let mut prompt = estimate_prompt_tokens(messages);
+    prompt.text_tokens = prompt.text_tokens.saturating_add(tool_tokens(params));
+    let input = prompt.input_cost_usd(info.context_length, price);
+    Some((input + output) / 1_000_000.0)
+}
 
-    (input + output) / 1_000_000.0
+/// The tokens the tool definitions occupy, biased high like text: every
+/// provider sends them as input, written out as JSON.
+fn tool_tokens(params: &CompletionParameters) -> u64 {
+    let Some(tools) = &params.tools else {
+        return 0;
+    };
+    let json = serde_json::to_string(tools).expect("tool definitions are plain JSON");
+    (bpe::count_tokens(&json) as f64 * SAFETY_MULTIPLIER).ceil() as u64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::generator::ReasoningConfig;
+    use crate::generator::Reasoning;
     use crate::message::AudioInput;
     use crate::provider::wire::{TokenPrice, AUDIO_RATE_FALLBACK_MULTIPLE};
 
@@ -371,17 +406,33 @@ mod tests {
         Message::user(MessageContent::Parts(parts))
     }
 
-    fn rates(max_completion: Option<u32>, context: u32) -> ModelRates {
-        ModelRates {
-            price: TokenPrice::new(3.0, 15.0),
-            max_completion_tokens: max_completion,
-            context_length: context,
+    /// A tool call in the history is sent back to the model, so its arguments
+    /// count as input: an agent loop with long arguments is not undercounted.
+    #[test]
+    fn tool_calls_in_the_history_count_as_input() {
+        let plain = Message::assistant("");
+        let mut calling = Message::assistant("");
+        calling.tool_calls = Some(vec![crate::tools::ToolCall {
+            id: "call_1".into(),
+            name: "search".into(),
+            arguments: format!(r#"{{"query": "{}"}}"#, "word ".repeat(500)),
+        }]);
+        let without = estimate_prompt_tokens(&[plain]).text_tokens;
+        let with = estimate_prompt_tokens(&[calling]).text_tokens;
+        assert!(with >= without + 500, "{with} vs {without}");
+    }
+
+    fn rates(max_completion: Option<u32>, context: u32) -> ModelInfo {
+        ModelInfo {
+            price: Some(TokenPrice::new(3.0, 15.0)),
+            max_output_tokens: max_completion,
+            context_length: Some(context),
         }
     }
 
-    /// A declared resolution refines a still's price via tile pricing;
-    /// unknown (or nonsense) dimensions keep the flat unknown-size bound,
-    /// and no tiled figure ever exceeds it.
+    /// A declared resolution refines a still's price: the higher of the tile
+    /// price and Anthropic's pixel price, never above the flat bound; unknown
+    /// (or nonsense) dimensions keep the flat bound.
     #[test]
     fn a_declared_resolution_refines_a_stills_price_under_the_flat_bound() {
         // Small image: one 512px tile.
@@ -389,10 +440,12 @@ mod tests {
             still_image_tokens(Some(400), Some(300)),
             TOKENS_PER_IMAGE_BASE + TOKENS_PER_IMAGE_TILE
         );
-        // Large image: capped by the 2048-fit + 768-shortest-side resizes,
-        // so the tile count tops out and stays under the flat bound.
+        // A square megapixel: Anthropic's pixel price (1334) beats the four
+        // tiles (765).
+        assert_eq!(still_image_tokens(Some(1000), Some(1000)), 1334);
+        // Large image: both prices top out, at most the flat bound.
         let huge = still_image_tokens(Some(8000), Some(6000));
-        assert!(huge < TOKENS_PER_STILL_IMAGE, "{huge}");
+        assert!(huge <= TOKENS_PER_STILL_IMAGE, "{huge}");
         assert!(huge > still_image_tokens(Some(400), Some(300)));
         // Unknown or nonsense dimensions: the flat bound.
         assert_eq!(still_image_tokens(None, None), TOKENS_PER_STILL_IMAGE);
@@ -461,8 +514,8 @@ mod tests {
 
         let r = rates(Some(1000), 200_000);
         let params = CompletionParameters::new().with_max_tokens(500);
-        let direct = estimate_cost_usd(&originals, &params, &r);
-        let re_parsed = estimate_cost_usd(&round_tripped, &params, &r);
+        let direct = estimate_cost_usd(&originals, &params, &r).expect("priced and bounded");
+        let re_parsed = estimate_cost_usd(&round_tripped, &params, &r).expect("priced and bounded");
         assert!(direct > 0.0);
         assert_eq!(
             direct, re_parsed,
@@ -474,7 +527,10 @@ mod tests {
         // really rides the kept metadata, not luck.
         let strict = serde_json::Value::Array(messages_to_payload(&originals, false));
         let strict_msgs: Vec<Message> = serde_json::from_value(strict).expect("parses");
-        assert_ne!(estimate_cost_usd(&strict_msgs, &params, &r), direct);
+        assert_ne!(
+            estimate_cost_usd(&strict_msgs, &params, &r).expect("priced and bounded"),
+            direct
+        );
     }
 
     /// The property that matters: the estimate must never fall below the truth.
@@ -505,90 +561,105 @@ mod tests {
             max_tokens: Some(500),
             ..Default::default()
         };
-        assert_eq!(max_output_tokens(&p, &r), 500);
+        assert_eq!(max_output_tokens(&p, &r), Some(500));
 
         // A caller asking for more than the model can emit is bounded by the model.
         let p = CompletionParameters {
             max_tokens: Some(999_999),
             ..Default::default()
         };
-        assert_eq!(max_output_tokens(&p, &r), 8_000);
+        assert_eq!(max_output_tokens(&p, &r), Some(8_000));
     }
 
-    /// `CompletionParameters::default()` carries `max_tokens: Some(4096)`, so the
-    /// estimate prices what will REALLY be sent, not the model's ceiling. A caller
-    /// who never sets `max_tokens` is capped at 4096 output tokens on the wire.
+    /// Default parameters set no `max_tokens`, so nothing caps the answer below
+    /// what the model can emit: the model's published completion cap is priced.
     #[test]
-    fn the_default_max_tokens_is_what_gets_priced() {
+    fn default_parameters_price_the_models_completion_cap() {
         let r = rates(Some(64_000), 200_000);
         assert_eq!(
             max_output_tokens(&CompletionParameters::default(), &r),
-            4_096
+            Some(64_000)
         );
     }
 
-    /// Only an explicitly unset `max_tokens` falls through to the model's ceiling,
-    /// and with no published completion cap the context window is the last bound.
+    /// With no `max_tokens` and no published completion cap, the context window
+    /// is the last bound.
     #[test]
     fn with_no_max_tokens_and_no_completion_cap_the_context_window_is_the_ceiling() {
         let r = rates(None, 32_768);
-        let p = CompletionParameters {
-            max_tokens: None,
-            ..Default::default()
-        };
-        assert_eq!(max_output_tokens(&p, &r), 32_768);
+        let p = CompletionParameters::default();
+        assert_eq!(max_output_tokens(&p, &r), Some(32_768));
 
         // A published completion cap wins over the context window.
         let capped = rates(Some(8_000), 32_768);
-        assert_eq!(max_output_tokens(&p, &capped), 8_000);
+        assert_eq!(max_output_tokens(&p, &capped), Some(8_000));
     }
 
-    /// Reasoning tokens bill at the output rate and are not charged against
-    /// `max_tokens`, so they must be added ON TOP of it, never folded inside.
+    /// `max_tokens` caps reasoning and answer together, so reasoning, on or
+    /// off, never moves the priced completion past it.
     #[test]
-    fn reasoning_tokens_are_added_on_top_of_the_visible_output_budget() {
+    fn max_tokens_bounds_reasoning_and_answer_together() {
         let r = rates(Some(8_000), 200_000);
-        let base = CompletionParameters {
-            max_tokens: Some(1_000),
-            ..Default::default()
-        };
-        assert_eq!(max_output_tokens(&base, &r), 1_000);
+        for reasoning in [
+            None,
+            Some(Reasoning::Off),
+            Some(Reasoning::On(None)),
+            Some(Reasoning::On(Some("max".into()))),
+        ] {
+            let p = CompletionParameters {
+                max_tokens: Some(1_000),
+                reasoning: reasoning.clone(),
+                ..Default::default()
+            };
+            assert_eq!(max_output_tokens(&p, &r), Some(1_000), "{reasoning:?}");
+        }
+    }
 
-        // An explicit thinking budget adds exactly itself.
-        let thinking = CompletionParameters {
-            max_tokens: Some(1_000),
-            reasoning: Some(ReasoningConfig {
-                effort: None,
-                max_tokens: Some(4_000),
-                exclude: None,
-            }),
-            ..Default::default()
+    /// Tool definitions are sent as input, so they are priced like text.
+    #[test]
+    fn tool_definitions_are_priced_as_input() {
+        let info = ModelInfo {
+            price: Some(TokenPrice::new(1_000_000.0, 0.0)),
+            max_output_tokens: Some(1),
+            context_length: None,
         };
-        assert_eq!(max_output_tokens(&thinking, &r), 5_000);
+        let plain = CompletionParameters::new();
+        let with_tool = CompletionParameters::new().with_tool(crate::tools::ToolDefinition::new(
+            "get_weather",
+            "Get the current weather for a city",
+            serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+        ));
+        let messages = [user("hi")];
+        let without = estimate_cost_usd(&messages, &plain, &info).unwrap();
+        let with = estimate_cost_usd(&messages, &with_tool, &info).unwrap();
+        assert!(with > without + 10.0, "{with} vs {without}");
+    }
 
-        // An effort level bounds nothing, so the model's ceiling is the only bound.
-        let effort = CompletionParameters {
-            max_tokens: Some(1_000),
-            reasoning: Some(ReasoningConfig {
-                effort: Some("high".into()),
-                max_tokens: None,
-                exclude: None,
-            }),
-            ..Default::default()
+    /// An unknown price, or nothing bounding the output, makes the estimate
+    /// unknown rather than a guess.
+    #[test]
+    fn an_estimate_needs_a_price_and_a_bound() {
+        let messages = [user("hi")];
+        let unpriced = ModelInfo {
+            price: None,
+            ..rates(Some(1_000), 10_000)
         };
-        assert_eq!(max_output_tokens(&effort, &r), 9_000);
-
-        // "none" disables reasoning entirely, so it costs nothing.
-        let off = CompletionParameters {
-            max_tokens: Some(1_000),
-            reasoning: Some(ReasoningConfig {
-                effort: Some("none".into()),
-                max_tokens: None,
-                exclude: None,
-            }),
-            ..Default::default()
+        assert_eq!(
+            estimate_cost_usd(&messages, &CompletionParameters::default(), &unpriced),
+            None
+        );
+        let unbounded = ModelInfo {
+            price: Some(TokenPrice::new(1.0, 1.0)),
+            max_output_tokens: None,
+            context_length: None,
         };
-        assert_eq!(max_output_tokens(&off, &r), 1_000);
+        assert_eq!(
+            estimate_cost_usd(&messages, &CompletionParameters::default(), &unbounded),
+            None
+        );
+        // A max_tokens bounds it even when the model's limits are unknown.
+        let capped = CompletionParameters::new().with_max_tokens(1_000_000);
+        assert!(estimate_cost_usd(&messages, &capped, &unbounded).is_some());
     }
 
     fn video(duration_secs: Option<f64>) -> Message {
@@ -753,18 +824,19 @@ mod tests {
     #[test]
     fn an_absurdly_long_clip_still_prices_as_one_full_window() {
         let window = 1_000u32;
-        let r = ModelRates {
-            price: TokenPrice::new(1.0, 0.0),
-            max_completion_tokens: Some(0),
-            context_length: window,
+        let r = ModelInfo {
+            price: Some(TokenPrice::new(1.0, 0.0)),
+            max_output_tokens: Some(0),
+            context_length: Some(window),
         };
         let params = CompletionParameters {
             max_tokens: Some(0),
             ..Default::default()
         };
 
-        let cost = estimate_cost_usd(&[video(Some(f64::MAX))], &params, &r);
-        let full_window_of_audio = f64::from(window) * r.price.audio_rate() / 1e6;
+        let cost =
+            estimate_cost_usd(&[video(Some(f64::MAX))], &params, &r).expect("priced and bounded");
+        let full_window_of_audio = f64::from(window) * r.price.as_ref().unwrap().audio_rate() / 1e6;
         assert!((cost - full_window_of_audio).abs() < 1e-12, "{cost}");
     }
 
@@ -774,10 +846,10 @@ mod tests {
     #[test]
     fn a_prompt_too_large_to_send_is_priced_as_the_full_window() {
         let window = 1_000u32;
-        let r = ModelRates {
-            price: TokenPrice::new(1.0, 0.0),
-            max_completion_tokens: Some(0),
-            context_length: window,
+        let r = ModelInfo {
+            price: Some(TokenPrice::new(1.0, 0.0)),
+            max_output_tokens: Some(0),
+            context_length: Some(window),
         };
         let params = CompletionParameters {
             max_tokens: Some(0),
@@ -789,8 +861,9 @@ mod tests {
         assert!(huge.total_tokens() > u64::from(window) * 1_000);
 
         // Priced at exactly a full window of the dearest token present.
-        let cost = estimate_cost_usd(&[video(Some(86_400.0))], &params, &r);
-        let full_window_of_audio = f64::from(window) * r.price.audio_rate() / 1e6;
+        let cost =
+            estimate_cost_usd(&[video(Some(86_400.0))], &params, &r).expect("priced and bounded");
+        let full_window_of_audio = f64::from(window) * r.price.as_ref().unwrap().audio_rate() / 1e6;
         assert!(
             (cost - full_window_of_audio).abs() < 1e-12,
             "{cost} vs {full_window_of_audio}"
@@ -804,10 +877,10 @@ mod tests {
         let window = 100u32;
         // Audio at $1000/Mtok, text at $1/Mtok.
         let price = TokenPrice::new(1.0, 0.0).with_media_rates(Some(1000.0), None);
-        let r = ModelRates {
-            price,
-            max_completion_tokens: Some(0),
-            context_length: window,
+        let r = ModelInfo {
+            price: Some(price),
+            max_output_tokens: Some(0),
+            context_length: Some(window),
         };
         let params = CompletionParameters {
             max_tokens: Some(0),
@@ -818,7 +891,7 @@ mod tests {
         let long_text = "word ".repeat(500);
         let messages = [audio(Some(10.0)), user(&long_text)];
 
-        let cost = estimate_cost_usd(&messages, &params, &r);
+        let cost = estimate_cost_usd(&messages, &params, &r).expect("priced and bounded");
         let window_of_audio = f64::from(window) * 1000.0 / 1e6;
         assert!(
             (cost - window_of_audio).abs() < 1e-12,
@@ -835,11 +908,11 @@ mod tests {
     /// three orders of magnitude.
     #[test]
     fn audio_is_billed_at_the_audio_rate_not_the_input_rate() {
-        let r = ModelRates {
+        let r = ModelInfo {
             // Voxtral's real shape: $0.10 input, $100 audio, per million tokens.
-            price: TokenPrice::new(0.1, 0.2).with_media_rates(Some(100.0), None),
-            max_completion_tokens: Some(0),
-            context_length: 1_000,
+            price: Some(TokenPrice::new(0.1, 0.2).with_media_rates(Some(100.0), None)),
+            max_output_tokens: Some(0),
+            context_length: Some(1_000),
         };
         let params = CompletionParameters {
             max_tokens: Some(0),
@@ -848,7 +921,7 @@ mod tests {
 
         // One second = 32 audio tokens at $100/Mtok = $0.0032, plus the message
         // envelope's few text tokens at $0.10/Mtok (negligible but nonzero).
-        let cost = estimate_cost_usd(&[audio(Some(1.0))], &params, &r);
+        let cost = estimate_cost_usd(&[audio(Some(1.0))], &params, &r).expect("priced and bounded");
         let audio_only = 32.0 * 100.0 / 1e6;
         assert!(
             cost > audio_only,
@@ -908,16 +981,16 @@ mod tests {
     #[test]
     fn cost_prices_the_bounded_output_at_the_output_rate() {
         // 1M output tokens at $15/Mtok = $15, plus a small prompt at $3/Mtok.
-        let r = ModelRates {
-            price: TokenPrice::new(3.0, 15.0),
-            max_completion_tokens: Some(1_000_000),
-            context_length: 2_000_000,
+        let r = ModelInfo {
+            price: Some(TokenPrice::new(3.0, 15.0)),
+            max_output_tokens: Some(1_000_000),
+            context_length: Some(2_000_000),
         };
         let p = CompletionParameters {
             max_tokens: Some(1_000_000),
             ..Default::default()
         };
-        let cost = estimate_cost_usd(&[user("hi")], &p, &r);
+        let cost = estimate_cost_usd(&[user("hi")], &p, &r).expect("priced and bounded");
         assert!((cost - 15.0).abs() < 0.001, "{cost}");
     }
 }

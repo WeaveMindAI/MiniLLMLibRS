@@ -2,11 +2,6 @@
 
 mod info;
 mod params;
-pub(crate) mod pricing;
 
 pub use info::GeneratorInfo;
-pub use params::{
-    CompletionParameters, NodeCompletionParameters, ProviderSettings, ReasoningConfig,
-    ResponseFormat,
-};
-pub use pricing::ModelRates;
+pub use params::{CompletionParameters, NodeCompletionParameters, Reasoning, ResponseFormat};

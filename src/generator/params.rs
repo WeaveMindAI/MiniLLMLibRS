@@ -13,14 +13,22 @@ use serde::{Deserialize, Serialize};
 /// [`extra`](Self::extra), the documented escape hatch: they are honestly just
 /// extra wire keys, not pretend-universal fields.
 ///
-/// Serde uses camelCase keys with every field optional (missing fields take
-/// the defaults), so a JSON settings object (`{"maxTokens": 1024,
+/// Every field is unset by default, and an unset field is no preference: the
+/// provider's own default applies (see each field for what that means on a
+/// wire that requires the key).
+///
+/// Serde uses camelCase keys with every field optional (missing fields stay
+/// unset), so a JSON settings object (`{"maxTokens": 1024,
 /// "temperature": 0.2}`) deserializes directly; unknown keys are ignored.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct CompletionParameters {
-    /// Maximum tokens to generate. The provider emits it under its own key
-    /// (`max_completion_tokens`, `max_tokens`, Anthropic's required `max_tokens`).
+    /// The most tokens the model may produce, reasoning and answer together.
+    /// The provider emits it under its own key (`max_completion_tokens`,
+    /// `max_tokens`); every supported wire already counts reasoning inside it.
+    /// Unset means no limit beyond the model's own: nothing is sent, except on
+    /// a wire whose API requires the key (Anthropic), which sends the model's
+    /// largest output, or 4096 when that is unknown.
     pub max_tokens: Option<u32>,
 
     /// Temperature for sampling (0.0 = deterministic, 2.0 = very random).
@@ -52,8 +60,8 @@ pub struct CompletionParameters {
     /// Seed for reproducibility
     pub seed: Option<u64>,
 
-    /// Normalized response-format intent (e.g. force JSON output). The provider
-    /// maps it to its wire (OpenAI `response_format`, Anthropic structured output).
+    /// Normalized response-format intent (e.g. force JSON output), sent as
+    /// OpenAI's `response_format`. Anthropic has no such field and refuses it.
     pub response_format: Option<ResponseFormat>,
 
     /// Tools the model may call, as normalized [`ToolDefinition`]s. The provider
@@ -70,8 +78,9 @@ pub struct CompletionParameters {
     /// `tool_choice`.
     pub parallel_tool_calls: Option<bool>,
 
-    /// Reasoning configuration (for models that support extended thinking).
-    pub reasoning: Option<ReasoningConfig>,
+    /// Whether the model reasons, and how hard (see [`Reasoning`]). Unset
+    /// sends nothing, so the API's own default applies.
+    pub reasoning: Option<Reasoning>,
 
     /// Provider-specific extra keys, merged into the request body as-is. This is
     /// the honest home for anything without a normalized meaning, e.g. OpenRouter
@@ -79,161 +88,60 @@ pub struct CompletionParameters {
     pub extra: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
-/// Reasoning configuration for models that support extended thinking.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReasoningConfig {
-    /// Effort level: "none", "minimal", "low", "medium", "high", "xhigh"
-    /// "none" disables reasoning entirely.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effort: Option<String>,
-
-    /// Explicit reasoning token budget (used by Anthropic, Gemini).
-    /// When set, overrides effort-based calculation.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens: Option<u32>,
-
-    /// If true, reasoning is performed but excluded from the response.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exclude: Option<bool>,
-}
-
-/// OpenRouter provider routing settings
+/// Whether the model reasons before answering. Unset (`None` on
+/// [`CompletionParameters::reasoning`]) sends nothing, so the API's own default
+/// applies.
 ///
-/// See: <https://openrouter.ai/docs/provider-routing>
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ProviderSettings {
-    /// Ordered list of provider names to try
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub order: Option<Vec<String>>,
-
-    /// Sort providers by: "price", "throughput", or "latency"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sort: Option<String>,
-
-    /// List of providers to ignore/exclude
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ignore: Option<Vec<String>>,
-
-    /// Data collection preference: "allow" or "deny"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data_collection: Option<String>,
-
-    /// Allow fallback to other providers if preferred ones fail
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub allow_fallbacks: Option<bool>,
-
-    /// Require specific provider parameters
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub require_parameters: Option<bool>,
+/// Each provider sends its own spelling, and nothing is checked: a model that
+/// cannot do what was asked refuses at the API, and that refusal is the
+/// request's error.
+///
+/// In JSON it is one word: `"off"`, `"on"`, or anything else, which is an
+/// effort sent as written (`"high"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reasoning {
+    /// What the API calls no reasoning.
+    Off,
+    /// Reason. `None` is the API's lowest effort; `Some` is an effort word
+    /// sent as written, in the API's own vocabulary.
+    On(Option<String>),
 }
 
-impl ProviderSettings {
-    /// Create new provider settings
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// The provider slug whose rates will bill this request, as far as these
-    /// settings can promise, or `None` when the request may be served by anyone.
-    ///
-    /// Exactly one provider is guaranteed only when `order` names one AND
-    /// fallbacks are off. With fallbacks left on (OpenRouter's default), a listed
-    /// provider is a preference, not a promise, and the request may be served by
-    /// anyone: the price must then be bounded across every provider. Same for
-    /// `sort`, which reorders candidates without excluding any.
-    ///
-    /// This is deliberately conservative. Reading it as "pinned" when it is not
-    /// under-estimates the cost, and an estimate that is sometimes low is the one
-    /// failure a reservation cannot tolerate. When a request pins a provider this
-    /// way, price it with
-    /// [`GeneratorInfo::model_rates_served_by`](crate::GeneratorInfo::model_rates_served_by)
-    /// passing the pinned slug, so the estimate reflects who will really bill.
-    pub fn billing_provider(&self) -> Option<String> {
-        match (&self.order, self.allow_fallbacks) {
-            (Some(order), Some(false)) if order.len() == 1 => Some(order[0].clone()),
-            _ => None,
+impl Reasoning {
+    /// The one word for it: `"off"`, `"on"`, or the effort.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Off => "off",
+            Self::On(None) => "on",
+            Self::On(Some(effort)) => effort,
         }
-    }
-
-    /// Serialize to the JSON value OpenRouter expects under the request's
-    /// `"provider"` key (used by [`CompletionParameters::with_openrouter_routing`]).
-    pub fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self).unwrap_or(serde_json::Value::Null)
-    }
-
-    /// Set ordered list of providers to try
-    pub fn with_order(mut self, providers: Vec<String>) -> Self {
-        self.order = Some(providers);
-        self
-    }
-
-    /// Sort by throughput (fastest)
-    pub fn sort_by_throughput(mut self) -> Self {
-        self.sort = Some("throughput".to_string());
-        self
-    }
-
-    /// Sort by price (cheapest)
-    pub fn sort_by_price(mut self) -> Self {
-        self.sort = Some("price".to_string());
-        self
-    }
-
-    /// Sort by latency (lowest)
-    pub fn sort_by_latency(mut self) -> Self {
-        self.sort = Some("latency".to_string());
-        self
-    }
-
-    /// Set providers to ignore/exclude
-    pub fn with_ignore(mut self, providers: Vec<String>) -> Self {
-        self.ignore = Some(providers);
-        self
-    }
-
-    /// Deny data collection
-    pub fn deny_data_collection(mut self) -> Self {
-        self.data_collection = Some("deny".to_string());
-        self
-    }
-
-    /// Allow data collection
-    pub fn allow_data_collection(mut self) -> Self {
-        self.data_collection = Some("allow".to_string());
-        self
-    }
-
-    /// Set whether to allow fallbacks
-    pub fn with_fallbacks(mut self, allow: bool) -> Self {
-        self.allow_fallbacks = Some(allow);
-        self
     }
 }
 
-impl Default for CompletionParameters {
-    fn default() -> Self {
-        Self {
-            max_tokens: Some(4096),
-            temperature: Some(0.7),
-            top_p: None,
-            top_k: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            repetition_penalty: None,
-            stop: None,
-            seed: None,
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            parallel_tool_calls: None,
-            reasoning: None,
-            extra: None,
+impl From<&str> for Reasoning {
+    fn from(word: &str) -> Self {
+        match word {
+            "off" => Self::Off,
+            "on" => Self::On(None),
+            effort => Self::On(Some(effort.to_string())),
         }
+    }
+}
+
+impl Serialize for Reasoning {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Reasoning {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(Self::from(String::deserialize(d)?.as_str()))
     }
 }
 
 impl CompletionParameters {
-    /// Create new parameters with just max_tokens
+    /// Create new parameters with every field unset.
     pub fn new() -> Self {
         Self::default()
     }
@@ -274,8 +182,8 @@ impl CompletionParameters {
         self
     }
 
-    /// Set reasoning configuration
-    pub fn with_reasoning(mut self, reasoning: ReasoningConfig) -> Self {
+    /// Set whether the model reasons, and how hard.
+    pub fn with_reasoning(mut self, reasoning: Reasoning) -> Self {
         self.reasoning = Some(reasoning);
         self
     }
@@ -343,16 +251,6 @@ impl CompletionParameters {
         }
     }
 
-    /// Set OpenRouter provider-routing settings (order/sort/ignore/data_collection).
-    ///
-    /// OpenRouter-specific: it goes through [`extra`](Self::extra) under the
-    /// `"provider"` key (the honest home for a provider-specific knob), so it
-    /// reaches OpenRouter's wire and is simply ignored by providers that don't
-    /// understand it, rather than masquerading as a universal parameter.
-    pub fn with_openrouter_routing(self, routing: ProviderSettings) -> Self {
-        self.with_extra("provider", routing.to_value())
-    }
-
     /// Add extra parameters to pass directly to the API
     pub fn with_extra(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         let extra = self
@@ -362,7 +260,8 @@ impl CompletionParameters {
         self
     }
 
-    /// Set multiple extra parameters at once
+    /// Replace every extra parameter at once, dropping any set before
+    /// (OpenRouter routing included).
     pub fn with_extras(
         mut self,
         extras: std::collections::HashMap<String, serde_json::Value>,
@@ -385,13 +284,15 @@ pub enum ResponseFormat {
     JsonObject,
 }
 
-use crate::provider::{CostCallback, TokenPrice};
+use crate::provider::CostCallback;
 
 /// Per-request completion parameters (used when calling complete on a node)
 #[derive(Clone)]
 pub struct NodeCompletionParameters {
-    /// Override completion parameters
-    pub params: Option<CompletionParameters>,
+    /// The completion parameters for this request, layered over the
+    /// generator's `default_params` (see
+    /// [`GeneratorInfo::request_params`](crate::GeneratorInfo::request_params)).
+    pub params: CompletionParameters,
 
     /// System prompt to prepend
     pub system_prompt: Option<String>,
@@ -423,7 +324,8 @@ pub struct NodeCompletionParameters {
     pub force_prepend: Option<String>,
 
     // Retry and error handling
-    /// Number of retry attempts on error (default: 4)
+    /// Number of retries after a failed attempt (default: 0, so one attempt).
+    /// Each retry is a new paid request, so it is only made when asked for.
     pub retry: u32,
 
     /// Use exponential backoff between retries
@@ -435,7 +337,9 @@ pub struct NodeCompletionParameters {
     /// Maximum wait time in seconds for backoff (default: 15.0)
     pub max_back_off: f64,
 
-    /// Raise error if model doesn't return valid JSON (when parse_json=true)
+    /// With `parse_json`, reject a response whose repaired JSON is empty or
+    /// null (what a model that refused instead of answering produces). A
+    /// rejected response is retried when `retry > 0`.
     pub crash_on_refusal: bool,
 
     /// Raise error if model returns empty output
@@ -453,10 +357,6 @@ pub struct NodeCompletionParameters {
     /// by the generator's provider accounting; this only says whether to track.
     pub track_cost: bool,
 
-    /// Per-request override of the generator's `token_price` (for providers that
-    /// price by token). When `None`, the generator's price is used.
-    pub token_price: Option<TokenPrice>,
-
     /// Callback function called with cost info after each completion
     pub cost_callback: Option<CostCallback>,
 }
@@ -464,14 +364,14 @@ pub struct NodeCompletionParameters {
 impl Default for NodeCompletionParameters {
     fn default() -> Self {
         Self {
-            params: None,
+            params: CompletionParameters::default(),
             system_prompt: None,
             format_kwargs: std::collections::HashMap::new(),
             add_child: true,
             parse_json: false,
             use_cache: false,
             force_prepend: None,
-            retry: 4,
+            retry: 0,
             exp_back_off: false,
             back_off_time: 1.0,
             max_back_off: 15.0,
@@ -479,7 +379,6 @@ impl Default for NodeCompletionParameters {
             crash_on_empty_response: false,
             timeout_secs: None,
             track_cost: false,
-            token_price: None,
             cost_callback: None,
         }
     }
@@ -494,7 +393,14 @@ impl std::fmt::Debug for NodeCompletionParameters {
             .field("add_child", &self.add_child)
             .field("parse_json", &self.parse_json)
             .field("force_prepend", &self.force_prepend)
+            .field("use_cache", &self.use_cache)
             .field("retry", &self.retry)
+            .field("exp_back_off", &self.exp_back_off)
+            .field("back_off_time", &self.back_off_time)
+            .field("max_back_off", &self.max_back_off)
+            .field("crash_on_refusal", &self.crash_on_refusal)
+            .field("crash_on_empty_response", &self.crash_on_empty_response)
+            .field("timeout_secs", &self.timeout_secs)
             .field("track_cost", &self.track_cost)
             .field("cost_callback", &self.cost_callback.is_some())
             .finish()
@@ -506,8 +412,22 @@ impl NodeCompletionParameters {
         Self::default()
     }
 
+    /// The request's deadline, if any. 0 means none, not an instantly-firing
+    /// 0s deadline.
+    pub(crate) fn timeout(&self) -> Option<std::time::Duration> {
+        self.timeout_secs
+            .filter(|&s| s > 0)
+            .map(std::time::Duration::from_secs)
+    }
+
+    /// Whether the request asks the provider for usage: when cost is tracked,
+    /// and when a cost callback is waiting for it.
+    pub(crate) fn tracks_usage(&self) -> bool {
+        self.track_cost || self.cost_callback.is_some()
+    }
+
     pub fn with_params(mut self, params: CompletionParameters) -> Self {
-        self.params = Some(params);
+        self.params = params;
         self
     }
 
@@ -585,7 +505,8 @@ impl NodeCompletionParameters {
         self
     }
 
-    /// Crash if model doesn't return valid JSON (requires parse_json=true)
+    /// With `parse_json`, reject a response whose repaired JSON is empty or
+    /// null (retried when `retry > 0`).
     pub fn with_crash_on_refusal(mut self, crash: bool) -> Self {
         self.crash_on_refusal = crash;
         self
@@ -609,13 +530,6 @@ impl NodeCompletionParameters {
         self
     }
 
-    /// Override the generator's per-token price for this request (for providers
-    /// that price by token).
-    pub fn with_token_price(mut self, price: TokenPrice) -> Self {
-        self.token_price = Some(price);
-        self
-    }
-
     /// Set a callback function to be called with cost info after each completion
     ///
     /// # Example
@@ -631,7 +545,7 @@ impl NodeCompletionParameters {
     ///     .with_cost_callback(move |info| {
     ///         let mut cost = cost_tracker.lock().unwrap();
     ///         *cost += info.cost;
-    ///         println!("Request cost: {} credits, Total: {}", info.cost, *cost);
+    ///         println!("Request cost: ${}, total: ${}", info.cost, *cost);
     ///     });
     /// ```
     pub fn with_cost_callback<F>(mut self, callback: F) -> Self
@@ -648,7 +562,7 @@ mod wire_tests {
     use super::CompletionParameters;
 
     /// A JSON settings object deserializes directly: camelCase keys, every
-    /// field optional (missing ones take the defaults), unknown keys ignored.
+    /// field optional (missing ones stay unset), unknown keys ignored.
     /// This is what lets a node's flat config map onto the parameters without
     /// a hand-written field-by-field translation.
     #[test]
@@ -668,13 +582,49 @@ mod wire_tests {
         assert_eq!(params.frequency_penalty, Some(0.5));
         assert_eq!(params.seed, Some(7));
 
-        // Missing fields take the type's defaults, same as ::new().
+        // Missing fields stay unset, same as ::new().
         let defaults: CompletionParameters = serde_json::from_value(serde_json::json!({})).unwrap();
-        assert_eq!(defaults.max_tokens, CompletionParameters::new().max_tokens);
-        assert_eq!(
-            defaults.temperature,
-            CompletionParameters::new().temperature
-        );
+        assert_eq!(defaults.max_tokens, None);
+        assert_eq!(defaults.temperature, None);
+    }
+
+    /// Reasoning is one word in JSON, in both directions, so a settings object
+    /// carries it as `"reasoning": "high"`. Any word that is not `off` or `on`
+    /// is an effort, kept as written.
+    #[test]
+    fn reasoning_is_one_word_in_json() {
+        use super::Reasoning;
+        for (reasoning, word) in [
+            (Reasoning::Off, "off"),
+            (Reasoning::On(None), "on"),
+            (Reasoning::On(Some("high".into())), "high"),
+            (
+                Reasoning::On(Some("whatever-a-vendor-adds".into())),
+                "whatever-a-vendor-adds",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&reasoning).unwrap(), word);
+            assert_eq!(
+                serde_json::from_value::<Reasoning>(serde_json::json!(word)).unwrap(),
+                reasoning
+            );
+        }
+        let params: CompletionParameters =
+            serde_json::from_value(serde_json::json!({ "reasoning": "high" })).unwrap();
+        assert_eq!(params.reasoning, Some(Reasoning::On(Some("high".into()))));
+    }
+
+    /// No field has a value nobody chose: a default `CompletionParameters`
+    /// serializes with every key null, so nothing it carries can reach a wire.
+    #[test]
+    fn default_parameters_set_nothing() {
+        let value = serde_json::to_value(CompletionParameters::default()).unwrap();
+        for (key, field) in value.as_object().unwrap() {
+            assert!(
+                field.is_null(),
+                "`{key}` defaults to {field}, expected unset"
+            );
+        }
     }
 
     #[test]
@@ -684,63 +634,5 @@ mod wire_tests {
             serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
         assert_eq!(back.max_tokens, Some(64));
         assert_eq!(back.seed, Some(3));
-    }
-}
-
-#[cfg(test)]
-mod billing_provider_tests {
-    use super::ProviderSettings;
-
-    /// The only configuration that guarantees who bills us: one provider, no
-    /// fallbacks. Anything else may be served by anyone.
-    #[test]
-    fn one_provider_with_fallbacks_off_pins_the_price() {
-        let settings = ProviderSettings::new()
-            .with_order(vec!["anthropic".into()])
-            .with_fallbacks(false);
-        assert_eq!(settings.billing_provider(), Some("anthropic".to_string()));
-    }
-
-    /// Fallbacks left on (OpenRouter's default) make an ordered provider a
-    /// preference, not a promise. Reading it as pinned would under-estimate.
-    #[test]
-    fn one_provider_with_fallbacks_on_is_not_pinned() {
-        let settings = ProviderSettings::new().with_order(vec!["anthropic".into()]);
-        assert_eq!(settings.billing_provider(), None);
-
-        let explicit = ProviderSettings::new()
-            .with_order(vec!["anthropic".into()])
-            .with_fallbacks(true);
-        assert_eq!(explicit.billing_provider(), None);
-    }
-
-    #[test]
-    fn several_ordered_providers_are_not_pinned_even_without_fallbacks() {
-        let settings = ProviderSettings::new()
-            .with_order(vec!["anthropic".into(), "amazon-bedrock".into()])
-            .with_fallbacks(false);
-        assert_eq!(settings.billing_provider(), None);
-    }
-
-    /// `sort` reorders the candidates without excluding any, so it pins nothing.
-    /// Even "cheapest first" can land on a dearer provider when the cheapest is
-    /// unavailable, which is exactly the case that must not under-estimate.
-    #[test]
-    fn sorting_by_price_does_not_pin_a_provider() {
-        assert_eq!(
-            ProviderSettings::new().sort_by_price().billing_provider(),
-            None
-        );
-        assert_eq!(
-            ProviderSettings::new()
-                .sort_by_throughput()
-                .billing_provider(),
-            None
-        );
-    }
-
-    #[test]
-    fn no_settings_at_all_leaves_routing_free() {
-        assert_eq!(ProviderSettings::new().billing_provider(), None);
     }
 }

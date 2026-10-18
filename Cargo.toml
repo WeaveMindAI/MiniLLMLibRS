@@ -1,6 +1,6 @@
 [package]
 name = "minillmlib"
-version = "0.5.11"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.86"
 description = "A minimalist, async-first Rust library for LLM interactions with streaming support"
@@ -25,16 +25,17 @@ exclude = [
 
 [features]
 # Opt-in live integration tests that make REAL, billed API calls (OpenRouter +
-# Anthropic). Off by default so `cargo test` is free, offline, and deterministic.
+# Anthropic). Off by default, so a plain `cargo test` makes no network call and
+# costs nothing.
 # Run with: `cargo test --features live` (needs OPENROUTER_API_KEY and/or
-# ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN in the environment).
+# ANTHROPIC_API_KEY in the environment).
 live = []
 
-# Estimate a completion's cost BEFORE sending it. Off by default: it is only
-# useful to a caller that must gate a request on affordability, and it embeds a
-# 1.6 MB token vocabulary that a plain completion never needs. The price lookup
-# (`GeneratorInfo::model_rates`) is NOT behind this feature: pricing a completion
-# after the fact needs rates, not a tokenizer.
+# Estimate a completion's cost BEFORE sending it. Off by default: it only
+# matters if you need to know, before sending, whether a request is affordable,
+# and it embeds a 1.6 MB token vocabulary that a plain completion never needs. The price lookup
+# (`GeneratorInfo::model_info`) is NOT behind this feature: pricing a completion
+# after the fact needs a price, not a tokenizer.
 estimate = ["dep:regex"]
 
 [lib]

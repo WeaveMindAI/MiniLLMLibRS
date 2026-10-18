@@ -93,14 +93,15 @@ impl Usage {
 /// silently counted as a real zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CostResolution {
-    /// The USD cost is authoritative (returned natively by the provider, or
-    /// derived from real token counts and a configured `TokenPrice`).
+    /// The USD cost is real: the provider's own figure, or the token counts at
+    /// the model's price (given, or looked up).
     #[default]
     Resolved,
-    /// Token counts are real, but the provider returns no native cost and no
-    /// `TokenPrice` was configured for this generator/request, so the USD amount
-    /// is unknown. Set a `TokenPrice` (on the generator or per-request) to resolve
-    /// it. The `cost` field is 0.0 and must NOT be treated as a free request.
+    /// Token counts are real, but the provider returns no native cost and the
+    /// model's price is unknown (not given, and the lookup found none), so the
+    /// USD amount is unknown. Give the price on the generator
+    /// (`with_token_price`) to resolve it. The `cost` field is 0.0 and must NOT
+    /// be treated as a free request.
     Unpriced,
     /// Cost could not be determined at all (no usage was returned and any
     /// out-of-band query failed). Numeric fields are best-effort.
@@ -142,8 +143,8 @@ pub struct CostInfo {
     pub resolution: CostResolution,
 }
 
-/// Callback function type for cost ingestion
-/// Called with CostInfo after each successful completion
+/// Callback function type for cost ingestion: called with the CostInfo of
+/// every billed request, a response later rejected included.
 pub type CostCallback = Arc<dyn Fn(CostInfo) + Send + Sync>;
 
 /// A complete response from an LLM API.

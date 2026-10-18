@@ -16,9 +16,6 @@
 //!   auth, request body, response/stream envelope). Ships OpenAI/OpenRouter,
 //!   native Anthropic (`/v1/messages`, `content[]`), and a generic compatible
 //!   provider; a custom enterprise API is a small `impl Provider`.
-//! - **Subscription auth**: a Claude Pro/Max OAuth token works via
-//!   [`Auth::BearerToken`] (see [`GeneratorInfo::claude_subscription`]); cost is a
-//!   token-count ESTIMATE through [`TokenPrice`].
 //! - **Cost Tracking**: Per-provider usage & cost accounting behind the [`Provider`]
 //!   trait; enforced tracking via [`CompletionContext`], with honest
 //!   [`CostResolution`] (`Resolved`/`Unpriced`/`Unknown`, never a fake $0)
@@ -49,18 +46,21 @@
 //!
 //! # Estimating a call's cost
 //!
-//! With the `estimate` feature, the generator answers directly (a deliberately
-//! high figure, to reserve against):
+//! With the `estimate` feature, the generator answers directly: a deliberately
+//! high figure to reserve against, or `None` when the model's price (or how
+//! much it can produce) is unknown.
 //!
 //! ```no_run
 //! # #[cfg(feature = "estimate")]
-//! # async fn example(generator: minillmlib::GeneratorInfo, prompt: minillmlib::ChatNode, params: minillmlib::CompletionParameters) -> minillmlib::error::Result<()> {
-//! let usd = generator.estimate_cost_usd(&prompt.thread(), &params).await?;
-//! # Ok(())
+//! # async fn example(generator: minillmlib::GeneratorInfo, prompt: minillmlib::ChatNode, params: minillmlib::CompletionParameters) {
+//! match generator.estimate_cost_usd(&prompt.thread(), &params).await {
+//!     Some(usd) => println!("at most ${usd:.4}"),
+//!     None => println!("this model's price is unknown"),
+//! }
 //! # }
 //! ```
 //!
-//! See [`GeneratorInfo::estimate_cost_usd`] and [`GeneratorInfo::model_rates`].
+//! See [`GeneratorInfo::estimate_cost_usd`] and [`GeneratorInfo::model_info`].
 
 // Core modules
 pub mod chat_node;
@@ -79,20 +79,17 @@ pub use chat_node::{
     ThreadData,
 };
 pub use error::{MiniLLMError, Result};
-pub use generator::{
-    CompletionParameters, GeneratorInfo, ModelRates, NodeCompletionParameters, ProviderSettings,
-    ReasoningConfig,
-};
+pub use generator::{CompletionParameters, GeneratorInfo, NodeCompletionParameters, Reasoning};
 pub use json_repair::{loads, repair_json, JsonValue, RepairOptions};
 pub use message::{
     AudioData, AudioInput, ContentPart, DocumentData, FileData, ImageData, ImageUrl, Media,
     MediaData, Message, MessageContent, Role, VideoData, VideoUrl,
 };
 pub use provider::{
-    resolve_claude_subscription_auth, AnthropicProvider, AppIdentity, Auth, CompletionResponse,
-    CostCallback, CostInfo, CostOutcome, CostResolution, GenericProvider, LLMClient,
-    OpenAiProvider, OpenRouterProvider, PostStreamCtx, Provider, StreamChunk, StreamingCompletion,
-    TokenPrice, Usage,
+    AnthropicProvider, AppIdentity, Auth, CompletionResponse, CostCallback, CostInfo, CostOutcome,
+    CostResolution, GenericProvider, InfoFuture, LLMClient, ModelInfo, ModelLookup, OpenAiProvider,
+    OpenRouterProvider, OpenRouterRouting, Provider, SideCall, StreamChunk, StreamingCompletion,
+    TokenPrice, Usage, UsageFuture, UsageQuery, Wanted,
 };
 
 /// Pre-call cost estimation. Requires the `estimate` feature, which pulls in a

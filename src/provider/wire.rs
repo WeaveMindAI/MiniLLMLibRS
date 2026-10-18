@@ -7,9 +7,10 @@
 //!   streaming `stream_options:{include_usage:true}`, Anthropic always-on),
 //! - the usage field names (`prompt_tokens` vs `input_tokens`, etc.),
 //! - whether cost is returned natively in USD (OpenRouter) or not at all (OpenAI,
-//!   Anthropic return token counts only, you price them via [`TokenPrice`]),
-//! - out-of-band cost resolution (OpenRouter has a `/generation` endpoint; most
+//!   Anthropic return token counts only, priced at the model's [`TokenPrice`]),
+//! - usage reported out of band (OpenRouter has a `/generation` endpoint; most
 //!   providers have none),
+//! - where the model's price and limits are looked up,
 //! - attribution headers (OpenRouter's `HTTP-Referer`/`X-Title`).
 //!
 //! All of it lives behind the [`Provider`] trait, owned by
@@ -210,25 +211,196 @@ impl CostOutcome {
     }
 }
 
-/// Context for an out-of-band post-stream cost query (a cancelled/usage-less
-/// stream). Carries what a provider needs to hit its own endpoint, if it has
-/// one. The client is the GENERATOR's (owned, since the resolve may outlive
-/// the borrow that built this context): an injected client's routing sees the
-/// follow-up exactly like the call it resolves.
-pub struct PostStreamCtx<'a> {
+/// Where a side call about a request goes (a model lookup, a cost query): the
+/// client, address and headers (auth, attribution, custom) the request itself
+/// rides, so a generator behind a gateway is asked through that gateway exactly
+/// like its requests are.
+#[derive(Debug, Clone)]
+pub struct SideCall {
     pub client: reqwest_middleware::ClientWithMiddleware,
-    /// The generator's base URL. The query goes to the same address as the
-    /// call it resolves (and authenticates with the same credential), so a
-    /// generator pointed at a gateway keeps working: never hardcode a host.
-    pub base_url: &'a str,
-    pub generation_id: &'a str,
-    pub auth: &'a Auth,
-    pub price: Option<&'a TokenPrice>,
+    pub base_url: String,
+    pub headers: reqwest::header::HeaderMap,
 }
 
-/// Boxed future returned by [`Provider::resolve_post_stream`] (keeps the
-/// trait object-safe since async-fn-in-trait is not yet dyn-compatible).
-pub type CostFuture<'a> = Pin<Box<dyn Future<Output = CostOutcome> + Send + 'a>>;
+impl SideCall {
+    /// The URL of `path` (with its query, if any) under the base URL, joined
+    /// with exactly one `/`.
+    pub fn url(&self, path: &str) -> String {
+        format!(
+            "{}/{}",
+            self.base_url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    }
+
+    /// GET `path` (with its query, if any) under the base URL. Returns the
+    /// status and body text; transport failures and timeouts map as they do
+    /// for a request.
+    pub async fn get(
+        &self,
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> crate::error::Result<(reqwest::StatusCode, String)> {
+        super::client::get_text(&self.client, &self.url(path), self.headers.clone(), timeout).await
+    }
+
+    /// GET `path` and `parse` the reply, shared across the whole process: one
+    /// request per URL, header set and parsed type, however many callers ask.
+    /// Callers waiting at the same moment share it, and it runs to its end
+    /// even if they all give up.
+    ///
+    /// `parse` sees the status and body and returns the value, and is run once
+    /// per request, so whatever it logs is logged once. What is kept, and for
+    /// how long:
+    /// - a value `parse` returns from a success or a 404 (the thing does not
+    ///   exist): an hour;
+    /// - a value from any other status, or an error `parse` returns: nothing
+    ///   is kept beyond the callers already waiting, so the next caller asks
+    ///   again;
+    /// - no reply at all (a timeout, a refused connection): a minute, so a
+    ///   source that is down costs one wait a minute rather than one per
+    ///   caller.
+    ///
+    /// A failure is logged once, here, and reaches every waiting caller as
+    /// [`MiniLLMError::SideRequest`](crate::MiniLLMError::SideRequest). The
+    /// client is not part of the key: two clients asking the same URL with the
+    /// same headers share the answer.
+    pub async fn get_cached<T: Clone + Send + Sync + 'static>(
+        &self,
+        path: &str,
+        timeout: std::time::Duration,
+        parse: impl FnOnce(reqwest::StatusCode, &str) -> crate::error::Result<T> + Send + 'static,
+    ) -> crate::error::Result<T> {
+        type Any = std::sync::Arc<dyn std::any::Any + Send + Sync>;
+        static REPLIES: std::sync::LazyLock<super::memo::Memo<Any>> =
+            std::sync::LazyLock::new(super::memo::Memo::new);
+        const KEPT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+        let url = self.url(path);
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut headers = std::collections::hash_map::DefaultHasher::new();
+            for (name, value) in &self.headers {
+                name.as_str().hash(&mut headers);
+                value.as_bytes().hash(&mut headers);
+            }
+            format!(
+                "{url}\n{:x}\n{:?}",
+                headers.finish(),
+                std::any::TypeId::of::<T>()
+            )
+        };
+        let call = self.clone();
+        let value = REPLIES
+            .get_or_lookup(&key, move || {
+                Box::pin(async move {
+                    let reply =
+                        super::client::get_text(&call.client, &url, call.headers.clone(), timeout)
+                            .await;
+                    let (outcome, ttl) = match reply {
+                        Err(e) => (Err(e), super::memo::FAILURE_TTL),
+                        Ok((status, body)) => {
+                            let lasting =
+                                status.is_success() || status == reqwest::StatusCode::NOT_FOUND;
+                            let ttl = if lasting {
+                                KEPT
+                            } else {
+                                std::time::Duration::ZERO
+                            };
+                            match parse(status, &body) {
+                                Ok(value) => (Ok(std::sync::Arc::new(value) as Any), ttl),
+                                Err(e) => (Err(e), std::time::Duration::ZERO),
+                            }
+                        }
+                    };
+                    if let Err(e) = &outcome {
+                        tracing::warn!("{url}: {e}");
+                    }
+                    (outcome, ttl)
+                })
+            })
+            .await
+            .map_err(crate::error::MiniLLMError::SideRequest)?;
+        Ok(value
+            .downcast_ref::<T>()
+            .expect("the key names the type, so the value is that type")
+            .clone())
+    }
+}
+
+/// Context for an out-of-band usage query (a stream that ended without its
+/// usage, a cancelled one): where to ask, and which generation.
+pub struct UsageQuery<'a> {
+    pub call: SideCall,
+    pub generation_id: &'a str,
+}
+
+/// Boxed future returned by [`Provider::usage_out_of_band`] (keeps the trait
+/// object-safe since async-fn-in-trait is not yet dyn-compatible).
+pub type UsageFuture<'a> = Pin<Box<dyn Future<Output = Option<Usage>> + Send + 'a>>;
+
+/// What the library knows about one model: what it charges, and how much it
+/// can produce and read. Cost estimation and a required output cap are figured
+/// from it, the same way for every provider. Unknown is `None`.
+///
+/// The caller can give it ([`GeneratorInfo::with_model_info`](crate::GeneratorInfo::with_model_info));
+/// whatever the caller leaves unset, the generator's provider looks up
+/// ([`Provider::model_info`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelInfo {
+    /// What the model charges per token.
+    pub price: Option<TokenPrice>,
+    /// The most tokens the model may produce in one response, reasoning
+    /// included.
+    pub max_output_tokens: Option<u32>,
+    /// The model's whole context window, input plus output.
+    pub context_length: Option<u32>,
+}
+
+impl ModelInfo {
+    /// Every field `self` leaves unset, filled from `other`.
+    pub fn or(self, other: ModelInfo) -> ModelInfo {
+        ModelInfo {
+            price: self.price.or(other.price),
+            max_output_tokens: self.max_output_tokens.or(other.max_output_tokens),
+            context_length: self.context_length.or(other.context_length),
+        }
+    }
+}
+
+/// Which facts about a model a caller needs looked up: the price, the limits
+/// (largest output and context window), or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wanted {
+    pub price: bool,
+    pub limits: bool,
+}
+
+impl Wanted {
+    /// Everything.
+    pub const ALL: Wanted = Wanted {
+        price: true,
+        limits: true,
+    };
+}
+
+/// What a provider gets to look a model up with.
+pub struct ModelLookup {
+    /// Where the generator's requests go: its client, address and headers.
+    pub call: SideCall,
+    /// The model's id on this wire.
+    pub model: String,
+    /// The model's id in OpenRouter's catalog, when the caller set one
+    /// ([`GeneratorInfo::with_openrouter_name`](crate::GeneratorInfo::with_openrouter_name)).
+    pub openrouter_name: Option<String>,
+    /// The facts the caller needs and does not have: a source that would only
+    /// fill the others need not be asked.
+    pub wanted: Wanted,
+}
+
+/// Boxed future returned by [`Provider::model_info`]. A lookup never fails: a
+/// source that cannot answer is logged and leaves its fields unknown.
+pub type InfoFuture = Pin<Box<dyn Future<Output = ModelInfo> + Send>>;
 
 /// The calling application's identity, for providers that attribute usage to an
 /// app (e.g. OpenRouter rankings). Set on the [`GeneratorInfo`](crate::GeneratorInfo);
@@ -252,16 +424,6 @@ pub struct AppIdentity {
 /// A provider with a different envelope (Anthropic's `/v1/messages` + `content[]`)
 /// overrides the shape methods too.
 pub trait Provider: Send + Sync + std::fmt::Debug {
-    /// This provider's slug in OpenRouter's catalog (`anthropic`, `openai`, ...),
-    /// when it is a vendor the catalog lists. Cost estimation prices a call at
-    /// this provider's own published rates. `None` for a provider the catalog
-    /// does not list as a vendor (a router, a custom API): estimation then falls
-    /// back to the generator's name, and past that to the dearest rate any
-    /// provider of the model charges.
-    fn openrouter_slug(&self) -> Option<&'static str> {
-        None
-    }
-
     // ---- wire shape (default = OpenAI `/chat/completions` + `choices[]`) -------
 
     /// The full completions endpoint URL for `base_url`. Default appends
@@ -270,17 +432,36 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
         format!("{}/chat/completions", base_url.trim_end_matches('/'))
     }
 
-    /// HTTP auth headers for this provider's wire, given the generator's [`Auth`]
-    /// strategy. Default OpenAI-wire: a key or token becomes
+    /// HTTP auth headers for this provider's wire, given the generator's
+    /// [`Auth`]. Default OpenAI-wire: a key or token becomes
     /// `Authorization: Bearer <secret>`. Anthropic maps `ApiKey` to `x-api-key`.
     fn auth_headers(&self, auth: &Auth) -> crate::error::Result<Vec<(String, String)>> {
         super::openai_wire::openai_auth_headers(auth)
     }
 
+    /// How this provider finds out about a model (see [`ModelInfo`]), or
+    /// `None` when it has no way to. Fill what you can find and leave the rest
+    /// unset; a source that cannot answer is logged and leaves its fields
+    /// unset. Ask through [`SideCall::get_cached`], which shares each request
+    /// across the process, so a lookup costs one round trip per model, not one
+    /// per call. The default has no way.
+    fn model_info(&self, _lookup: ModelLookup) -> Option<InfoFuture> {
+        None
+    }
+
+    /// Whether this wire's API refuses a request without an output cap. When
+    /// it does and the caller set none, the request carries the model's
+    /// largest ([`ModelInfo::max_output_tokens`]), or 4096 when that is
+    /// unknown. Default: no.
+    fn requires_max_tokens(&self) -> bool {
+        false
+    }
+
     /// Build the request body from normalized inputs. `include_usage` asks the
-    /// provider to opt into usage reporting if its wire requires a flag. Default =
-    /// the OpenAI body shape (typed params + `model`/`messages`/`stream` + the
-    /// provider's token-limit key + usage opt-in + merged `extra`).
+    /// provider to opt into usage reporting if its wire requires a flag.
+    /// Default = the OpenAI body shape (typed params + `model`/`messages`/
+    /// `stream` + the provider's token-limit key + usage opt-in + merged
+    /// `extra`).
     fn build_request(
         &self,
         model: &str,
@@ -310,25 +491,20 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// consulted by the default [`build_request`](Self::build_request).
     fn openai_request_usage(&self, _body: &mut serde_json::Value, _stream: bool) {}
 
-    /// (OpenAI-default helper) write the normalized [`ReasoningConfig`] onto the
-    /// request body in this wire's dialect. Only consulted by the default
+    /// (OpenAI-default helper) the request key and value a
+    /// [`Reasoning`](crate::generator::Reasoning) becomes in this wire's
+    /// dialect. Only consulted by the default
     /// [`build_request`](Self::build_request); a provider with its own envelope
     /// translates reasoning inside its own `build_request`.
     ///
-    /// The contract every wire honours: "off" (`effort: "none"`) never fails a
-    /// request. A wire whose models are off unless asked, and whose plain
-    /// models refuse the key in any value (OpenAI's `reasoning_effort`), writes
-    /// nothing for off. The default is OpenAI's dialect: `reasoning_effort:
-    /// <effort>` for an effort other than `none`, nothing for `none`; a budget
-    /// (`max_tokens`) is refused, since this wire has no budget knob and
-    /// dropping it would silently change what the caller asked for; `exclude`
-    /// is a no-op, since a chat completion never returns the reasoning text.
-    fn openai_reasoning_value(
+    /// The default is OpenAI's dialect: `reasoning_effort`, `"none"` for off,
+    /// `"low"` (the lowest effort every OpenAI reasoning model takes) for on
+    /// with no effort, and the caller's word as written for on with one.
+    fn openai_reasoning_field(
         &self,
-        obj: &mut serde_json::Map<String, serde_json::Value>,
-        reasoning: &crate::generator::ReasoningConfig,
-    ) -> crate::error::Result<()> {
-        super::openai_wire::openai_reasoning_effort(obj, reasoning)
+        reasoning: &crate::generator::Reasoning,
+    ) -> (&'static str, serde_json::Value) {
+        super::openai_wire::openai_reasoning_field(reasoning)
     }
 
     /// How many cache breakpoints this provider's wire accepts per request.
@@ -448,10 +624,13 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
     /// [`CostOutcome::unpriced`].
     fn cost_of(&self, usage: Usage, price: Option<&TokenPrice>) -> CostOutcome;
 
-    /// Resolve cost out-of-band for a stream that ended *without* usage. Only
-    /// reached when no usage was captured. Default: unresolvable → `Unknown`.
-    fn resolve_post_stream<'a>(&'a self, _ctx: PostStreamCtx<'a>) -> CostFuture<'a> {
-        Box::pin(async { CostOutcome::unknown() })
+    /// The usage of a generation whose response carried none (a stream that
+    /// ended without its usage chunk, a cancelled one), from the provider's own
+    /// record of it, or `None` when it has no such record. The cost is then
+    /// worked out from it like any other usage ([`cost_of`](Self::cost_of)).
+    /// Default: no record.
+    fn usage_out_of_band<'a>(&'a self, _ctx: UsageQuery<'a>) -> UsageFuture<'a> {
+        Box::pin(async { None })
     }
 }
 
@@ -459,8 +638,9 @@ pub trait Provider: Send + Sync + std::fmt::Debug {
 /// provider's [`Provider::max_cache_breakpoints`] cap: of all marked
 /// messages, the LAST `max` (the most-recent prefixes are the largest
 /// reusable spans). Warns when marks are dropped. Provider-agnostic:
-/// the cap and the marker's wire form are each provider's own.
-pub(crate) fn kept_cache_breakpoints(
+/// the cap and the marker's wire form are each provider's own, so a custom
+/// `build_request` that writes cache markers calls this with its own cap.
+pub fn kept_cache_breakpoints(
     messages: &[Message],
     max: usize,
 ) -> std::collections::HashSet<usize> {

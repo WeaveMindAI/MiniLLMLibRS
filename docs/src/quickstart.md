@@ -5,7 +5,7 @@
 ```toml
 # Cargo.toml
 [dependencies]
-minillmlib = "0.5"
+minillmlib = "0.6"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -16,7 +16,8 @@ use minillmlib::{ChatNode, GeneratorInfo};
 
 #[tokio::main]
 async fn main() -> minillmlib::Result<()> {
-    // Pick a provider. OpenRouter reads OPENROUTER_API_KEY from the environment.
+    // Pick a provider. OpenRouter reads OPENROUTER_API_KEY from the environment
+    // (if it is in a .env file, call `minillmlib::init()` first, which loads it).
     let generator = GeneratorInfo::openrouter("google/gemini-2.5-flash-lite");
 
     // A conversation is a tree; `root` is the system prompt.
@@ -30,20 +31,18 @@ async fn main() -> minillmlib::Result<()> {
 }
 ```
 
-That is the 80% case. Swapping the provider is a one-line change and nothing else
-moves:
+If you want another provider, change that one line:
 
 ```rust,no_run
 # use minillmlib::GeneratorInfo;
 GeneratorInfo::openrouter("google/gemini-2.5-flash-lite");      // OPENROUTER_API_KEY
 GeneratorInfo::openai("gpt-4o-mini");                           // OPENAI_API_KEY
 GeneratorInfo::anthropic("claude-haiku-4-5");                   // ANTHROPIC_API_KEY, native /v1/messages
-GeneratorInfo::claude_subscription("claude-haiku-4-5");         // your Pro/Max plan, no API key
 GeneratorInfo::custom("my", "http://localhost:8000/v1", "m");   // your own OpenAI-compatible server
 ```
 
-See [Providers](./providers.md) for what each does, and
-[Custom Providers](./custom-providers.md) for connecting your own server.
+For what each preset does, go and read [Providers](./providers.md), and to
+connect your own server, [Custom Providers](./custom-providers.md).
 
 ## A multi-turn conversation
 
@@ -68,9 +67,11 @@ async fn main() -> minillmlib::Result<()> {
 
 ## Errors
 
-Every fallible call returns [`minillmlib::Result<T>`], an alias for
-`Result<T, MiniLLMError>`. The library fails loudly: an auth/validation error,
-a malformed response, or an exhausted retry surface as a typed `MiniLLMError`,
-never a silent empty success.
+Every fallible call returns [`minillmlib::Result<T>`], whose error is a
+`MiniLLMError` you can match on: `Api { status, message }` when the provider
+refuses, `Timeout`, and `MaxRetriesExceeded` once retries you turned on run
+out. An empty reply counts as a success unless you pass
+`NodeCompletionParameters::new().with_crash_on_empty(true)` to `complete` (see
+[Completion Parameters](./parameters.md)).
 
-[`minillmlib::Result<T>`]: https://docs.rs/minillmlib/latest/minillmlib/type.Result.html
+[`minillmlib::Result<T>`]: https://docs.rs/minillmlib/latest/minillmlib/error/type.Result.html

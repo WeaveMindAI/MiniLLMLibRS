@@ -1,6 +1,6 @@
 # MiniLLMLib-RS
 
-A minimalist, async-first Rust library for LLM interactions with streaming support.
+A small async Rust library for calling LLMs, with the same code whatever the provider.
 
 [![Crates.io](https://img.shields.io/crates/v/minillmlib.svg)](https://crates.io/crates/minillmlib)
 [![Documentation](https://docs.rs/minillmlib/badge.svg)](https://docs.rs/minillmlib)
@@ -14,20 +14,22 @@ A minimalist, async-first Rust library for LLM interactions with streaming suppo
 
 ## Features
 
-- **Async-first**: Built on Tokio for high-performance async operations
-- **Streaming Support**: First-class SSE streaming for real-time responses
+- **Async**: built on Tokio
+- **Streaming**: replies arrive token by token over SSE
 - **Conversation Trees**: `ChatNode` provides tree-based conversation structure with branching
 - **Tree Manipulation**: `detach()`, `merge()`, tree iterators (depth-first, breadth-first, leaves)
 - **Template Substitution**: Format kwargs with `{placeholders}` in messages
 - **Thread Serialization**: Save/load conversation threads to/from JSON files
-- **Cost Tracking**: OpenRouter usage accounting with callbacks
+- **Reasoning**: off, on, or on at an effort you name, written in each provider's own spelling
+- **Only what you set is sent**: an unset parameter stays off the wire, except the output cap Anthropic requires
+- **Cost Tracking**: what every call cost, through callbacks or returned with the reply, for every provider
 - **Cost Estimation**: what a call will cost *before* it is sent, so you can decide whether to allow it (opt-in `estimate` feature)
 - **Tool Calling**: Normalized `ToolDefinition`/`ToolChoice`/`ToolCall` types; each provider emits its own wire (OpenAI `tools`, Anthropic `tool_use`), streaming included
-- **Multimodal**: Support for images, audio, video and documents (PDF) in messages
-- **JSON Repair**: Robust handling of malformed JSON from LLM outputs
-- **OpenRouter Compatible**: Works with OpenRouter, OpenAI, and any OpenAI-compatible API
-- **Retry with Backoff**: Built-in exponential backoff and retry logic
-- **Provider Routing**: OpenRouter provider settings (sort, ignore, data collection)
+- **Multimodal**: Support for images, audio, video and documents (PDF) in messages (Anthropic's own API takes images and PDFs, but no audio or video)
+- **JSON Repair**: fixes the broken JSON models often return
+- **Providers**: OpenRouter, OpenAI, Anthropic, and any OpenAI-compatible server
+- **Retry with Backoff**: Exponential backoff and retries, off unless you ask (each retry is a new paid request)
+- **OpenRouter routing**: `OpenRouterRouting` (sort, ignore, data collection)
 
 ## Installation
 
@@ -35,8 +37,8 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-minillmlib = "0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+minillmlib = "0.6"
+tokio = { version = "1", features = ["full"] }
 ```
 
 ### Optional features
@@ -70,13 +72,9 @@ async fn main() -> minillmlib::Result<()> {
 
 ## Environment Variables
 
-Set your API key in a `.env` file or environment:
-
-```bash
-OPENROUTER_API_KEY=sk-or-v1-your-key-here
-# Or for direct OpenAI:
-OPENAI_API_KEY=sk-your-key-here
-```
+Each preset reads its key from the environment: `OPENROUTER_API_KEY`,
+`OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. If you keep them in a `.env` file, call
+`minillmlib::init()` first, which loads it.
 
 ## Usage Examples
 
@@ -122,7 +120,7 @@ let root = ChatNode::root("You are helpful.");
 // First turn
 let response1 = root.chat("My name is Alice.", &generator).await?;
 
-// Second turn - context is preserved
+// Second turn: context is preserved
 let response2 = response1.chat("What's my name?", &generator).await?;
 // Response will mention "Alice"
 ```
@@ -165,13 +163,13 @@ let content = MessageContent::with_documents("Summarize this report.", &[documen
 
 ### Generated Media (image output)
 
-Media the model RETURNS (an image-generation model's output) lands on
-`CompletionResponse::media` as the same typed `Media` the request side uses,
-and `to_assistant_message()` is the canonical way to append the reply
-(text + returned media) to a conversation:
+If the model returns media (an image-generation model, say), it lands on
+`CompletionResponse::media` as the same `Media` type you send. If you want to
+add the reply, text and media, to a conversation, `to_assistant_message()`
+builds that message:
 
 ```rust
-let response = user.complete(&generator, None).await?;
+let (node, response) = user.complete_collect(&generator, None).await?;
 for media in &response.media {
     // e.g. Media::Image(img) where img.base64_data is a data: URL or an https URL
 }
@@ -182,7 +180,8 @@ let assistant_message = response.to_assistant_message();
 
 Tools are normalized: define them once, and each provider emits its own wire
 shape (OpenAI-wire `tools`/`tool_calls`, Anthropic `tool_use`/`tool_result`).
-See the guide's Tool Calling chapter for the full loop.
+For the full loop, go and read the guide's
+[Tool Calling chapter](https://weavemindai.github.io/MiniLLMLibRS/tool-calling.html).
 
 ```rust
 use minillmlib::{CompletionParameters, NodeCompletionParameters, ToolChoice, ToolDefinition};
@@ -205,7 +204,7 @@ let node = user.complete(&generator, Some(&params)).await?;
 if let Some(calls) = node.tool_calls() {
     let mut current = node.clone();
     for call in &calls {
-        let args = call.arguments_json()?;                 // typed arguments
+        let args = call.arguments_json()?;                 // arguments parsed as JSON
         let result = run_my_tool(&call.name, &args);       // your code
         current = current.add_tool_result(&call.id, result);
     }
@@ -213,22 +212,23 @@ if let Some(calls) = node.tool_calls() {
 }
 ```
 
-Streamed tool arguments can be consumed DECODED, live, per field:
-`ArgumentStream` gives every argument a `FieldHandle` where the consumer picks
-`wait().await` (complete parsed value) or `delta().await` (the field's text as
-the model generates it, escapes undone), with an opt-in lenient mode for
-sloppy models. See the guide's Tool Calling chapter.
+If you want a tool call's arguments while the model is still writing them,
+`ArgumentStream` gives you a `FieldHandle` per argument: `wait().await` for the
+finished value, or `delta().await` for its text as it arrives, escapes undone.
+A lenient mode handles models that write sloppy JSON. For the details, go and
+read the guide's Tool Calling chapter.
 
 For a complete multi-turn agent loop (streaming prose live, one streaming tool
 consuming its decoded payload as the model generates it, one buffered tool),
-run `cargo run --example agent_loop` ([examples/agent_loop.rs](examples/agent_loop.rs)).
+run `OPENROUTER_API_KEY=... cargo run --example agent_loop`
+([examples/agent_loop.rs](examples/agent_loop.rs)); it makes real, billed calls.
 
 ### JSON Response with Repair
 
 ```rust
 let params = NodeCompletionParameters::new()
     .with_parse_json(true)           // Enable JSON repair
-    .with_crash_on_refusal(true)     // Retry if no valid JSON
+    .with_crash_on_refusal(true)     // Reject empty or null JSON (retried below)
     .with_retry(3);                  // Number of retries
 
 let response = user.complete(&generator, Some(&params)).await?;
@@ -246,7 +246,7 @@ let params = NodeCompletionParameters::new()
     .with_crash_on_empty(true); // Retry on empty responses
 ```
 
-### Force Prepend (Constrained Generation)
+### Force Prepend (start the reply with your text)
 
 ```rust
 // Force the model to start its response with specific text
@@ -256,16 +256,16 @@ let params = NodeCompletionParameters::new()
 // Response will start with "Score: " followed by the model's completion
 ```
 
-### OpenRouter Provider Settings
+### OpenRouter routing
 
-OpenRouter routing is provider-specific, so it's attached via
-`with_openrouter_routing` (which carries it under the request's `provider` key);
-non-OpenRouter providers simply ignore it.
+If you use OpenRouter, `with_openrouter_routing` puts its routing settings under
+the request's `provider` key. Set it only on an OpenRouter generator: OpenAI
+and Anthropic refuse a request that carries that key.
 
 ```rust
-use minillmlib::{CompletionParameters, ProviderSettings};
+use minillmlib::{CompletionParameters, OpenRouterRouting};
 
-let routing = ProviderSettings::new()
+let routing = OpenRouterRouting::new()
     .sort_by_throughput()                              // or .sort_by_price()
     .deny_data_collection()
     .with_ignore(vec!["SambaNova".to_string()]);       // Exclude providers
@@ -278,7 +278,7 @@ let params = CompletionParameters::new()
 
 Mark what to cache on the tree; the provider decides the wire (Anthropic and
 OpenRouter-fronted Claude models emit `cache_control` breakpoints, OpenAI
-auto-caches). Switch the provider and the same code works.
+auto-caches).
 
 ```rust
 let root = ChatNode::root(big_system_prompt);
@@ -293,8 +293,8 @@ root.clear_cache_breakpoint();           // one node
 root.clear_all_cache_breakpoints();      // whole tree
 ```
 
-Cache tokens are priced with distinct read/write rates (cache reads are ~0.1×
-input; cache writes a ~1.25× premium):
+If you give a price yourself, add the cache rates too, or cache reads and
+writes are billed at the plain input rate:
 
 ```rust
 let price = TokenPrice::new(1.0, 5.0)        // $/Mtok input, output
@@ -339,10 +339,11 @@ root.set_format_kwarg("bot_name", "Claude");
 root.set_format_kwarg("style", "helpful");
 
 let user = root.add_user("Hi {bot_name}!");
+user.set_format_kwarg("bot_name", "Claude"); // a node's values fill only its own message
 
 // Get formatted messages with placeholders replaced
 let formatted = user.formatted_thread();
-// Messages now contain "You are Claude, a helpful assistant." etc.
+// "You are Claude, a helpful assistant." and "Hi Claude!"
 ```
 
 ### Save and Load Conversation Threads
@@ -352,8 +353,8 @@ use minillmlib::ChatNode;
 
 // Build a conversation
 let root = ChatNode::root("You are helpful.");
-root.set_format_kwarg("name", "Alice");
 let user = root.add_user("Hello {name}!");
+user.set_format_kwarg("name", "Alice");
 let assistant = user.add_assistant("Hi there!");
 
 // Save to JSON file
@@ -363,7 +364,7 @@ assistant.save_thread("conversation.json")?;
 let (loaded_root, loaded_leaf) = ChatNode::from_thread_file("conversation.json")?;
 
 // Or load from JSON string
-let json = r#"{"prompts": [{"role": "system", "content": "Hello"}], "required_kwargs": {}}"#;
+let json = r#"{"prompts": [{"message": {"role": "system", "content": "Hello"}}]}"#;
 let (root, leaf) = ChatNode::from_thread_json(json)?;
 ```
 
@@ -379,7 +380,7 @@ let root = some_deep_node.get_root();
 let subtree = node.detach();  // node is now a new root
 
 // Merge trees
-let merged = tree1_leaf.merge(&tree2_leaf);  // tree2's root becomes child of tree1_leaf
+let merged = tree1_leaf.merge(&tree2_leaf)?;  // a copy of tree2 goes under tree1_leaf; returns the copy's leaf
 
 // Iterate over tree
 for node in root.iter_depth_first() {
@@ -393,7 +394,7 @@ let leaves = root.iter_leaves();
 let count = root.node_count();
 ```
 
-### Cost Tracking (OpenRouter)
+### Cost Tracking
 
 ```rust
 use minillmlib::{ChatNode, GeneratorInfo, NodeCompletionParameters, CostInfo};
@@ -406,10 +407,9 @@ let total_cost = Arc::new(Mutex::new(0.0));
 let cost_tracker = total_cost.clone();
 
 let params = NodeCompletionParameters::new()
-    .with_cost_tracking(true)
     .with_cost_callback(move |info: CostInfo| {
         *cost_tracker.lock().unwrap() += info.cost;
-        println!("Request cost: {} credits", info.cost);
+        println!("Request cost: ${}", info.cost);
         println!("Tokens: {} prompt, {} completion", 
             info.prompt_tokens, info.completion_tokens);
     });
@@ -418,81 +418,23 @@ let root = ChatNode::root("You are helpful.");
 let user = root.add_user("Hello!");
 let response = user.complete(&generator, Some(&params)).await?;
 
-println!("Total spent: {} credits", *total_cost.lock().unwrap());
+println!("Total spent: ${}", *total_cost.lock().unwrap());
 ```
 
 ### Estimating a call's cost
 
-Cost tracking tells you what a call *did* cost. Estimation tells you what it *will*
-cost, before you send it, so you can decide whether to allow it. Enable the
-`estimate` feature.
-
-The `GeneratorInfo` you already have answers it directly:
+If you want to know what a call will cost before you send it, turn on the
+`estimate` feature and ask the generator. You get a deliberately high figure to
+reserve against, or `None` when it cannot be worked out:
 
 ```rust
-use minillmlib::{ChatNode, CompletionParameters, GeneratorInfo};
-
-let generator = GeneratorInfo::openrouter("anthropic/claude-haiku-4.5");
 let params = CompletionParameters::new().with_max_tokens(1024);
-
-let root = ChatNode::root("You are terse.");
-let prompt = root.add_user("Name three primary colours.");
-
-let usd = generator.estimate_cost_usd(&prompt.thread(), &params).await?;
-println!("this call will cost at most ${usd:.6}");
+let usd = generator.estimate_cost_usd(&user.thread(), &params).await;
 ```
 
-The prices come from OpenRouter's catalog, the one public price sheet, so the
-model is looked up by its OpenRouter id. An OpenRouter generator's model id
-already is one. A direct-vendor generator whose id differs (Anthropic's
-`claude-haiku-4-5-20251001` is the catalog's `anthropic/claude-haiku-4.5`) sets
-`.with_openrouter_name("anthropic/claude-haiku-4.5")`: that is what unlocks
-estimation. The only failure is a model the catalog does not know at all.
-
-One model is served by many providers at different prices. The rates used are the
-serving provider's own when the generator knows who that is (the built-in
-Anthropic and OpenAI providers do); otherwise the **dearest** rate any provider
-of the model charges, the only figure that is a ceiling wherever routing lands.
-
-The figure is a **deliberately high estimate**, never a best guess, because only
-the low side lets you overspend. Every assumption leans expensive; it is still an
-estimate (tokenizers differ across model families), so treat it as a strong
-ceiling to reserve against, not a guarantee. Concretely it assumes:
-
-- no prompt caching (caching only ever makes the real cost lower);
-- the largest completion the request permits, including any reasoning budget,
-  which providers bill *on top of* `max_tokens` rather than inside it;
-- a minute of media, for a clip whose length you did not state. **If your prompt
-  carries audio or video, set the clip's real duration** (`with_duration`): the
-  one-minute assumption overshoots short clips by a lot (measured live: 5-7x on
-  an 8-second clip) and *undershoots* anything longer than a minute, which is
-  the one way the estimate can come in below the real cost.
-
-There is no error case. A prompt counted larger than the model accepts is priced
-as the largest input that model *does* accept, so you always get a number and never
-have to handle "unknown". Replace it with the real cost once the call returns.
-
-To sharpen the estimate:
-
-- If your OpenRouter routing settings pin one provider (a single-entry `order`
-  with fallbacks off), `ProviderSettings::billing_provider()` gives you its slug;
-  price with `generator.model_rates_served_by(Some(&slug))` to get exactly that
-  provider's rates.
-- Pass a clip's length with `AudioData::with_duration` / `VideoData::with_duration`
-  and the estimate stops guessing. Audio is billed by the second, at up to a
-  thousand times the text rate on some models, so this matters.
-- Same for documents: pass `DocumentData::with_page_count` and the estimate
-  prices the real page count instead of assuming a 20-page document (PDFs bill
-  per page: the page's text plus the page rendered as an image).
-
-**Keep your generators alive.** Each `GeneratorInfo` caches the prices it fetches
-for an hour, and clones share the cache, so reusing a generator means only the
-first estimate in an hour touches the network; recreating it per call refetches
-the price sheet every time. The library holds no registry: if you multiplex many
-models, pool your generators yourself in a map keyed by
-`generator.pricing_key()` (the catalog model id plus provider slug, exactly the
-pair that determines the price). If you never estimate costs, none of this
-matters.
+For where each provider finds a model's price, what the figure assumes, and how
+to make it tighter, go and read
+[the cost estimation chapter](https://weavemindai.github.io/MiniLLMLibRS/cost-estimation.html).
 
 ## API Reference
 
@@ -516,92 +458,63 @@ matters.
 ```rust
 // Pre-configured providers
 GeneratorInfo::openrouter(model)         // OpenRouter (OpenAI wire, native USD cost)
-GeneratorInfo::openai(model)             // OpenAI (token-only; price via with_token_price)
-GeneratorInfo::anthropic(model)          // Native Anthropic /v1/messages, x-api-key auth
-GeneratorInfo::claude_subscription(model)// Anthropic wire, Claude Pro/Max OAuth token
+GeneratorInfo::openai(model)             // OpenAI (token counts; priced at your price, else the catalog's)
+GeneratorInfo::anthropic(model)          // Anthropic's /v1/messages, x-api-key auth (token counts; priced at your price, else the catalog's, which usually needs with_openrouter_name)
 GeneratorInfo::custom(name, url, model)  // Custom OpenAI-compatible endpoint
 
 // Auth builder methods
 .with_api_key(key)                       // provider chooses header (Bearer / x-api-key)
 .with_api_key_from_env("ENV_VAR")
-.with_bearer_token(token)                // OAuth / subscription bearer token
+.with_bearer_token(token)                // always sent as Authorization: Bearer
 .with_bearer_token_from_env("ENV_VAR")
 
 // Other builder methods
-.with_token_price(TokenPrice::new(in_per_mtok, out_per_mtok)) // cost estimate for token-only providers
+.with_token_price(TokenPrice::new(in_per_mtok, out_per_mtok)) // the model's price: bills token-only calls and prices estimates
+.with_openrouter_name("anthropic/claude-haiku-4.5") // the model's catalog id, so its price can be looked up
 .with_provider(Arc::new(MyProvider))     // swap the wire dialect
 .with_header(name, value)
-.with_vision()
-.with_audio()
-.with_max_context(length)
+.with_model_info(info)                   // largest output, context window (and price); unset fields are looked up
 .with_default_params(params)
 ```
 
-### Claude Subscription (use your Pro/Max plan)
-
-A Claude **Pro/Max subscription** OAuth token authenticates against the native
-Anthropic API the same way an API key does, but draws on your **subscription's
-rolling quota** (the 5-hour / 7-day window) instead of pay-as-you-go API billing.
-
-`claude_subscription` resolves the token in this order:
-
-1. the `ANTHROPIC_AUTH_TOKEN` env var, if set (explicit override, e.g. from
-   `claude setup-token`; you keep it fresh);
-2. otherwise the live Claude Code credential at `~/.claude/.credentials.json`
-   (`claudeAiOauth.accessToken`), which Claude Code keeps refreshed, so if you're
-   logged into Claude Code with your subscription, it just works.
-
-```rust
-use minillmlib::{ChatNode, GeneratorInfo, TokenPrice};
-
-// Anthropic returns token counts but no dollar cost, so set a price for a
-// resolved cost ESTIMATE (otherwise tracking reports `Unpriced`).
-let generator = GeneratorInfo::claude_subscription("claude-haiku-4-5")
-    .with_token_price(TokenPrice::new(1.0, 5.0)); // $/Mtok in, $/Mtok out
-
-let root = ChatNode::root("You are helpful.");
-let response = root.chat("Hello!", &generator).await?;
-```
-
-> **Subscription vs Console.** A subscription token (from Claude Code) bills your
-> Pro/Max plan. A Console/API OAuth token (e.g. from the `ant` CLI) bills your
-> **API account**, not the subscription; for Console use an API key via
-> `GeneratorInfo::anthropic(model)`. Verify which bucket you're hitting by the
-> response's rate-limit headers: subscription returns `anthropic-ratelimit-unified-5h-*`;
-> the API tier returns `anthropic-ratelimit-input-tokens-limit`.
-
 ### CompletionParameters
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `max_tokens` | `Option<u32>` | `4096` | Maximum tokens to generate |
-| `temperature` | `Option<f32>` | `0.7` | Sampling temperature |
-| `top_p` | `Option<f32>` | `None` | Nucleus sampling |
-| `top_k` | `Option<u32>` | `None` | Top-k sampling |
-| `stop` | `Option<Vec<String>>` | `None` | Stop sequences |
-| `seed` | `Option<u64>` | `None` | Random seed |
-| `response_format` | `Option<ResponseFormat>` | `None` | Force JSON output |
-| `reasoning` | `Option<ReasoningConfig>` | `None` | Reasoning on or off and how hard; translated per wire (`reasoning` object on OpenRouter, `reasoning_effort` on OpenAI, `thinking` on Anthropic). `effort: "none"` is off and never fails a request |
-| `extra` | `Option<HashMap>` | `None` | Provider-specific keys (incl. OpenRouter routing) |
+These are the common ones; for every field, go and read
+[the parameters chapter](https://weavemindai.github.io/MiniLLMLibRS/parameters.html).
+Every field defaults to unset, and an unset field is not sent.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `max_tokens` | `Option<u32>` | The most tokens the model may write, reasoning included. Unset, Anthropic (which requires one) gets the model's largest, or 4096 |
+| `temperature` | `Option<f64>` | Sampling temperature |
+| `top_p` | `Option<f64>` | Nucleus sampling |
+| `top_k` | `Option<u32>` | Top-k sampling |
+| `stop` | `Option<Vec<String>>` | Stop sequences |
+| `seed` | `Option<u64>` | Random seed |
+| `response_format` | `Option<ResponseFormat>` | Force JSON output |
+| `reasoning` | `Option<Reasoning>` | `Off`, `On(None)` (a low effort), or `On(Some("high"))`, sent in each provider's own spelling |
+| `extra` | `Option<HashMap>` | Provider-specific keys (incl. OpenRouter routing) |
 
 ### NodeCompletionParameters
 
+These are the common ones; for every field, go and read
+[the parameters chapter](https://weavemindai.github.io/MiniLLMLibRS/parameters.html).
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `system_prompt` | `Option<String>` | `None` | Override system prompt |
+| `system_prompt` | `Option<String>` | `None` | System message to add when the thread has none |
 | `parse_json` | `bool` | `false` | Parse/repair JSON response |
 | `force_prepend` | `Option<String>` | `None` | Force response prefix |
-| `retry` | `u32` | `4` | Retry attempts |
+| `retry` | `u32` | `0` | Retries after a failed attempt (each one is a new paid request) |
 | `exp_back_off` | `bool` | `false` | Exponential backoff |
 | `back_off_time` | `f64` | `1.0` | Initial backoff (seconds) |
 | `max_back_off` | `f64` | `15.0` | Max backoff (seconds) |
-| `crash_on_refusal` | `bool` | `false` | Error if no JSON |
+| `crash_on_refusal` | `bool` | `false` | With `parse_json`, error if the JSON is empty or null |
 | `crash_on_empty_response` | `bool` | `false` | Error if empty |
-| `track_cost` | `bool` | `false` | Request and report usage/cost |
-| `token_price` | `Option<TokenPrice>` | `None` | Per-request price override (token-only providers) |
+| `track_cost` | `bool` | `false` | Ask for token counts (stored on the reply); for the cost, add a `cost_callback` or call `complete_costed` |
 | `cost_callback` | `Option<CostCallback>` | `None` | Callback for cost info |
 
-### ProviderSettings (OpenRouter)
+### OpenRouterRouting
 
 | Parameter | Description |
 |-----------|-------------|
@@ -613,7 +526,8 @@ let response = root.chat("Hello!", &generator).await?;
 
 ## CLI Tool
 
-The library includes a CLI for JSON repair:
+If you want to repair JSON from the shell, install the bundled CLI with
+`cargo install minillmlib`:
 
 ```bash
 # Repair JSON from file
@@ -633,21 +547,18 @@ cargo test
 cargo test --lib
 
 # Live integration tests (REAL, billed API calls): opt in with the `live` feature.
-# Reads OPENROUTER_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN from the env
-# (or a .env); each live test skips gracefully if its key is absent.
+# Reads OPENROUTER_API_KEY and ANTHROPIC_API_KEY from the env (or a .env);
+# each live test skips if its key is absent.
 cargo test --features live
 
 # Run with output
 cargo test -- --nocapture
 ```
 
-Without `--features live`, every network test skips, so `cargo test` is free,
-offline, and deterministic even when real keys are present in your environment.
-
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License. For details, see [LICENSE](LICENSE).
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+If you want to help, send a pull request.

@@ -11,7 +11,6 @@
 - [Cost Estimation](./cost-estimation.md)
 - [Prompt Caching](./caching.md)
 - [Custom Providers](./custom-providers.md)
-- [Claude Subscription](./claude-subscription.md)
 
 ---
 
